@@ -1,0 +1,27 @@
+fastapi[all]==0.115.0
+python-multipart==0.0.9
+pandas==2.2.2
+openpyxl==3.1.5
+openai==1.51.0
+pillow==10.4.0
+uvicorn[standard]==0.30.6
+python-dotenv==1.0.1
+aiofiles==24.1.0
+backoff==2.2.1
+
+# Redis and Celery for distributed task processing
+redis==5.1.1
+celery[redis]==5.4.0
+kombu==5.4.2
+
+# Additional dependencies for Redis integration
+hiredis==3.0.0  # High-performance Redis client
+flower==2.0.1   # Celery monitoring web interface
+
+# WebSocket and Pub/Sub dependencies
+fastapi_websocket_pubsub==0.3.7  # FastAPI WebSocket pub/sub with Redis support
+websockets==13.1  # WebSocket client/server implementation
+
+# Supabase integration
+supabase==2.9.1  # Supabase Python client
+pyjwt==2.9.0  # JWT token verification
