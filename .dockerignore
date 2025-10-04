@@ -64,8 +64,13 @@ temp_storage/
 Thumbs.db
 .DS_Store
 
-# Railway (don't need in the image)
-.railway/
-
 # MCP config
 .mcp.json
+
+# Fly.io
+.fly/
+fly.toml
+
+# Database dumps
+*.rdb
+dump.rdb
