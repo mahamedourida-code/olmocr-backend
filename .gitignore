@@ -32,10 +32,16 @@ env/
 .DS_Store
 .claude/
 
-# Documentation (keep only essential)
-CLAUDE.md
-RAILWAY_DEPLOY.md
-README.md
+# Documentation and guides
+*.md
+!requirements.txt
+
+# Backup and temp files
+*.backup
+dump.rdb
+
+# Scripts
+*.ps1
 
 # Testing
 .pytest_cache/
