@@ -6,7 +6,7 @@ FROM python:3.11-slim as base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    PORT=8000
+    PORT=8080
 
 # Create app directory
 WORKDIR /app
@@ -50,7 +50,7 @@ EXPOSE $PORT
 
 # Health check - only runs for web service type
 HEALTHCHECK --interval=30s --timeout=30s --start-period=40s --retries=3 \
-    CMD if [ "$SERVICE_TYPE" = "web" ] || [ -z "$SERVICE_TYPE" ]; then curl -f http://localhost:${PORT:-8000}/api/v1/health || exit 1; else exit 0; fi
+    CMD if [ "$SERVICE_TYPE" = "web" ] || [ -z "$SERVICE_TYPE" ]; then curl -f http://localhost:${PORT:-8080}/api/v1/health || exit 1; else exit 0; fi
 
 # Default command - uses startup script for different service types
 CMD ["python", "start.py"]

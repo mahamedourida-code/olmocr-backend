@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     
     # Server Configuration
     host: str = Field("0.0.0.0", env="HOST")
-    port: int = Field(8000, env="PORT")
+    port: int = Field(8080, env="PORT")
     
     # File Storage Configuration
     temp_storage_path: str = Field("/app/temp_storage", env="TEMP_STORAGE_PATH")
