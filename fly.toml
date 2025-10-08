@@ -1,0 +1,46 @@
+# fly.toml app configuration file generated for olmocr-backend-vl616a on 2025-10-04T21:11:15+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'olmocr-backend-vl616a'
+primary_region = 'arn'
+
+
+[build]
+  buildpacks = ["heroku/python"]
+
+[env]
+  API_V1_PREFIX = '/api/v1'
+  CELERY_WORKER_CONCURRENCY = '2'
+  CLEANUP_INTERVAL_HOURS = '1'
+  CORS_ALLOW_CREDENTIALS = 'true'
+  CORS_ALLOW_HEADERS = '["*"]'
+  CORS_ALLOW_METHODS = '["GET","POST","PUT","DELETE","OPTIONS"]'
+  DEBUG = 'false'
+  DOCS_URL = '/docs'
+  ENVIRONMENT = 'production'
+  FILE_RETENTION_HOURS = '24'
+  HOST = '0.0.0.0'
+  LOG_FORMAT = 'json'
+  LOG_LEVEL = 'INFO'
+  MAX_BATCH_SIZE = '10'
+  MAX_FILE_SIZE_MB = '10'
+  PORT = '8000'
+  REDIS_CONNECT_TIMEOUT = '10'
+  REDIS_MAX_CONNECTIONS = '20'
+  REDIS_SOCKET_TIMEOUT = '30'
+  REDOC_URL = '/redoc'
+  SUPABASE_STORAGE_BUCKET = 'jobs'
+  TEMP_STORAGE_PATH = '/app/temp_storage'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  size = 'performance-1x'  # 1 CPU core, 2GB RAM
