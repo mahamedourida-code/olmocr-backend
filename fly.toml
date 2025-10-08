@@ -8,7 +8,7 @@ primary_region = 'arn'
 
 
 [build]
-  buildpacks = ["heroku/python"]
+  dockerfile = "./Dockerfile"
 
 [env]
   API_V1_PREFIX = '/api/v1'
