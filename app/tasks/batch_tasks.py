@@ -923,12 +923,32 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
             
             # Update progress
             progress_percentage = int((i / len(images)) * 100)
+            current_image_id = img.get('id', img.get('filename', f'image_{i+1}'))
+
             await redis_service.update_job(job_id, {
                 'processed_images': i,
                 'progress': progress_percentage,
-                'current_image': img.get('filename', f"img_{i}"),
+                'current_image': current_image_id,
                 'updated_at': datetime.utcnow().isoformat()
             })
+
+            # Publish WebSocket progress update
+            progress_message = JobProgressUpdate(
+                job_id=job_id,
+                status='processing',
+                progress=progress_percentage,
+                total_images=len(images),
+                processed_images=i,
+                current_image=current_image_id,
+                session_id=session_id
+            )
+
+            # Publish ONLY to session topic to prevent duplicate messages
+            if session_id:
+                await redis_service.publish_message(
+                    WebSocketTopics.session_topic(session_id), progress_message
+                )
+                logger.debug(f"[Direct] Published progress update: {i}/{len(images)}")
             
             try:
                 # Decode image
@@ -985,7 +1005,30 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
 
                 download_urls.append(f"/api/v1/download/{file_id}")
                 logger.info(f"Successfully processed image {i+1}: {file_id}")
-                
+
+                # PROGRESSIVE RESULTS: Send individual file completion message immediately
+                from app.models.websocket import SingleFileCompletedMessage
+                file_ready_message = SingleFileCompletedMessage(
+                    job_id=job_id,
+                    file_info=ProcessedFileInfo(
+                        file_id=file_id,
+                        download_url=f"/api/v1/download/{file_id}",
+                        filename=excel_filename,
+                        image_id=img['id'],
+                        size_bytes=len(excel_data)
+                    ),
+                    image_number=i+1,
+                    total_images=len(images),
+                    session_id=session_id
+                )
+
+                # Publish immediately so user can download this file right away
+                if session_id:
+                    await redis_service.publish_message(
+                        WebSocketTopics.session_topic(session_id), file_ready_message
+                    )
+                    logger.info(f"[Direct] Published file_ready message for {excel_filename}")
+
             except Exception as e:
                 logger.error(f"Failed to process image {i+1} for job {job_id}: {str(e)}")
                 failed_results.append({
