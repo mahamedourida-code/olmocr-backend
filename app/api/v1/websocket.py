@@ -66,7 +66,31 @@ async def websocket_session_endpoint(
         "message": f"Monitoring session {session_id}. You will receive updates for all jobs in this session.",
         "details": {"session_id": session_id, "subscribed_topics": session_topics}
     }, websocket)
-    
+
+    # CRITICAL FIX: Retrieve and send any buffered messages
+    # This ensures file_ready messages published before WebSocket connection aren't lost
+    try:
+        if websocket_manager.redis_service:
+            session_topic = WebSocketTopics.session_topic(session_id)
+            buffered_messages = await websocket_manager.redis_service.get_buffered_messages(session_topic)
+
+            if buffered_messages:
+                logger.info(f"📬 Sending {len(buffered_messages)} buffered messages to newly connected client")
+
+                # Send each buffered message to the client
+                for msg in buffered_messages:
+                    await websocket_manager.send_json_message(msg, websocket)
+
+                # Clear the buffer after successful delivery
+                await websocket_manager.redis_service.clear_buffered_messages(session_topic)
+                logger.info(f"✅ Successfully delivered and cleared {len(buffered_messages)} buffered messages")
+            else:
+                logger.debug("No buffered messages found for this session")
+
+    except Exception as e:
+        logger.error(f"Error retrieving buffered messages: {e}")
+        # Continue anyway - buffered messages are a nice-to-have feature
+
     try:
         # Message handling loop
         while True:

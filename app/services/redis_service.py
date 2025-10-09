@@ -482,11 +482,12 @@ class RedisService:
     async def publish_message(self, topic: str, message: Union[Dict[str, Any], WebSocketMessageType]) -> bool:
         """
         Publish a message to a Redis pub/sub topic.
-        
+        If no subscribers, buffer the message for later retrieval.
+
         Args:
             topic: Topic name to publish to
             message: Message data (dict or WebSocket message model)
-        
+
         Returns:
             bool: True if message was published successfully
         """
@@ -496,17 +497,24 @@ class RedisService:
                 message_data = message.model_dump(mode='json')
             else:
                 message_data = message
-            
+
             # Ensure timestamp is included
             if 'timestamp' not in message_data:
                 message_data['timestamp'] = datetime.utcnow().isoformat()
-            
+
             message_json = json.dumps(message_data)
             subscribers = await self.client.publish(topic, message_json)
-            
-            logger.info(f"📢 Published message to topic '{topic}': {subscribers} subscribers, message type: {message_data.get('type', 'unknown')}")
+
+            # CRITICAL FIX: Buffer message if no subscribers
+            # This prevents message loss when WebSocket connects after processing starts
+            if subscribers == 0:
+                logger.warning(f"⚠️ No subscribers for topic '{topic}', buffering message type: {message_data.get('type', 'unknown')}")
+                await self.buffer_message(topic, message_data)
+            else:
+                logger.info(f"📢 Published message to topic '{topic}': {subscribers} subscribers, message type: {message_data.get('type', 'unknown')}")
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to publish message to topic '{topic}': {e}")
             return False
@@ -700,7 +708,7 @@ class RedisService:
     async def list_active_topics(self) -> List[str]:
         """
         Get list of active pub/sub topics.
-        
+
         Returns:
             List of active topic names
         """
@@ -711,7 +719,97 @@ class RedisService:
         except Exception as e:
             logger.error(f"Failed to list active topics: {e}")
             return []
-    
+
+    # Message Buffering Methods (for handling pub/sub message loss)
+
+    async def buffer_message(self, topic: str, message_data: Dict[str, Any]) -> bool:
+        """
+        Buffer a message in Redis for later retrieval.
+        Used when no subscribers are available to receive the message.
+
+        Args:
+            topic: Topic name the message belongs to
+            message_data: Message data to buffer
+
+        Returns:
+            bool: True if message was buffered successfully
+        """
+        try:
+            buffer_key = f"buffer:{topic}"
+            message_json = json.dumps(message_data)
+
+            # Add message to buffer list
+            await self.client.lpush(buffer_key, message_json)
+
+            # Set expiration on buffer (1 hour) to prevent accumulation
+            await self.client.expire(buffer_key, 3600)
+
+            logger.info(f"💾 Buffered message for topic '{topic}', type: {message_data.get('type', 'unknown')}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to buffer message for topic '{topic}': {e}")
+            return False
+
+    async def get_buffered_messages(self, topic: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all buffered messages for a topic.
+        Messages are returned in FIFO order (oldest first).
+
+        Args:
+            topic: Topic name to retrieve messages for
+
+        Returns:
+            List of buffered messages
+        """
+        try:
+            buffer_key = f"buffer:{topic}"
+
+            # Get all messages from buffer
+            messages_json = await self.client.lrange(buffer_key, 0, -1)
+
+            if not messages_json:
+                return []
+
+            # Parse JSON messages
+            messages = []
+            for msg_json in reversed(messages_json):  # Reverse to get FIFO order
+                try:
+                    messages.append(json.loads(msg_json))
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse buffered message: {e}")
+
+            logger.info(f"📤 Retrieved {len(messages)} buffered messages for topic '{topic}'")
+            return messages
+
+        except Exception as e:
+            logger.error(f"Failed to get buffered messages for topic '{topic}': {e}")
+            return []
+
+    async def clear_buffered_messages(self, topic: str) -> bool:
+        """
+        Clear all buffered messages for a topic.
+        Should be called after messages have been successfully delivered.
+
+        Args:
+            topic: Topic name to clear messages for
+
+        Returns:
+            bool: True if clearing was successful
+        """
+        try:
+            buffer_key = f"buffer:{topic}"
+            result = await self.client.delete(buffer_key)
+
+            if result > 0:
+                logger.info(f"🗑️ Cleared buffered messages for topic '{topic}'")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to clear buffered messages for topic '{topic}': {e}")
+            return False
+
     # Cleanup Methods
     
     async def cleanup_expired_jobs(self) -> int:
