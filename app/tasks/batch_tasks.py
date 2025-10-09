@@ -402,6 +402,19 @@ def process_batch_images(self, job_id: str, images: List[Dict[str, str]]) -> Dic
                             download_urls.append(f"/api/v1/download/{file_id}")
                             logger.info(f"Created Excel file for {result['image_id']}: {file_id}")
 
+                            # PROGRESSIVE RESULTS: Add file to session immediately for download access
+                            session_metadata = main_loop.run_until_complete(
+                                storage_service.get_session_metadata(session_id)
+                            )
+                            if session_metadata:
+                                if file_id not in session_metadata.result_files:
+                                    session_metadata.result_files.append(file_id)
+                                    session_metadata.update_activity()
+                                    main_loop.run_until_complete(
+                                        storage_service.update_session_metadata(session_metadata)
+                                    )
+                                    logger.info(f"Added {file_id} to session {session_id} result_files")
+
                             # PROGRESSIVE RESULTS: Send individual file completion message immediately
                             file_ready_message = SingleFileCompletedMessage(
                                 job_id=job_id,
@@ -1005,6 +1018,15 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
 
                 download_urls.append(f"/api/v1/download/{file_id}")
                 logger.info(f"Successfully processed image {i+1}: {file_id}")
+
+                # PROGRESSIVE RESULTS: Add file to session immediately for download access
+                session_metadata = await storage_service.get_session_metadata(session_id)
+                if session_metadata:
+                    if file_id not in session_metadata.result_files:
+                        session_metadata.result_files.append(file_id)
+                        session_metadata.update_activity()
+                        await storage_service.update_session_metadata(session_metadata)
+                        logger.info(f"[Direct] Added {file_id} to session {session_id} result_files")
 
                 # PROGRESSIVE RESULTS: Send individual file completion message immediately
                 from app.models.websocket import SingleFileCompletedMessage
