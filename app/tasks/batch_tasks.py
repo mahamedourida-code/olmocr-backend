@@ -272,14 +272,7 @@ def process_batch_images(self, job_id: str, images: List[Dict[str, str]]) -> Dic
                     session_id=session_id
                 )
 
-                # Publish to job-specific topic, general progress topic, AND session topic
-                main_loop.run_until_complete(redis_service.publish_message(
-                    WebSocketTopics.job_topic(job_id), progress_message
-                ))
-                main_loop.run_until_complete(redis_service.publish_message(
-                    WebSocketTopics.JOB_PROGRESS, progress_message
-                ))
-                # CRITICAL: Publish to session topic so WebSocket clients receive updates
+                # Publish ONLY to session topic to prevent duplicate messages
                 if session_id:
                     main_loop.run_until_complete(redis_service.publish_message(
                         WebSocketTopics.session_topic(session_id), progress_message
@@ -525,18 +518,14 @@ def process_batch_images(self, job_id: str, images: List[Dict[str, str]]) -> Dic
             session_id=session_id_final
         )
 
-        # Publish to job-specific topic, general completion topic, AND session topic
-        main_loop.run_until_complete(redis_service.publish_message(
-            WebSocketTopics.job_topic(job_id), completion_message
-        ))
-        main_loop.run_until_complete(redis_service.publish_message(
-            WebSocketTopics.JOB_COMPLETED, completion_message
-        ))
-        # CRITICAL: Publish to session topic so WebSocket clients receive updates
+        # Publish ONLY to session topic to prevent duplicate messages
+        # Clients subscribe only to session:{session_id}, so publishing to multiple topics
+        # causes the same message to be received multiple times
         if session_id_final:
             main_loop.run_until_complete(redis_service.publish_message(
                 WebSocketTopics.session_topic(session_id_final), completion_message
             ))
+            logger.info(f"Published completion message to session topic: {session_id_final}")
         
         # Schedule cleanup task
         cleanup_job_files.apply_async(
@@ -600,17 +589,12 @@ def process_batch_images(self, job_id: str, images: List[Dict[str, str]]) -> Dic
                     session_id=session_id_error
                 )
 
-                main_loop.run_until_complete(redis_service.publish_message(
-                    WebSocketTopics.job_topic(job_id), error_message
-                ))
-                main_loop.run_until_complete(redis_service.publish_message(
-                    WebSocketTopics.JOB_ERROR, error_message
-                ))
-                # CRITICAL: Publish to session topic so WebSocket clients receive updates
+                # Publish ONLY to session topic to prevent duplicate messages
                 if session_id_error:
                     main_loop.run_until_complete(redis_service.publish_message(
                         WebSocketTopics.session_topic(session_id_error), error_message
                     ))
+                    logger.info(f"Published error message to session topic: {session_id_error}")
                 
             except Exception as e:
                 logger.error(f"Failed to update job status: {e}")
@@ -1043,20 +1027,12 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
             session_id=session_id
         )
 
-        # Publish to job-specific topic, general completion topic, AND session topic
-        await redis_service.publish_message(
-            WebSocketTopics.job_topic(job_id), completion_message
-        )
-        await redis_service.publish_message(
-            WebSocketTopics.JOB_COMPLETED, completion_message
-        )
-        # CRITICAL: Publish to session topic so WebSocket clients receive updates
+        # Publish ONLY to session topic to prevent duplicate messages
         if session_id:
             await redis_service.publish_message(
                 WebSocketTopics.session_topic(session_id), completion_message
             )
-
-        logger.info(f"[Direct] Published WebSocket completion message for job {job_id}")
+            logger.info(f"[Direct] Published completion message to session topic: {session_id}")
 
         # Update Supabase with final status if user is authenticated
         try:
