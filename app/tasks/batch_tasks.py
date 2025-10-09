@@ -23,7 +23,13 @@ from app.services.storage import FileStorageManager
 from app.services.redis_service import RedisService
 from app.services.supabase_service import get_supabase_service
 from app.models.jobs import ImageProcessingResult
-from app.models.websocket import JobProgressUpdate, JobCompletedMessage, WebSocketTopics
+from app.models.websocket import (
+    JobProgressUpdate,
+    JobCompletedMessage,
+    SingleFileCompletedMessage,
+    ProcessedFileInfo,
+    WebSocketTopics
+)
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -395,7 +401,29 @@ def process_batch_images(self, job_id: str, images: List[Dict[str, str]]) -> Dic
 
                             download_urls.append(f"/api/v1/download/{file_id}")
                             logger.info(f"Created Excel file for {result['image_id']}: {file_id}")
-                            
+
+                            # PROGRESSIVE RESULTS: Send individual file completion message immediately
+                            file_ready_message = SingleFileCompletedMessage(
+                                job_id=job_id,
+                                file_info=ProcessedFileInfo(
+                                    file_id=file_id,
+                                    download_url=f"/api/v1/download/{file_id}",
+                                    filename=excel_filename,
+                                    image_id=result['image_id'],
+                                    size_bytes=len(excel_data)
+                                ),
+                                image_number=i+1,
+                                total_images=len(successful_results),
+                                session_id=session_id
+                            )
+
+                            # Publish immediately so user can download this file right away
+                            if session_id:
+                                main_loop.run_until_complete(redis_service.publish_message(
+                                    WebSocketTopics.session_topic(session_id), file_ready_message
+                                ))
+                                logger.info(f"Published file_ready message for {excel_filename}")
+
                         except Exception as e:
                             logger.error(f"Failed to create Excel file for image {result['image_id']}: {e}")
                             failed_results.append({

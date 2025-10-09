@@ -64,9 +64,19 @@ class JobCompletedMessage(WebSocketMessage):
     errors: List[str] = Field(default_factory=list, description="List of error messages")
 
 
+class SingleFileCompletedMessage(WebSocketMessage):
+    """WebSocket message for individual file completion (progressive results)."""
+
+    type: Literal["file_ready"] = "file_ready"
+    job_id: str = Field(..., description="Job identifier")
+    file_info: ProcessedFileInfo = Field(..., description="Completed file information")
+    image_number: int = Field(..., description="Image number in batch (1-indexed)")
+    total_images: int = Field(..., description="Total images in batch")
+
+
 class JobErrorMessage(WebSocketMessage):
     """WebSocket message for job errors."""
-    
+
     type: Literal["job_error"] = "job_error"
     job_id: str = Field(..., description="Job identifier")
     error: str = Field(..., description="Error message")
@@ -121,6 +131,7 @@ class WebSocketAuthRequest(BaseModel):
 # Union type for all WebSocket messages
 WebSocketMessageType = Union[
     JobProgressUpdate,
+    SingleFileCompletedMessage,
     JobCompletedMessage,
     JobErrorMessage,
     ConnectionMessage,
