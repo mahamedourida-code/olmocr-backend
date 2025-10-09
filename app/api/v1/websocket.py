@@ -48,14 +48,12 @@ async def websocket_session_endpoint(
     
     websocket_manager.authenticate_client(websocket, session_id)
     
-    # Auto-subscribe to session and general topics
+    # Auto-subscribe to session-specific topic only
+    # Session topic receives all job updates (progress, completion, errors) for this session
+    # No need to subscribe to general topics as they cause duplicate messages
     from app.models.websocket import WebSocketTopics
     session_topics = [
-        WebSocketTopics.session_topic(session_id),
-        WebSocketTopics.JOB_PROGRESS,
-        WebSocketTopics.JOB_COMPLETED,
-        WebSocketTopics.JOB_ERROR,
-        WebSocketTopics.SINGLE_IMAGE_COMPLETED
+        WebSocketTopics.session_topic(session_id)
     ]
     
     for topic in session_topics:
