@@ -880,17 +880,202 @@ def process_batch_images_direct(job_id: str, images: List[Dict[str, str]]):
                 pass
 
 
-async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str, str]]):
+async def _process_single_image_concurrent(
+    img: Dict[str, str],
+    img_index: int,
+    total_images: int,
+    job_id: str,
+    session_id: str,
+    redis_service: 'RedisService',
+    olmocr_service: 'OlmOCRService',
+    excel_service: ExcelService,
+    storage_service: FileStorageManager,
+    job_data: Dict[str, Any],
+    semaphore: asyncio.Semaphore,
+    processed_count: List[int]  # Shared list to track processed count
+) -> Dict[str, Any]:
     """
-    Direct async implementation of batch processing.
-    This replicates the core logic from the Celery task.
+    Process a single image concurrently with semaphore limiting.
+
+    Args:
+        img: Image data dictionary
+        img_index: Index of this image in the batch
+        total_images: Total number of images in batch
+        job_id: Job identifier
+        session_id: Session identifier
+        redis_service: Redis service instance
+        olmocr_service: OlmOCR service instance
+        excel_service: Excel service instance
+        storage_service: Storage service instance
+        job_data: Job data dictionary
+        semaphore: Semaphore to limit concurrent processing
+        processed_count: Shared list to track how many images have been processed
+
+    Returns:
+        Dictionary containing result (success/error) and file info if successful
+    """
+    async with semaphore:  # Limit concurrent API requests
+        try:
+            logger.info(f"[Concurrent] Processing image {img_index+1}/{total_images} for job {job_id}")
+
+            # Decode image
+            image_data = img['data']
+            if image_data.startswith('data:'):
+                image_data = image_data.split(',', 1)[1]
+            image_bytes = base64.b64decode(image_data)
+
+            # Extract table data using OlmOCR with rate limiting
+            csv_data = await olmocr_service.extract_table_from_image(image_bytes)
+
+            # Create Excel file
+            excel_data = excel_service.csv_to_xlsx(csv_data, f"Table_{img['id']}")
+
+            # Generate filename
+            original_filename = img.get('filename', f"image_{img['id']}")
+            base_name = original_filename.split('.')[0] if '.' in original_filename else original_filename
+            excel_filename = f"{base_name}_processed.xlsx"
+
+            # Save file
+            file_id = storage_service.save_result_file_sync(session_id, excel_filename, excel_data)
+
+            # Upload to Supabase Storage if user is authenticated
+            supabase_url = None
+            try:
+                if job_data.get('user_id'):
+                    supabase_service = get_supabase_service()
+                    file_path = f"{job_data['user_id']}/{job_id}/{excel_filename}"
+                    supabase_url = await supabase_service.upload_file_to_storage(
+                        file_data=excel_data,
+                        file_path=file_path
+                    )
+                    logger.info(f"[Concurrent] Uploaded to Supabase Storage: {file_path}")
+            except Exception as upload_error:
+                logger.warning(f"[Concurrent] Failed to upload to Supabase Storage: {upload_error}")
+                # Continue even if upload fails
+
+            # Update processed count
+            processed_count[0] += 1
+            current_progress = int((processed_count[0] / total_images) * 100)
+
+            # Update Redis job progress
+            current_image_id = img.get('id', img.get('filename', f'image_{img_index+1}'))
+            await redis_service.update_job(job_id, {
+                'processed_images': processed_count[0],
+                'progress': current_progress,
+                'current_image': current_image_id,
+                'updated_at': datetime.utcnow().isoformat()
+            })
+
+            # Publish WebSocket progress update
+            progress_message = JobProgressUpdate(
+                job_id=job_id,
+                status='processing',
+                progress=current_progress,
+                total_images=total_images,
+                processed_images=processed_count[0],
+                current_image=current_image_id,
+                session_id=session_id
+            )
+
+            # Publish ONLY to session topic to prevent duplicate messages
+            if session_id:
+                await redis_service.publish_message(
+                    WebSocketTopics.session_topic(session_id), progress_message
+                )
+                logger.debug(f"[Concurrent] Published progress update: {processed_count[0]}/{total_images}")
+
+            # PROGRESSIVE RESULTS: Add file to session immediately for download access
+            session_metadata = await storage_service.get_session_metadata(session_id)
+            if session_metadata:
+                if file_id not in session_metadata.result_files:
+                    session_metadata.result_files.append(file_id)
+                    session_metadata.update_activity()
+                    await storage_service.update_session_metadata(session_metadata)
+                    logger.info(f"[Concurrent] Added {file_id} to session {session_id} result_files")
+
+            # PROGRESSIVE RESULTS: Send individual file completion message immediately
+            from app.models.websocket import SingleFileCompletedMessage
+            file_ready_message = SingleFileCompletedMessage(
+                job_id=job_id,
+                file_info=ProcessedFileInfo(
+                    file_id=file_id,
+                    download_url=f"/api/v1/download/{file_id}",
+                    filename=excel_filename,
+                    image_id=img['id'],
+                    size_bytes=len(excel_data)
+                ),
+                image_number=img_index+1,
+                total_images=total_images,
+                session_id=session_id
+            )
+
+            # Publish immediately so user can download this file right away
+            if session_id:
+                await redis_service.publish_message(
+                    WebSocketTopics.session_topic(session_id), file_ready_message
+                )
+                logger.info(f"[Concurrent] Published file_ready message for {excel_filename}")
+
+            logger.info(f"[Concurrent] Successfully processed image {img_index+1}: {file_id}")
+
+            # Return success result
+            return {
+                'status': 'success',
+                'image_id': img['id'],
+                'filename': original_filename,
+                'extracted_data': csv_data,
+                'file_id': file_id,
+                'file_info': {
+                    'file_id': file_id,
+                    'image_id': img['id'],
+                    'filename': excel_filename,
+                    'original_filename': original_filename,
+                    'size_bytes': len(excel_data),
+                    'supabase_url': supabase_url
+                },
+                'download_url': f"/api/v1/download/{file_id}"
+            }
+
+        except Exception as e:
+            logger.error(f"[Concurrent] Failed to process image {img_index+1} for job {job_id}: {str(e)}")
+
+            # Update processed count even for failures
+            processed_count[0] += 1
+            current_progress = int((processed_count[0] / total_images) * 100)
+
+            # Update progress even on failure
+            await redis_service.update_job(job_id, {
+                'processed_images': processed_count[0],
+                'progress': current_progress,
+                'updated_at': datetime.utcnow().isoformat()
+            })
+
+            return {
+                'status': 'error',
+                'error': str(e),
+                'image_id': img['id'],
+                'filename': img.get('filename', f"image_{img['id']}")
+            }
+
+
+async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str, str]], max_concurrent: int = 5):
+    """
+    Direct async implementation of batch processing with PARALLEL PROCESSING.
+
+    Uses asyncio.gather() to process multiple images concurrently, with a semaphore
+    to limit the number of simultaneous API requests.
+
+    Args:
+        job_id: Job identifier
+        images: List of image data dictionaries
+        max_concurrent: Maximum number of concurrent image processing tasks (default: 5)
     """
     from app.services.redis_service import RedisService
     from app.services.olmocr import OlmOCRService
     from app.services.excel import ExcelService
     from app.services.storage import FileStorageManager
-    
-    logger.info(f"Starting direct batch processing for job {job_id} with {len(images)} images")
+
+    logger.info(f"[Concurrent] Starting parallel batch processing for job {job_id} with {len(images)} images (max {max_concurrent} concurrent)")
 
     # Initialize services
     redis_service = RedisService()
@@ -901,10 +1086,6 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
     storage_service = FileStorageManager()
 
     start_time = datetime.utcnow()
-    successful_results = []
-    failed_results = []
-    generated_files = []
-    download_urls = []
 
     # Get job data to find session ID
     job_data = await redis_service.get_job(job_id)
@@ -925,139 +1106,77 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
                     'started_at': datetime.utcnow().isoformat()
                 }
             )
-            logger.info(f"[Direct] Updated Supabase job {job_id} to processing")
+            logger.info(f"[Concurrent] Updated Supabase job {job_id} to processing")
     except Exception as supabase_error:
-        logger.warning(f"[Direct] Failed to update Supabase job status: {supabase_error}")
+        logger.warning(f"[Concurrent] Failed to update Supabase job status: {supabase_error}")
 
     try:
-        # Process each image
-        for i, img in enumerate(images):
-            logger.info(f"Processing image {i+1}/{len(images)} for job {job_id}")
-            
-            # Update progress
-            progress_percentage = int((i / len(images)) * 100)
-            current_image_id = img.get('id', img.get('filename', f'image_{i+1}'))
+        # PARALLEL PROCESSING: Create semaphore to limit concurrent API requests
+        semaphore = asyncio.Semaphore(max_concurrent)
 
-            await redis_service.update_job(job_id, {
-                'processed_images': i,
-                'progress': progress_percentage,
-                'current_image': current_image_id,
-                'updated_at': datetime.utcnow().isoformat()
-            })
+        # Track processed count with a shared list (mutable)
+        processed_count = [0]
 
-            # Publish WebSocket progress update
-            progress_message = JobProgressUpdate(
-                job_id=job_id,
-                status='processing',
-                progress=progress_percentage,
+        # Create concurrent tasks for all images
+        logger.info(f"[Concurrent] Creating {len(images)} parallel processing tasks (max {max_concurrent} concurrent)")
+
+        tasks = [
+            _process_single_image_concurrent(
+                img=img,
+                img_index=i,
                 total_images=len(images),
-                processed_images=i,
-                current_image=current_image_id,
-                session_id=session_id
+                job_id=job_id,
+                session_id=session_id,
+                redis_service=redis_service,
+                olmocr_service=olmocr_service,
+                excel_service=excel_service,
+                storage_service=storage_service,
+                job_data=job_data,
+                semaphore=semaphore,
+                processed_count=processed_count
             )
+            for i, img in enumerate(images)
+        ]
 
-            # Publish ONLY to session topic to prevent duplicate messages
-            if session_id:
-                await redis_service.publish_message(
-                    WebSocketTopics.session_topic(session_id), progress_message
-                )
-                logger.debug(f"[Direct] Published progress update: {i}/{len(images)}")
-            
-            try:
-                # Decode image
-                image_data = img['data']
-                if image_data.startswith('data:'):
-                    image_data = image_data.split(',', 1)[1]
-                image_bytes = base64.b64decode(image_data)
+        # Execute all tasks concurrently with asyncio.gather()
+        logger.info(f"[Concurrent] Executing {len(tasks)} tasks in parallel...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Extract table data using OlmOCR with rate limiting
-                csv_data = await olmocr_service.extract_table_from_image(image_bytes)
-                
-                # Create Excel file
-                excel_data = excel_service.csv_to_xlsx(csv_data, f"Table_{img['id']}")
-                
-                # Generate filename
-                original_filename = img.get('filename', f"image_{img['id']}")
-                base_name = original_filename.split('.')[0] if '.' in original_filename else original_filename
-                excel_filename = f"{base_name}_processed.xlsx"
-                
-                # Save file
-                file_id = storage_service.save_result_file_sync(session_id, excel_filename, excel_data)
+        # Process results
+        successful_results = []
+        failed_results = []
+        generated_files = []
+        download_urls = []
 
-                # Upload to Supabase Storage if user is authenticated
-                supabase_url = None
-                try:
-                    if job_data.get('user_id'):
-                        supabase_service = get_supabase_service()
-                        file_path = f"{job_data['user_id']}/{job_id}/{excel_filename}"
-                        supabase_url = await supabase_service.upload_file_to_storage(
-                            file_data=excel_data,
-                            file_path=file_path
-                        )
-                        logger.info(f"[Direct] Uploaded to Supabase Storage: {file_path}")
-                except Exception as upload_error:
-                    logger.warning(f"[Direct] Failed to upload to Supabase Storage: {upload_error}")
-                    # Continue even if upload fails
-
-                # Store result
-                successful_results.append({
-                    'image_id': img['id'],
-                    'filename': original_filename,
-                    'extracted_data': csv_data,
-                    'file_id': file_id
-                })
-
-                generated_files.append({
-                    'file_id': file_id,
-                    'image_id': img['id'],
-                    'filename': excel_filename,
-                    'original_filename': original_filename,
-                    'size_bytes': len(excel_data),
-                    'supabase_url': supabase_url
-                })
-
-                download_urls.append(f"/api/v1/download/{file_id}")
-                logger.info(f"Successfully processed image {i+1}: {file_id}")
-
-                # PROGRESSIVE RESULTS: Add file to session immediately for download access
-                session_metadata = await storage_service.get_session_metadata(session_id)
-                if session_metadata:
-                    if file_id not in session_metadata.result_files:
-                        session_metadata.result_files.append(file_id)
-                        session_metadata.update_activity()
-                        await storage_service.update_session_metadata(session_metadata)
-                        logger.info(f"[Direct] Added {file_id} to session {session_id} result_files")
-
-                # PROGRESSIVE RESULTS: Send individual file completion message immediately
-                from app.models.websocket import SingleFileCompletedMessage
-                file_ready_message = SingleFileCompletedMessage(
-                    job_id=job_id,
-                    file_info=ProcessedFileInfo(
-                        file_id=file_id,
-                        download_url=f"/api/v1/download/{file_id}",
-                        filename=excel_filename,
-                        image_id=img['id'],
-                        size_bytes=len(excel_data)
-                    ),
-                    image_number=i+1,
-                    total_images=len(images),
-                    session_id=session_id
-                )
-
-                # Publish immediately so user can download this file right away
-                if session_id:
-                    await redis_service.publish_message(
-                        WebSocketTopics.session_topic(session_id), file_ready_message
-                    )
-                    logger.info(f"[Direct] Published file_ready message for {excel_filename}")
-
-            except Exception as e:
-                logger.error(f"Failed to process image {i+1} for job {job_id}: {str(e)}")
+        for i, result in enumerate(results):
+            # Handle exceptions returned by gather()
+            if isinstance(result, Exception):
+                logger.error(f"[Concurrent] Task {i+1} raised exception: {result}")
                 failed_results.append({
-                    'error': str(e),
-                    'image_id': img['id'],
-                    'filename': img.get('filename', f"image_{img['id']}")
+                    'error': str(result),
+                    'image_id': images[i].get('id', f'image_{i+1}'),
+                    'filename': images[i].get('filename', f"image_{images[i]['id']}")
                 })
+            elif result['status'] == 'success':
+                # Success result
+                successful_results.append({
+                    'image_id': result['image_id'],
+                    'filename': result['filename'],
+                    'extracted_data': result['extracted_data'],
+                    'file_id': result['file_id']
+                })
+
+                generated_files.append(result['file_info'])
+                download_urls.append(result['download_url'])
+            else:
+                # Error result
+                failed_results.append({
+                    'error': result['error'],
+                    'image_id': result['image_id'],
+                    'filename': result['filename']
+                })
+
+        logger.info(f"[Concurrent] Parallel processing completed: {len(successful_results)} successful, {len(failed_results)} failed")
         
         # Calculate final status and processing time
         processing_time = (datetime.utcnow() - start_time).total_seconds()
