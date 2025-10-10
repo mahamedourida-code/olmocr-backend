@@ -173,7 +173,7 @@ async def create_batch_job(
 
 @router.post("/batch-upload", response_model=BatchConvertResponse)
 async def create_batch_job_multipart(
-    files: List[UploadFile] = File(...),
+    files: List[UploadFile] = File(..., description="Image files to process (PNG, JPEG, WebP)"),
     output_format: str = Form("xlsx"),
     consolidation_strategy: str = Form("consolidated"),
     session: SessionMetadata = Depends(get_or_create_session),
@@ -196,6 +196,39 @@ async def create_batch_job_multipart(
     # Validate batch request
     simple_batch_validation(len(files))
 
+    # Validate each file
+    SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    MAX_FILE_SIZE = settings.max_file_size_bytes
+
+    for i, file in enumerate(files):
+        # Check content type
+        if file.content_type not in SUPPORTED_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'. "
+                       f"Supported types: PNG, JPEG, WebP"
+            )
+
+        # Check file size (read first to get size, then seek back)
+        file_content = await file.read()
+        file_size = len(file_content)
+
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File {i+1} '{file.filename}': File size ({file_size / 1024 / 1024:.2f}MB) "
+                       f"exceeds maximum allowed ({MAX_FILE_SIZE / 1024 / 1024:.0f}MB)"
+            )
+
+        if file_size < 100:  # Minimum reasonable file size
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File {i+1} '{file.filename}': File appears to be empty or corrupted"
+            )
+
+        # Reset file pointer for later processing
+        await file.seek(0)
+
     # Generate job ID
     job_id = str(uuid.uuid4())
 
@@ -204,7 +237,7 @@ async def create_batch_job_multipart(
         # In future, we can refactor the pipeline to work directly with binary data
         images_data = []
         for i, file in enumerate(files):
-            # Read binary data
+            # Read binary data (we already validated it above)
             file_content = await file.read()
 
             # Convert to base64 for compatibility with existing processing pipeline

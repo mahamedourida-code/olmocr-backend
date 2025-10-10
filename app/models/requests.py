@@ -10,27 +10,37 @@ class ImageData(BaseModel):
     
     @validator("image")
     def validate_base64(cls, v):
-        """Validate that image is base64 encoded."""
+        """Validate that image is base64 encoded (supports both data URLs and raw base64)."""
         if not v:
             raise ValueError("Image data cannot be empty")
-        
+
         import base64
-        
+
         # Handle data URL format (data:image/png;base64,{base64_data})
         if v.startswith('data:'):
             try:
                 # Extract base64 part after comma
                 base64_part = v.split(',', 1)[1]
-                base64.b64decode(base64_part)
+                decoded = base64.b64decode(base64_part, validate=True)
+                if len(decoded) < 100:  # Minimum reasonable image size
+                    raise ValueError("Image data appears to be too small (minimum 100 bytes)")
+            except ValueError as e:
+                # Re-raise our custom ValueError
+                raise e
             except Exception:
-                raise ValueError("Invalid data URL or base64 encoded image data")
+                raise ValueError("Invalid data URL format or base64 encoding")
         else:
-            # Handle raw base64 data
+            # Handle raw base64 data (no data URL prefix)
             try:
-                base64.b64decode(v)
+                decoded = base64.b64decode(v, validate=True)
+                if len(decoded) < 100:  # Minimum reasonable image size
+                    raise ValueError("Image data appears to be too small (minimum 100 bytes)")
+            except ValueError as e:
+                # Re-raise our custom ValueError
+                raise e
             except Exception:
-                raise ValueError("Invalid base64 encoded image data")
-        
+                raise ValueError("Invalid base64 encoding")
+
         return v
 
 
