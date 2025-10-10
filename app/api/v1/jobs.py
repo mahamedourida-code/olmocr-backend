@@ -125,75 +125,31 @@ async def create_batch_job(
                 detail="Failed to store job in Redis"
             )
         
-        # Check if Celery workers are available (only use Celery if explicitly enabled)
-        use_celery = os.getenv('CELERY_ENABLED', 'false').lower() == 'true'
+        # Use Redis queue-based processing (simple and efficient)
+        from app.tasks.queue_processor import enqueue_batch_processing
 
-        if use_celery:
-            # Submit Celery task for batch processing
-            try:
-                task_result = process_batch_images.apply_async(
-                    args=[job_id, job_data['images']],
-                    queue='batch_processing',
-                    priority=5
-                )
-
-                # Store Celery task ID in job data
-                update_success = await redis_service.update_job(job_id, {
-                    'celery_task_id': task_result.id,
-                    'status': 'processing'
-                })
-
-                logger.info(f"Submitted Celery task {task_result.id} for job {job_id}")
-
-            except Exception as celery_error:
-                logger.warning(f"Celery task submission failed: {celery_error}, using direct processing")
-                use_celery = False  # Fall back to direct processing
-
-        if not use_celery:
-            logger.info(f"Celery workers not available, using direct processing for job {job_id}")
-
-            # Fallback: Process directly without Celery
-            from app.tasks.batch_tasks import process_batch_images_direct
+        try:
+            # Enqueue all images for processing
+            await enqueue_batch_processing(
+                job_id=job_id,
+                session_id=session.session_id,
+                images=job_data['images'],
+                user_id=user['user_id'] if user else None
+            )
 
             # Update job status to processing
             update_success = await redis_service.update_job(job_id, {
                 'status': 'processing'
             })
 
-            # Create wrapper function to catch and log thread errors
-            def thread_wrapper():
-                try:
-                    logger.info(f"[Thread] Background thread started for job {job_id}")
-                    process_batch_images_direct(job_id, job_data['images'])
-                    logger.info(f"[Thread] Background thread completed for job {job_id}")
-                except Exception as thread_error:
-                    logger.error(f"[Thread] Background thread crashed for job {job_id}: {thread_error}")
-                    logger.error(f"[Thread] Traceback: {traceback.format_exc()}")
+            logger.info(f"Enqueued {len(job_data['images'])} images for job {job_id}")
 
-                    # Try to update job status to failed
-                    try:
-                        import asyncio
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(redis_service.update_job(job_id, {
-                            'status': 'failed',
-                            'error': f"Background processing crashed: {str(thread_error)}",
-                            'updated_at': datetime.utcnow().isoformat()
-                        }))
-                        loop.close()
-                    except Exception as update_error:
-                        logger.error(f"[Thread] Failed to update job status after crash: {update_error}")
-
-            # Process in background thread to avoid blocking the API
-            processing_thread = threading.Thread(target=thread_wrapper, name=f"batch-{job_id[:8]}")
-            processing_thread.daemon = False  # Don't suppress errors
-            processing_thread.start()
-            logger.info(f"Started background thread {processing_thread.name} for job {job_id}")
-
-            update_success = True
-        
-        if not update_success:
-            logger.warning(f"Failed to update job {job_id} with Celery task ID")
+        except Exception as e:
+            logger.error(f"Failed to enqueue batch processing: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to start processing: {str(e)}"
+            )
         
         # Update session
         session.jobs_count += 1
