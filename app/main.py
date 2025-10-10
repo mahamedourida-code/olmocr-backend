@@ -47,11 +47,6 @@ async def lifespan(app: FastAPI):
     # Start WebSocket Redis pub/sub listener
     await websocket_manager.start_redis_pubsub_listener()
 
-    # Start Redis queue processor for async image processing
-    from app.tasks.queue_processor import get_queue_processor
-    queue_processor = await get_queue_processor()
-    logger.info("Queue processor started for async image processing")
-
     # Start background cleanup task
     cleanup_task = asyncio.create_task(
         periodic_cleanup(storage_service, settings.cleanup_interval_hours)
@@ -65,7 +60,6 @@ async def lifespan(app: FastAPI):
     # Store references in app state
     app.state.storage_service = storage_service
     app.state.websocket_manager = websocket_manager
-    app.state.queue_processor = queue_processor
     app.state.cleanup_task = cleanup_task
     app.state.websocket_cleanup_task = websocket_cleanup_task
     
@@ -75,12 +69,6 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down application...")
-
-    # Stop queue processor
-    queue_processor = app.state.queue_processor
-    if queue_processor:
-        await queue_processor.stop()
-        logger.info("Queue processor stopped")
 
     # Stop WebSocket Redis pub/sub listener
     await websocket_manager.stop_redis_pubsub_listener()

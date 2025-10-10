@@ -125,31 +125,19 @@ async def create_batch_job(
                 detail="Failed to store job in Redis"
             )
         
-        # Use Redis queue-based processing (simple and efficient)
-        from app.tasks.queue_processor import enqueue_batch_processing
+        # Start simple async batch processing
+        from app.tasks.simple_batch import process_batch_simple
+        import asyncio
 
-        try:
-            # Enqueue all images for processing
-            await enqueue_batch_processing(
-                job_id=job_id,
-                session_id=session.session_id,
-                images=job_data['images'],
-                user_id=user['user_id'] if user else None
-            )
+        # Launch background task to process batch
+        asyncio.create_task(process_batch_simple(
+            job_id=job_id,
+            session_id=session.session_id,
+            images=job_data['images'],
+            user_id=user['user_id'] if user else None
+        ))
 
-            # Update job status to processing
-            update_success = await redis_service.update_job(job_id, {
-                'status': 'processing'
-            })
-
-            logger.info(f"Enqueued {len(job_data['images'])} images for job {job_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to enqueue batch processing: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to start processing: {str(e)}"
-            )
+        logger.info(f"Started background processing for job {job_id} with {len(job_data['images'])} images")
         
         # Update session
         session.jobs_count += 1
