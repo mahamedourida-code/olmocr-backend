@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, File, UploadFile, Form
 from fastapi.responses import JSONResponse
-from typing import Dict, Any
+from typing import Dict, Any, List
 import os
 import uuid
 import logging
 import traceback
 import threading
+import base64
 from datetime import datetime, timedelta
 
 from app.models.requests import BatchConvertRequest
@@ -164,6 +165,146 @@ async def create_batch_job(
         except:
             pass
         
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create batch job: {str(e)}"
+        )
+
+
+@router.post("/batch-upload", response_model=BatchConvertResponse)
+async def create_batch_job_multipart(
+    files: List[UploadFile] = File(...),
+    output_format: str = Form("xlsx"),
+    consolidation_strategy: str = Form("consolidated"),
+    session: SessionMetadata = Depends(get_or_create_session),
+    storage: FileStorageManager = Depends(get_storage_service),
+    redis_service: RedisService = Depends(get_redis_service),
+    user: Optional[dict] = Depends(get_optional_user),
+    http_request: Request = None
+):
+    """
+    Create a new batch processing job using multipart/form-data file uploads.
+
+    This endpoint accepts multiple binary image files directly (no base64 encoding needed),
+    making uploads faster and more memory-efficient than the base64 endpoint.
+
+    This is the recommended endpoint for file uploads.
+    """
+    # Rate limiting
+    simple_rate_limit_check(http_request)
+
+    # Validate batch request
+    simple_batch_validation(len(files))
+
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+
+    try:
+        # Convert uploaded files to base64 format expected by existing processing pipeline
+        # In future, we can refactor the pipeline to work directly with binary data
+        images_data = []
+        for i, file in enumerate(files):
+            # Read binary data
+            file_content = await file.read()
+
+            # Convert to base64 for compatibility with existing processing pipeline
+            base64_data = base64.b64encode(file_content).decode('utf-8')
+
+            images_data.append({
+                'id': f"img_{i}",
+                'data': base64_data,
+                'filename': file.filename or f"image_{i}.png"
+            })
+
+            # Reset file pointer (in case we need to read again)
+            await file.seek(0)
+
+        # Create job metadata for Redis (convert None values to empty strings for Redis compatibility)
+        job_data = {
+            'job_id': job_id,
+            'session_id': session.session_id,
+            'user_id': user['user_id'] if user else '',  # Convert None to empty string for Redis
+            'status': 'queued',
+            'total_images': len(files),
+            'processed_images': 0,
+            'progress': 0,
+            'output_format': output_format,
+            'consolidation_strategy': consolidation_strategy,
+            'images': images_data,
+            'results': [],
+            'errors': [],
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+
+        # Create job in Supabase if user is authenticated
+        if user:
+            try:
+                supabase_service = get_supabase_service()
+                await supabase_service.create_job(
+                    job_id=job_id,
+                    user_id=user['user_id'],
+                    filename=f"batch_{len(files)}_images",
+                    metadata={
+                        'total_images': len(files),
+                        'consolidation_strategy': consolidation_strategy,
+                        'output_format': output_format,
+                        'session_id': session.session_id
+                    }
+                )
+                logger.info(f"Created Supabase job {job_id} for user {user['user_id']}")
+            except Exception as e:
+                logger.error(f"Failed to create Supabase job: {e}")
+                # Continue anyway - don't fail the request
+
+        # Store job in Redis
+        create_success = await redis_service.create_job(job_id, job_data)
+
+        if not create_success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to store job in Redis"
+            )
+
+        # Start simple async batch processing
+        from app.tasks.simple_batch import process_batch_simple
+        import asyncio
+
+        # Launch background task to process batch
+        asyncio.create_task(process_batch_simple(
+            job_id=job_id,
+            session_id=session.session_id,
+            images=job_data['images'],
+            user_id=user['user_id'] if user else None
+        ))
+
+        logger.info(f"Started background processing for job {job_id} with {len(job_data['images'])} images")
+
+        # Update session
+        session.jobs_count += 1
+        session.active_jobs.append(job_id)
+        await storage.update_session_metadata(session)
+
+        # Calculate estimated completion (now much faster with concurrency)
+        estimated_completion = datetime.utcnow() + timedelta(
+            seconds=max(30, len(files) * 2)  # Much faster with parallel processing
+        )
+
+        return BatchConvertResponse(
+            success=True,
+            job_id=job_id,
+            estimated_completion=estimated_completion,
+            status_url=f"/api/v1/jobs/{job_id}/status",
+            session_id=session.session_id
+        )
+
+    except Exception as e:
+        # Clean up job if creation failed
+        try:
+            await redis_service.delete_job(job_id)
+        except:
+            pass
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create batch job: {str(e)}"
