@@ -137,8 +137,10 @@ class RedisService:
 
         # If we get here, all connection attempts failed
         logger.error(f"All Redis connection attempts failed. Last error: {last_error}")
+        logger.warning("⚠️  Redis unavailable - service will run in DEGRADED MODE (no real-time updates)")
         self._is_connected = False
-        raise ConnectionError(f"Failed to connect to Redis after trying {len(connections_to_try)} connections. Last error: {last_error}")
+        # DON'T raise - allow service to continue without Redis
+        # raise ConnectionError(f"Failed to connect to Redis after trying {len(connections_to_try)} connections. Last error: {last_error}")
     
     async def close(self) -> None:
         """Close Redis connections."""
@@ -165,14 +167,18 @@ class RedisService:
     async def create_job(self, job_id: str, job_data: Dict[str, Any]) -> bool:
         """
         Create a new job in Redis with verification.
-        
+
         Args:
             job_id: Unique job identifier
             job_data: Job metadata and configuration
-        
+
         Returns:
             bool: True if job was created successfully
         """
+        if not self._is_connected or not self.client:
+            logger.warning(f"Redis unavailable - cannot create job {job_id} (degraded mode)")
+            return False
+
         try:
             # Make a copy to avoid modifying the original
             job_data_copy = job_data.copy()
@@ -221,13 +227,17 @@ class RedisService:
     async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """
         Get job data from Redis.
-        
+
         Args:
             job_id: Job identifier
-        
+
         Returns:
             Dict containing job data or None if not found
         """
+        if not self._is_connected or not self.client:
+            logger.warning(f"Redis unavailable - cannot get job {job_id} (degraded mode)")
+            return None
+
         try:
             job_key = f"job:{job_id}"
             job_data = await self.client.hgetall(job_key)
@@ -260,14 +270,18 @@ class RedisService:
     async def update_job(self, job_id: str, updates: Dict[str, Any]) -> bool:
         """
         Update job data in Redis, preserving existing fields.
-        
+
         Args:
             job_id: Job identifier
             updates: Fields to update
-        
+
         Returns:
             bool: True if update was successful
         """
+        if not self._is_connected or not self.client:
+            logger.debug(f"Redis unavailable - cannot update job {job_id} (degraded mode)")
+            return False
+
         try:
             # Make a copy to avoid modifying the original
             updates_copy = updates.copy()
@@ -491,6 +505,10 @@ class RedisService:
         Returns:
             bool: True if message was published successfully
         """
+        if not self._is_connected or not self.client:
+            logger.debug(f"Redis unavailable - cannot publish to topic '{topic}' (degraded mode)")
+            return False
+
         try:
             # Convert Pydantic models to dict for JSON serialization
             if hasattr(message, 'model_dump'):
@@ -849,10 +867,15 @@ redis_service = RedisService()
 async def get_redis_service() -> RedisService:
     """
     Dependency to get Redis service instance.
-    
+    Handles connection failures gracefully.
+
     Returns:
-        RedisService instance
+        RedisService instance (may be in degraded mode if Redis unavailable)
     """
     if not redis_service._is_connected:
-        await redis_service.initialize()
+        try:
+            await redis_service.initialize()
+        except Exception as e:
+            logger.warning(f"Redis initialization failed, continuing in degraded mode: {e}")
+            # Return service anyway - it will operate in degraded mode
     return redis_service

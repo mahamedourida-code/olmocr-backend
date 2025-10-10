@@ -42,6 +42,9 @@ primary_region = 'arn'
   SUPABASE_STORAGE_BUCKET = 'jobs'
   TEMP_STORAGE_PATH = '/app/temp_storage'
 
+# NOTE: Redis credentials must be set as secrets, not in fly.toml
+# Run: fly secrets set REDIS_URL="redis://default:AZ2UACQgNjUwMjVkM2YtNDM5YS00NTQzLWE3MTQtOTUyNjk1ODYzMjgwZjQ4ZmE4YjE4ZGE2NDQzMzgxYjkyNjZiMjU3YTU2OTY=@fly-waw.upstash.io:6379" -a backend-lively-hill-7043
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'

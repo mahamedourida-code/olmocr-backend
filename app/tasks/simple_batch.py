@@ -82,16 +82,19 @@ async def process_single_image_simple(
             except Exception as upload_error:
                 logger.warning(f"[Job {job_id}] Supabase upload failed: {upload_error}")
 
-        # Get current job to read processed count
+        # Get current job to read processed count (with fallback if Redis unavailable)
         job_data = await redis.get_job(job_id)
         if not job_data:
-            raise Exception(f"Job {job_id} not found")
+            logger.warning(f"Job {job_id} not found in Redis (may be unavailable), using estimated progress")
+            # Estimate progress without Redis
+            processed_count = img_index + 1
+        else:
+            # Increment processed count
+            processed_count = int(job_data.get('processed_images', 0)) + 1
 
-        # Increment processed count
-        processed_count = int(job_data.get('processed_images', 0)) + 1
         current_progress = int((processed_count / total_images) * 100)
 
-        # Update job
+        # Update job (will fail silently if Redis unavailable)
         await redis.update_job(job_id, {
             'processed_images': processed_count,
             'progress': current_progress,
@@ -99,20 +102,23 @@ async def process_single_image_simple(
             'updated_at': datetime.utcnow().isoformat()
         })
 
-        # Publish progress
-        progress_message = JobProgressUpdate(
-            job_id=job_id,
-            status='processing',
-            progress=current_progress,
-            total_images=total_images,
-            processed_images=processed_count,
-            current_image=img.get('id'),
-            session_id=session_id
-        )
-        await redis.publish_message(
-            WebSocketTopics.session_topic(session_id),
-            progress_message
-        )
+        # Publish progress (will fail silently if Redis unavailable)
+        try:
+            progress_message = JobProgressUpdate(
+                job_id=job_id,
+                status='processing',
+                progress=current_progress,
+                total_images=total_images,
+                processed_images=processed_count,
+                current_image=img.get('id'),
+                session_id=session_id
+            )
+            await redis.publish_message(
+                WebSocketTopics.session_topic(session_id),
+                progress_message
+            )
+        except Exception as pub_error:
+            logger.debug(f"Failed to publish progress (Redis may be unavailable): {pub_error}")
 
         # Publish file_ready for progressive download
         file_info = ProcessedFileInfo(
@@ -123,17 +129,21 @@ async def process_single_image_simple(
             size_bytes=len(excel_data)
         )
 
-        file_ready_message = SingleFileCompletedMessage(
-            job_id=job_id,
-            file_info=file_info,
-            image_number=processed_count,
-            total_images=total_images,
-            session_id=session_id
-        )
-        await redis.publish_message(
-            WebSocketTopics.session_topic(session_id),
-            file_ready_message
-        )
+        # Publish file_ready (will fail silently if Redis unavailable)
+        try:
+            file_ready_message = SingleFileCompletedMessage(
+                job_id=job_id,
+                file_info=file_info,
+                image_number=processed_count,
+                total_images=total_images,
+                session_id=session_id
+            )
+            await redis.publish_message(
+                WebSocketTopics.session_topic(session_id),
+                file_ready_message
+            )
+        except Exception as pub_error:
+            logger.debug(f"Failed to publish file_ready (Redis may be unavailable): {pub_error}")
 
         logger.info(f"[Job {job_id}] Image {img_index+1}/{total_images} completed")
 
@@ -156,22 +166,25 @@ async def process_single_image_simple(
         error_msg = f"Failed to process image {img_index+1}: {str(e)}"
         logger.error(f"[Job {job_id}] {error_msg}", exc_info=True)
 
-        # Update job with error
-        job_data = await redis.get_job(job_id)
-        if job_data:
-            errors = job_data.get('errors', [])
-            if isinstance(errors, str):
-                import json
-                errors = json.loads(errors) if errors else []
-            errors.append(error_msg)
+        # Update job with error (gracefully handle Redis unavailability)
+        try:
+            job_data = await redis.get_job(job_id)
+            if job_data:
+                errors = job_data.get('errors', [])
+                if isinstance(errors, str):
+                    import json
+                    errors = json.loads(errors) if errors else []
+                errors.append(error_msg)
 
-            failed_count = int(job_data.get('failed_images', 0)) + 1
+                failed_count = int(job_data.get('failed_images', 0)) + 1
 
-            await redis.update_job(job_id, {
-                'failed_images': failed_count,
-                'errors': errors,
-                'updated_at': datetime.utcnow().isoformat()
-            })
+                await redis.update_job(job_id, {
+                    'failed_images': failed_count,
+                    'errors': errors,
+                    'updated_at': datetime.utcnow().isoformat()
+                })
+        except Exception as redis_error:
+            logger.debug(f"Failed to update error in Redis: {redis_error}")
 
         return {
             'status': 'error',
@@ -204,11 +217,14 @@ async def process_batch_simple(
     logger.info(f"[Job {job_id}] Starting batch processing: {len(images)} images")
 
     try:
-        # Update job to processing
-        await redis.update_job(job_id, {
-            'status': 'processing',
-            'updated_at': datetime.utcnow().isoformat()
-        })
+        # Update job to processing (gracefully handle Redis unavailability)
+        try:
+            await redis.update_job(job_id, {
+                'status': 'processing',
+                'updated_at': datetime.utcnow().isoformat()
+            })
+        except Exception as redis_error:
+            logger.warning(f"[Job {job_id}] Failed to update job status in Redis: {redis_error}")
 
         # Process images with semaphore to limit concurrency
         semaphore = asyncio.Semaphore(5)  # Max 5 concurrent
@@ -259,17 +275,21 @@ async def process_batch_simple(
 
         processing_time = (datetime.utcnow() - start_time).total_seconds()
 
-        # Update job with final results
-        await redis.update_job(job_id, {
-            'status': final_status,
-            'progress': 100,
-            'processing_time': processing_time,
-            'completed_at': datetime.utcnow().isoformat(),
-            'generated_files': generated_files,
-            'download_urls': download_urls,
-            'file_id': generated_files[0]['file_id'] if generated_files else None,
-            'download_url': download_urls[0] if download_urls else None
-        })
+        # Update job with final results (gracefully handle Redis unavailability)
+        try:
+            await redis.update_job(job_id, {
+                'status': final_status,
+                'progress': 100,
+                'processing_time': processing_time,
+                'completed_at': datetime.utcnow().isoformat(),
+                'generated_files': generated_files,
+                'download_urls': download_urls,
+                'file_id': generated_files[0]['file_id'] if generated_files else None,
+                'download_url': download_urls[0] if download_urls else None
+            })
+            logger.info(f"[Job {job_id}] Updated final status in Redis: {final_status}")
+        except Exception as redis_error:
+            logger.warning(f"[Job {job_id}] Failed to update final status in Redis: {redis_error}")
 
         # Build files list for completion message
         files_info = []
@@ -282,33 +302,40 @@ async def process_batch_simple(
                 size_bytes=file_data.get('size_bytes')
             ))
 
-        # Send completion message
-        completion_message = JobCompletedMessage(
-            job_id=job_id,
-            status=final_status,
-            successful_images=len(successful_results),
-            failed_images=len(failed_results),
-            files=files_info,
-            download_urls=download_urls,
-            primary_download_url=download_urls[0] if download_urls else None,
-            processing_time=processing_time,
-            expires_at=datetime.utcnow() + timedelta(hours=settings.file_retention_hours),
-            session_id=session_id
-        )
+        # Send completion message (gracefully handle Redis unavailability)
+        try:
+            completion_message = JobCompletedMessage(
+                job_id=job_id,
+                status=final_status,
+                successful_images=len(successful_results),
+                failed_images=len(failed_results),
+                files=files_info,
+                download_urls=download_urls,
+                primary_download_url=download_urls[0] if download_urls else None,
+                processing_time=processing_time,
+                expires_at=datetime.utcnow() + timedelta(hours=settings.file_retention_hours),
+                session_id=session_id
+            )
 
-        await redis.publish_message(
-            WebSocketTopics.session_topic(session_id),
-            completion_message
-        )
+            await redis.publish_message(
+                WebSocketTopics.session_topic(session_id),
+                completion_message
+            )
+            logger.info(f"[Job {job_id}] Published completion message")
+        except Exception as pub_error:
+            logger.warning(f"[Job {job_id}] Failed to publish completion message: {pub_error}")
 
         logger.info(f"[Job {job_id}] Completed: {len(successful_results)} successful, {len(failed_results)} failed")
 
     except Exception as e:
         logger.error(f"[Job {job_id}] Batch processing failed: {e}", exc_info=True)
 
-        # Mark job as failed
-        await redis.update_job(job_id, {
-            'status': 'failed',
-            'error': str(e),
-            'updated_at': datetime.utcnow().isoformat()
-        })
+        # Mark job as failed (gracefully handle Redis unavailability)
+        try:
+            await redis.update_job(job_id, {
+                'status': 'failed',
+                'error': str(e),
+                'updated_at': datetime.utcnow().isoformat()
+            })
+        except Exception as redis_error:
+            logger.warning(f"[Job {job_id}] Failed to update failed status in Redis: {redis_error}")
