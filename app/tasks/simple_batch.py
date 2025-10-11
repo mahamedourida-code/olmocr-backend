@@ -6,7 +6,6 @@ No queues, no workers, just clean async processing.
 """
 
 import asyncio
-import base64
 import logging
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
@@ -48,14 +47,15 @@ async def process_single_image_simple(
     try:
         logger.info(f"[Job {job_id}] Processing image {img_index+1}/{total_images}")
 
-        # Decode image
+        # Get base64 image data (already encoded from upload)
         image_data = img['data']
+        # Remove data URL prefix if present
         if image_data.startswith('data:'):
             image_data = image_data.split(',', 1)[1]
-        image_bytes = base64.b64decode(image_data)
 
-        # Extract table with OlmOCR
-        csv_data = await olmocr.extract_table_from_image(image_bytes)
+        # Extract table with OlmOCR - pass base64 string directly (optimization!)
+        # No need to decode→encode, olmocr service handles both formats
+        csv_data = await olmocr.extract_table_from_image(image_data)
 
         # Create Excel
         excel_data = excel.csv_to_xlsx(csv_data, f"Table_{img['id']}")

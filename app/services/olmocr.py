@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 import random
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 import backoff
@@ -72,24 +72,34 @@ class OlmOCRService:
         max_tries=3,
         max_time=30
     )
-    async def extract_table_from_image(self, image_data: bytes) -> str:
+    async def extract_table_from_image(self, image_data: Union[bytes, str]) -> str:
         """
         Extract table data from image using OlmOCR API.
-        
+
         Args:
-            image_data: Binary image data
-            
+            image_data: Binary image data (bytes) or base64 encoded string
+
         Returns:
             Extracted table data as CSV string
-            
+
         Raises:
             OlmOCRError: If API call fails or returns invalid response
         """
         try:
             # Apply rate limiting before making the API call
             await self._apply_rate_limiting()
-            # Convert image to base64
-            img_b64 = base64.b64encode(image_data).decode("utf-8")
+
+            # Handle both bytes and base64 string input
+            if isinstance(image_data, bytes):
+                # Convert binary image to base64
+                img_b64 = base64.b64encode(image_data).decode("utf-8")
+            else:
+                # Already base64 string - use directly (optimization!)
+                # Remove data URL prefix if present
+                if image_data.startswith('data:'):
+                    img_b64 = image_data.split(',', 1)[1]
+                else:
+                    img_b64 = image_data
             
             # Prepare the request
             messages = [

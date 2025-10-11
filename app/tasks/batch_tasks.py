@@ -6,7 +6,6 @@ including single image processing, batch coordination, and cleanup tasks.
 """
 
 import asyncio
-import base64
 import logging
 import traceback
 from typing import Dict, Any, List, Optional
@@ -100,22 +99,17 @@ def process_single_image(self, image_data: str, image_id: str, job_id: str) -> D
         
         # Process image through OlmOCR
         start_time = datetime.utcnow()
-        
-        # Decode base64 image data to bytes
-        try:
-            # Handle data URL format (data:image/png;base64,{base64_data})
-            if image_data.startswith('data:'):
-                # Extract base64 part after comma
-                image_data = image_data.split(',', 1)[1]
-            
-            image_bytes = base64.b64decode(image_data)
-        except Exception as e:
-            raise Exception(f"Invalid base64 image data: {str(e)}")
-        
-        # Run async OCR processing with rate limiting using main loop
+
+        # Handle data URL format if present
+        if image_data.startswith('data:'):
+            # Extract base64 part after comma
+            image_data = image_data.split(',', 1)[1]
+
+        # Run async OCR processing - pass base64 string directly (optimization!)
+        # No need to decode→encode, olmocr service handles both formats
         try:
             ocr_result = main_loop.run_until_complete(
-                olmocr_service.extract_table_from_image(image_bytes)
+                olmocr_service.extract_table_from_image(image_data)
             )
         except Exception as ocr_error:
             logger.error(f"OlmOCR processing failed for image {image_id}: {ocr_error}")
@@ -491,14 +485,15 @@ async def _process_single_image_concurrent(
         try:
             logger.info(f"[Concurrent] Processing image {img_index+1}/{total_images} for job {job_id}")
 
-            # Decode image
+            # Get base64 image data (already encoded from upload)
             image_data = img['data']
+            # Remove data URL prefix if present
             if image_data.startswith('data:'):
                 image_data = image_data.split(',', 1)[1]
-            image_bytes = base64.b64decode(image_data)
 
-            # Extract table data using OlmOCR with rate limiting
-            csv_data = await olmocr_service.extract_table_from_image(image_bytes)
+            # Extract table data using OlmOCR - pass base64 string directly (optimization!)
+            # No need to decode→encode, olmocr service handles both formats
+            csv_data = await olmocr_service.extract_table_from_image(image_data)
 
             # Create Excel file
             excel_data = excel_service.csv_to_xlsx(csv_data, f"Table_{img['id']}")
