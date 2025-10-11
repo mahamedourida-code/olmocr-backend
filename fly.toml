@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for backend-lively-hill-7043 on 2025-10-08T22:22:25+01:00
+# fly.toml app configuration file generated for backend-lively-hill-7043 on 2025-10-11T19:51:00+01:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -8,15 +8,8 @@ primary_region = 'arn'
 
 [build]
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
-
 [env]
+  ALLOWED_ORIGINS = 'http://localhost:3000,https://exceletto.vercel.app,https://frontend-six-rho-53.vercel.app,https://frontend-44j5hlb03-hamas-projects-104eb9bb.vercel.app'
   API_V1_PREFIX = '/api/v1'
   CELERY_WORKER_CONCURRENCY = '2'
   CLEANUP_INTERVAL_HOURS = '1'
@@ -24,7 +17,6 @@ primary_region = 'arn'
   CORS_ALLOW_HEADERS = '["*"]'
   CORS_ALLOW_METHODS = '["GET","POST","PUT","DELETE","OPTIONS"]'
   CORS_ALLOW_ORIGIN_REGEX = 'https://.*\.vercel\.app'
-  ALLOWED_ORIGINS = 'http://localhost:3000,https://exceletto.vercel.app,https://frontend-six-rho-53.vercel.app,https://frontend-44j5hlb03-hamas-projects-104eb9bb.vercel.app'
   DEBUG = 'false'
   DOCS_URL = '/docs'
   ENVIRONMENT = 'production'
@@ -42,8 +34,13 @@ primary_region = 'arn'
   SUPABASE_STORAGE_BUCKET = 'jobs'
   TEMP_STORAGE_PATH = '/app/temp_storage'
 
-# NOTE: Redis credentials must be set as secrets, not in fly.toml
-# Run: fly secrets set REDIS_URL="redis://default:AZ2UACQgNjUwMjVkM2YtNDM5YS00NTQzLWE3MTQtOTUyNjk1ODYzMjgwZjQ4ZmE4YjE4ZGE2NDQzMzgxYjkyNjZiMjU3YTU2OTY=@fly-waw.upstash.io:6379" -a backend-lively-hill-7043
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
   memory = '1gb'

@@ -20,7 +20,7 @@ def main():
             "uvicorn",
             "app.main:app",
             "--host", "0.0.0.0",
-            "--port", str(os.getenv("PORT", "8000")),
+            "--port", str(os.getenv("PORT", "8080")),
             "--workers", "1"
         ]
     elif service_type == "worker":
