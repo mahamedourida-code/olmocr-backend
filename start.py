@@ -3,6 +3,7 @@
 Startup script for different service types based on environment variable.
 This allows Railway to run different services from the same Docker image.
 """
+# Added comment for demonstration - October 11, 2025
 import os
 import sys
 import subprocess
