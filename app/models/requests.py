@@ -1,5 +1,6 @@
 from typing import List, Optional, Literal
 from pydantic import BaseModel, Field, validator
+from app.core.config import settings
 
 
 class ImageData(BaseModel):
@@ -81,7 +82,7 @@ class BatchConvertRequest(BaseModel):
         if not v:
             raise ValueError("Images list cannot be empty")
         
-        if len(v) > 10:  # This should match settings.max_batch_size
-            raise ValueError("Too many images in batch (maximum 10)")
+        if len(v) > settings.max_batch_size:
+            raise ValueError(f"Too many images in batch (maximum {settings.max_batch_size})")
         
         return v

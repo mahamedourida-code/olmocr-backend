@@ -37,14 +37,14 @@ def simple_rate_limit_check(request: Request) -> None:
 
 def simple_batch_validation(image_count: int) -> None:
     """Simple batch validation without dependencies."""
-    MAX_BATCH_SIZE = 20  # Default from config
-    
+    MAX_BATCH_SIZE = settings.max_batch_size
+
     if image_count == 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No images provided for batch processing"
         )
-    
+
     if image_count > MAX_BATCH_SIZE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -190,6 +190,16 @@ async def create_batch_job_multipart(
 
     This is the recommended endpoint for file uploads.
     """
+    # Detailed logging for debugging
+    logger.info(f"[BATCH-UPLOAD] Received request with {len(files)} files")
+    logger.info(f"[BATCH-UPLOAD] Parameters: output_format={output_format}, consolidation_strategy={consolidation_strategy}")
+    logger.info(f"[BATCH-UPLOAD] Session ID: {session.session_id if session else 'None'}")
+    logger.info(f"[BATCH-UPLOAD] User ID: {user['user_id'] if user else 'None'}")
+
+    # Log file details for debugging
+    for i, file in enumerate(files):
+        logger.info(f"[BATCH-UPLOAD] File {i+1}: name={file.filename}, content_type={file.content_type}, size=pending")
+
     # Rate limiting
     simple_rate_limit_check(http_request)
 
@@ -201,36 +211,45 @@ async def create_batch_job_multipart(
     MAX_FILE_SIZE = settings.max_file_size_bytes
 
     for i, file in enumerate(files):
+        logger.info(f"[BATCH-UPLOAD] Validating file {i+1}: {file.filename}")
+
         # Check content type
         if file.content_type not in SUPPORTED_TYPES:
+            error_msg = f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'. Supported types: PNG, JPEG, WebP"
+            logger.error(f"[BATCH-UPLOAD] Validation failed - {error_msg}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'. "
-                       f"Supported types: PNG, JPEG, WebP"
+                detail=error_msg
             )
 
         # Check file size (read first to get size, then seek back)
         file_content = await file.read()
         file_size = len(file_content)
+        logger.info(f"[BATCH-UPLOAD] File {i+1} size: {file_size} bytes ({file_size / 1024 / 1024:.2f}MB)")
 
         if file_size > MAX_FILE_SIZE:
+            error_msg = f"File {i+1} '{file.filename}': File size ({file_size / 1024 / 1024:.2f}MB) exceeds maximum allowed ({MAX_FILE_SIZE / 1024 / 1024:.0f}MB)"
+            logger.error(f"[BATCH-UPLOAD] Validation failed - {error_msg}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File {i+1} '{file.filename}': File size ({file_size / 1024 / 1024:.2f}MB) "
-                       f"exceeds maximum allowed ({MAX_FILE_SIZE / 1024 / 1024:.0f}MB)"
+                detail=error_msg
             )
 
         if file_size < 100:  # Minimum reasonable file size
+            error_msg = f"File {i+1} '{file.filename}': File appears to be empty or corrupted (size: {file_size} bytes)"
+            logger.error(f"[BATCH-UPLOAD] Validation failed - {error_msg}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File {i+1} '{file.filename}': File appears to be empty or corrupted"
+                detail=error_msg
             )
 
         # Reset file pointer for later processing
         await file.seek(0)
+        logger.info(f"[BATCH-UPLOAD] File {i+1} validation passed")
 
     # Generate job ID
     job_id = str(uuid.uuid4())
+    logger.info(f"[BATCH-UPLOAD] Generated job ID: {job_id}")
 
     try:
         # Convert uploaded files to base64 format expected by existing processing pipeline
@@ -332,12 +351,20 @@ async def create_batch_job_multipart(
         )
 
     except Exception as e:
+        # Enhanced error logging for debugging
+        logger.error(f"[BATCH-UPLOAD] Failed to create batch job {job_id}: {str(e)}")
+        logger.error(f"[BATCH-UPLOAD] Error type: {type(e).__name__}")
+        import traceback
+        logger.error(f"[BATCH-UPLOAD] Traceback: {traceback.format_exc()}")
+
         # Clean up job if creation failed
         try:
             await redis_service.delete_job(job_id)
-        except:
-            pass
+            logger.info(f"[BATCH-UPLOAD] Cleaned up failed job {job_id}")
+        except Exception as cleanup_error:
+            logger.warning(f"[BATCH-UPLOAD] Failed to cleanup job {job_id}: {cleanup_error}")
 
+        # Return detailed error information
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create batch job: {str(e)}"

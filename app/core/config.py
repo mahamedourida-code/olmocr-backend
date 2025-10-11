@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     environment: str = Field("development", env="ENVIRONMENT")
     debug: bool = Field(False, env="DEBUG")
     max_file_size_mb: int = Field(10, env="MAX_FILE_SIZE_MB")
-    max_batch_size: int = Field(10, env="MAX_BATCH_SIZE")
+    max_batch_size: int = Field(100, env="MAX_BATCH_SIZE")
     file_retention_hours: int = Field(24, env="FILE_RETENTION_HOURS")
     
     # Server Configuration
