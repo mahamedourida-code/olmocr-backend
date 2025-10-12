@@ -114,21 +114,8 @@ class OlmOCRService:
                         },
                         {
                             "type": "text",
-                            "text": (
-                                "Extract the table data from this image and convert it to CSV format. "
-                                "Rules:\n"
-                                "1. Return ONLY clean CSV data, no explanations or extra text\n"
-                                "2. Use commas to separate columns\n"
-                                "3. Put each row on a new line\n"
-                                "4. Include column headers as the first row\n"
-                                "5. For empty cells, leave them blank or use 'none'\n"
-                                "6. Do NOT include any tokenization information, model metadata, or debugging output\n"
-                                "7. Start your response directly with the CSV data\n\n"
-                                "Example format:\n"
-                                "Header1,Header2,Header3\n"
-                                "Value1,Value2,Value3\n"
-                                "Value4,none,Value6"
-                            )
+                            "text": "Attached is one page of a document that you must process. Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown."
+                                    "Return your output as markdown"
                         }
                     ]
                 }
