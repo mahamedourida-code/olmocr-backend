@@ -134,11 +134,15 @@ class OlmOCRService:
             # Clean and process the response
             csv_content = self._clean_ocr_response(raw_content)
             
+            # Convert pipe-separated to CSV format
+            csv_content = self._convert_pipe_to_csv(csv_content)
+            
             # Validate that we got CSV-like content
             if not self._validate_csv_content(csv_content):
                 logger.warning(f"Invalid CSV format in API response. Raw content: {raw_content[:200]}...")
                 # Try to extract CSV from the response if it contains other text
                 csv_content = self._extract_csv_from_response(raw_content)
+                csv_content = self._convert_pipe_to_csv(csv_content)
                 
                 if not self._validate_csv_content(csv_content):
                     raise OlmOCRError(f"Could not extract valid CSV from API response: {raw_content[:100]}...")
@@ -247,8 +251,8 @@ class OlmOCRService:
             if not line:
                 continue
             
-            # Look for lines that look like CSV (contain commas or are headers)
-            if ',' in line or (not found_csv_start and any(char.isalpha() for char in line)):
+            # Look for lines that look like pipe-separated tables or headers
+            if '|' in line or (not found_csv_start and any(char.isalpha() for char in line)):
                 found_csv_start = True
                 csv_lines.append(line)
             elif found_csv_start and not any(token_indicator in line.lower() for token_indicator in [
@@ -289,6 +293,46 @@ class OlmOCRService:
                 break
         
         return has_csv_structure
+    
+    def _convert_pipe_to_csv(self, content: str) -> str:
+        """
+        Convert pipe-separated content to CSV format.
+        
+        Args:
+            content: Pipe-separated content
+            
+        Returns:
+            CSV formatted content
+        """
+        if not content:
+            return ""
+        
+        lines = content.strip().split('\n')
+        csv_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('|---') or all(c in '|-' for c in line.strip()):
+                continue  # Skip empty lines and separator lines
+            
+            # Remove leading/trailing pipes and split by pipes
+            if line.startswith('|') and line.endswith('|'):
+                line = line[1:-1]  # Remove outer pipes
+            
+            # Split by pipes and clean each cell
+            cells = [cell.strip() for cell in line.split('|')]
+            
+            # Convert to CSV format (escape commas in cell content)
+            csv_cells = []
+            for cell in cells:
+                if ',' in cell or '"' in cell:
+                    # Escape quotes and wrap in quotes
+                    cell = '"' + cell.replace('"', '""') + '"'
+                csv_cells.append(cell)
+            
+            csv_lines.append(','.join(csv_cells))
+        
+        return '\n'.join(csv_lines)
     
     async def process_batch_images(
         self, 
