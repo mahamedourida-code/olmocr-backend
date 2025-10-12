@@ -18,13 +18,10 @@ class SupabaseService:
 
     def __init__(self):
         """Initialize Supabase client."""
-        # Use service role key for backend operations (bypasses RLS)
-        if not settings.supabase_service_role_key:
-            raise ValueError("SUPABASE_SERVICE_ROLE_KEY is required for backend operations")
-        
+        # Use anon key for backend operations (respects RLS with user context)
         self.client: Client = create_client(
             settings.supabase_url,
-            settings.supabase_service_role_key
+            settings.supabase_anon_key
         )
         self.storage_bucket = settings.supabase_storage_bucket
         logger.info("Supabase service initialized with service role key")
