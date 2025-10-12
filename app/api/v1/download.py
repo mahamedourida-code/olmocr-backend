@@ -1,11 +1,13 @@
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
-from app.core.dependencies import get_storage_service
+from app.core.dependencies import get_storage_service, get_current_user, get_optional_user
 from app.services.storage import FileStorageManager
 from app.services.redis_service import get_redis_service, RedisService
+from app.services.supabase_service import get_supabase_service
 from app.models.jobs import SessionMetadata
+import io
 
 router = APIRouter(prefix="/download", tags=["File Downloads"])
 
@@ -172,4 +174,74 @@ async def download_file(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to serve file: {str(e)}"
+        )
+
+
+@router.get("/storage/{storage_path:path}")
+async def download_from_storage(
+    storage_path: str,
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """
+    Download a file from Supabase Storage.
+    
+    This endpoint downloads files that have been saved to permanent storage
+    in Supabase. The storage_path should be the full path within the bucket
+    (e.g., "user_id/job_id/filename.xlsx").
+    
+    Args:
+        storage_path: Path to the file in Supabase Storage
+        user: Optional authenticated user (for access control)
+    
+    Returns:
+        The file as a streaming response
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        logger.info(f"Storage download request for path: {storage_path}")
+        
+        # If user is authenticated, verify they have access to this file
+        if user and not storage_path.startswith(f"{user['user_id']}/"):
+            logger.warning(f"User {user['user_id']} attempted to access file outside their directory: {storage_path}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied - you can only download your own files"
+            )
+        
+        # Download file from Supabase Storage
+        supabase_service = get_supabase_service()
+        
+        try:
+            file_data = await supabase_service.download_file_from_storage(storage_path)
+            
+            # Extract filename from path
+            filename = storage_path.split('/')[-1] if '/' in storage_path else storage_path
+            
+            # Return file as streaming response
+            return StreamingResponse(
+                io.BytesIO(file_data),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={
+                    "Content-Disposition": f"attachment; filename=\"{filename}\"",
+                    "Cache-Control": "public, max-age=3600",  # Cache for 1 hour
+                    "Content-Length": str(len(file_data))
+                }
+            )
+            
+        except Exception as storage_error:
+            logger.error(f"Failed to download from storage: {storage_error}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found in storage"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in storage download: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to download file from storage: {str(e)}"
         )

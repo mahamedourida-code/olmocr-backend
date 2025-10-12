@@ -140,11 +140,11 @@ class SupabaseService:
             Public URL of the uploaded file
         """
         try:
-            # Upload file to storage
+            # Upload file to storage with upsert to overwrite if exists
             response = self.client.storage.from_(self.storage_bucket).upload(
                 file_path,
                 file_data,
-                {"content-type": content_type}
+                {"content-type": content_type, "upsert": "true"}
             )
 
             # Get public URL
@@ -196,6 +196,50 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Failed to get user jobs from Supabase: {e}")
             return []
+    
+    async def download_file_from_storage(
+        self,
+        file_path: str
+    ) -> bytes:
+        """
+        Download a file from Supabase Storage.
+
+        Args:
+            file_path: Path within the bucket (e.g., "user_id/job_id/file.xlsx")
+
+        Returns:
+            File content as bytes
+        """
+        try:
+            # Download file from storage
+            response = self.client.storage.from_(self.storage_bucket).download(file_path)
+            
+            logger.info(f"Downloaded file from Supabase Storage: {file_path}")
+            return response
+
+        except Exception as e:
+            logger.error(f"Failed to download file from Supabase Storage: {e}")
+            raise
+    
+    async def get_storage_public_url(
+        self,
+        file_path: str
+    ) -> str:
+        """
+        Get the public URL for a file in Supabase Storage.
+
+        Args:
+            file_path: Path within the bucket
+
+        Returns:
+            Public URL of the file
+        """
+        try:
+            public_url = self.client.storage.from_(self.storage_bucket).get_public_url(file_path)
+            return public_url
+        except Exception as e:
+            logger.error(f"Failed to get public URL: {e}")
+            raise
 
 
 # Global instance

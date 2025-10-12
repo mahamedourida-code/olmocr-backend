@@ -751,12 +751,14 @@ async def save_job_to_history(
     job_id: str,
     user: dict = Depends(get_current_user),
     redis_service: RedisService = Depends(get_redis_service),
+    storage: FileStorageManager = Depends(get_storage_service),
 ):
     """
     Save a completed job to the user's permanent history.
     
     This endpoint allows users to explicitly save their job results to their history.
     Only completed jobs can be saved, and only by the job owner.
+    Files are uploaded to Supabase Storage for permanent storage.
     """
     try:
         # Get job from Redis
@@ -803,7 +805,43 @@ async def save_job_to_history(
                 "job_id": job_id
             }
 
-        # Create/update job in Supabase
+        # Upload each generated Excel file to Supabase Storage
+        storage_urls = []
+        for file_info in results:
+            file_id = file_info.get('file_id')
+            if not file_id:
+                continue
+            
+            # Get the file from local storage
+            file_path = storage.get_download_file_path(file_id)
+            if not file_path.exists():
+                logger.warning(f"File {file_id} not found on disk, skipping upload")
+                continue
+            
+            # Read file content
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+            
+            # Upload to Supabase Storage with organized path: user_id/job_id/filename
+            storage_path = f"{user['user_id']}/{job_id}/{file_info.get('filename', f'{file_id}.xlsx')}"
+            try:
+                public_url = await supabase_service.upload_file_to_storage(
+                    file_data=file_data,
+                    file_path=storage_path,
+                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                storage_urls.append({
+                    'file_id': file_id,
+                    'filename': file_info.get('filename', f'{file_id}.xlsx'),
+                    'storage_path': storage_path,
+                    'public_url': public_url
+                })
+                logger.info(f"Uploaded file {file_id} to Supabase Storage: {storage_path}")
+            except Exception as upload_error:
+                logger.error(f"Failed to upload file {file_id} to storage: {upload_error}")
+                # Continue with other files even if one fails
+
+        # Create/update job in Supabase with storage URLs
         await supabase_service.create_job(
             job_id=job_id,
             user_id=user['user_id'],
@@ -815,17 +853,30 @@ async def save_job_to_history(
                 'output_format': job_data.get('output_format', 'xlsx'),
                 'session_id': job_data.get('session_id'),
                 'results': results,
+                'storage_files': storage_urls,  # Add storage URLs to metadata
                 'completed_at': job_data.get('updated_at'),
                 'processing_time_seconds': job_data.get('processing_time_seconds')
             }
         )
+        
+        # Update job status to include permanent storage URL
+        if storage_urls:
+            await supabase_service.update_job_status(
+                job_id=job_id,
+                status='completed',
+                result_url=storage_urls[0]['public_url'],  # Primary file URL
+                metadata={
+                    'storage_files': storage_urls
+                }
+            )
 
-        logger.info(f"Job {job_id} saved to history for user {user['user_id']}")
+        logger.info(f"Job {job_id} saved to history with {len(storage_urls)} files uploaded to storage")
 
         return {
             "success": True,
             "message": "Job saved to history successfully",
-            "job_id": job_id
+            "job_id": job_id,
+            "files_uploaded": len(storage_urls)
         }
 
     except HTTPException:
