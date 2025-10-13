@@ -807,16 +807,23 @@ async def save_job_to_history(
 
         # Upload each generated Excel file to Supabase Storage
         storage_urls = []
+        logger.info(f"Starting file upload process for job {job_id}. Found {len(results)} files to upload")
+        
         for file_info in results:
             file_id = file_info.get('file_id')
             if not file_id:
+                logger.warning(f"File info missing file_id: {file_info}")
                 continue
             
             # Get the file from local storage
             file_path = storage.get_download_file_path(file_id)
             if not file_path.exists():
-                logger.warning(f"File {file_id} not found on disk, skipping upload")
+                logger.warning(f"File {file_id} not found on disk at {file_path}, skipping upload")
                 continue
+            
+            # Log file size and location
+            file_size = file_path.stat().st_size
+            logger.info(f"Reading file {file_id} from {file_path} (size: {file_size} bytes)")
             
             # Read file content
             with open(file_path, 'rb') as f:
@@ -824,6 +831,8 @@ async def save_job_to_history(
             
             # Upload to Supabase Storage with enforced path structure
             filename = file_info.get('filename', f'{file_id}.xlsx')
+            logger.info(f"Attempting to upload file {file_id} as {filename} to Supabase Storage")
+            
             try:
                 upload_result = await supabase_service.upload_file_to_storage(
                     file_data=file_data,
@@ -834,6 +843,9 @@ async def save_job_to_history(
                     content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     max_file_size_mb=10  # Set reasonable limit
                 )
+                # Log successful upload response
+                logger.info(f"Upload succeeded! Response: {upload_result}")
+                
                 # Handle both public and signed URLs
                 url_key = 'public_url' if 'public_url' in upload_result else 'signed_url'
                 storage_urls.append({
@@ -844,7 +856,7 @@ async def save_job_to_history(
                     'url_type': upload_result.get('url_type', 'public'),
                     'size_mb': upload_result['size_mb']
                 })
-                logger.info(f"Uploaded file {file_id} to Supabase Storage: {upload_result['storage_path']} ({upload_result['size_mb']:.2f}MB)")
+                logger.info(f"Successfully uploaded file {file_id} to Supabase Storage at path: {upload_result['storage_path']} ({upload_result['size_mb']:.2f}MB)")
             except Exception as upload_error:
                 logger.error(f"Failed to upload file {file_id} to storage: {upload_error}")
                 # Continue with other files even if one fails

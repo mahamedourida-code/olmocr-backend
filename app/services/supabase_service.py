@@ -19,15 +19,21 @@ class SupabaseService:
     def __init__(self):
         """Initialize Supabase client."""
         # Use service role key for backend operations (bypasses RLS)
+        if not settings.supabase_service_role_key:
+            logger.error("SUPABASE_SERVICE_ROLE_KEY is not configured! Storage operations will fail.")
+            raise ValueError("SUPABASE_SERVICE_ROLE_KEY is required for storage operations")
+        
         self.client: Client = create_client(
             settings.supabase_url,
             settings.supabase_service_role_key
         )
+        logger.info(f"Supabase client initialized with service role key (has full access)")
+        
         self.storage_bucket = settings.supabase_storage_bucket
         # Configure whether the storage bucket is public or private
         # For user job data, it should be private for security
         self.is_bucket_public = False  # Set to False for private bucket
-        logger.info(f"Supabase service initialized with bucket '{self.storage_bucket}' (public: {self.is_bucket_public})")
+        logger.info(f"Storage bucket configured: '{self.storage_bucket}' (public: {self.is_bucket_public})")
 
     async def create_job(
         self,
@@ -165,24 +171,43 @@ class SupabaseService:
             storage_path = f"{user_id}/{job_id}/{filename}"
             
             # Upload file to storage with upsert to overwrite if exists
+            # Python client expects different parameters than JS client
             response = self.client.storage.from_(self.storage_bucket).upload(
-                storage_path,
-                file_data,
-                {"content-type": content_type, "x-upsert": "true"}  # Fixed: use x-upsert
+                path=storage_path,
+                file=file_data,
+                file_options={"content-type": content_type, "x-upsert": "true"}
             )
+            
+            # Check if upload was successful
+            if hasattr(response, 'error') and response.error:
+                raise Exception(f"Storage upload failed: {response.error}")
+            
+            logger.info(f"Successfully uploaded file to path: {storage_path}")
 
             # Generate URL based on bucket visibility
             if self.is_bucket_public:
                 # For public buckets, use public URL
-                url = self.client.storage.from_(self.storage_bucket).get_public_url(storage_path)
+                url_data = self.client.storage.from_(self.storage_bucket).get_public_url(storage_path)
+                url = url_data if isinstance(url_data, str) else url_data.get('publicUrl', url_data.get('publicURL'))
                 url_type = "public_url"
             else:
                 # For private buckets, create a signed URL with 7 days expiration
                 signed_response = self.client.storage.from_(self.storage_bucket).create_signed_url(
-                    storage_path,
-                    7 * 24 * 3600  # 7 days expiration for job history
+                    path=storage_path,
+                    expires_in=7 * 24 * 3600  # 7 days expiration for job history
                 )
-                url = signed_response['signedUrl'] if 'signedUrl' in signed_response else signed_response.get('data', {}).get('signedUrl')
+                # Handle different response formats from Python client
+                if isinstance(signed_response, dict):
+                    if 'signedURL' in signed_response:
+                        url = signed_response['signedURL']
+                    elif 'signedUrl' in signed_response:
+                        url = signed_response['signedUrl']
+                    elif 'data' in signed_response:
+                        url = signed_response['data'].get('signedURL') or signed_response['data'].get('signedUrl')
+                    else:
+                        raise Exception(f"Unexpected signed URL response format: {signed_response}")
+                else:
+                    url = signed_response
                 url_type = "signed_url"
 
             logger.info(f"Uploaded file to Supabase Storage: {storage_path} ({file_size_mb:.2f}MB) - {url_type}")
@@ -196,6 +221,7 @@ class SupabaseService:
 
         except Exception as e:
             logger.error(f"Failed to upload file to Supabase Storage: {e}")
+            logger.error(f"Upload parameters - bucket: {self.storage_bucket}, path: {storage_path}, size: {file_size_mb:.2f}MB")
             raise
 
     async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
@@ -278,15 +304,29 @@ class SupabaseService:
             Signed URL for the file
         """
         try:
+            # Use named parameters for Python client
             response = self.client.storage.from_(self.storage_bucket).create_signed_url(
-                file_path,
-                expires_in
+                path=file_path,
+                expires_in=expires_in
             )
             
-            if response.get('error'):
-                raise Exception(f"Failed to create signed URL: {response['error']}")
+            # Handle different response formats
+            if isinstance(response, str):
+                signed_url = response
+            elif isinstance(response, dict):
+                if response.get('error'):
+                    raise Exception(f"Failed to create signed URL: {response['error']}")
+                if 'signedURL' in response:
+                    signed_url = response['signedURL']
+                elif 'signedUrl' in response:
+                    signed_url = response['signedUrl']
+                elif 'data' in response:
+                    signed_url = response['data'].get('signedUrl') or response['data'].get('signedURL')
+                else:
+                    raise Exception(f"Unexpected response format: {response}")
+            else:
+                raise Exception(f"Unexpected response type: {type(response)}")
             
-            signed_url = response['data']['signedUrl'] if 'data' in response else response.get('signedUrl')
             logger.info(f"Created signed URL for {file_path} (expires in {expires_in}s)")
             return signed_url
         except Exception as e:
