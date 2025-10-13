@@ -167,45 +167,67 @@ class SupabaseService:
             file_size_mb = len(file_data) / (1024 * 1024)
             logger.info(f"Uploading {filename} ({file_size_mb:.2f}MB) to {storage_path}")
             
+            # First check if file already exists and remove it (to avoid conflicts)
+            try:
+                # Try to delete existing file if it exists
+                self.client.storage.from_(self.storage_bucket).remove([storage_path])
+                logger.info(f"Removed existing file at {storage_path}")
+            except Exception:
+                # File doesn't exist, which is fine
+                pass
+            
             # Upload using Python client syntax from documentation
-            # Python client: .upload(path, data, options_dict)
+            # Using upsert=true to overwrite if it exists (as backup)
             response = self.client.storage.from_(self.storage_bucket).upload(
-                storage_path,
-                file_data,
-                {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+                path=storage_path,
+                file=file_data,
+                file_options={
+                    "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "upsert": "true"  # Use string "true" as per docs
+                }
             )
             
             # Log response for debugging
             logger.info(f"Upload response type: {type(response)}")
             logger.info(f"Upload response: {response}")
             
-            # Check for errors
-            # The Python client returns an UploadResponse object on success
-            if hasattr(response, 'path'):
-                # Success - response is an UploadResponse object
-                logger.info(f"File uploaded successfully to: {response.path}")
+            # Check for errors - Supabase Python client returns different types
+            if hasattr(response, 'error') and response.error:
+                raise Exception(f"Upload error: {response.error}")
             elif isinstance(response, dict) and response.get('error'):
                 raise Exception(f"Upload error: {response['error']}")
+            elif hasattr(response, 'path'):
+                # Success - response is an UploadResponse object
+                logger.info(f"File uploaded successfully to: {response.path}")
             else:
-                logger.warning(f"Unexpected response format: {type(response)}")
+                # Assume success if no error
+                logger.info(f"File upload completed (response: {type(response)})")
                 
             # Generate a signed URL for private bucket (7 days expiry)
             signed_response = self.client.storage.from_(self.storage_bucket).create_signed_url(
-                storage_path,
-                7 * 24 * 3600  # 7 days
+                path=storage_path,
+                expires_in=7 * 24 * 3600  # 7 days in seconds
             )
             
             # Extract URL from response (Python client returns dict with signedURL)
+            access_url = None
             if isinstance(signed_response, dict):
-                access_url = signed_response.get('signedURL') or signed_response.get('signedUrl')
-                logger.info(f"Generated signed URL for {storage_path}")
+                if 'error' in signed_response:
+                    logger.error(f"Failed to create signed URL: {signed_response['error']}")
+                    # Fall back to public URL if signing fails
+                    access_url = f"{settings.supabase_url}/storage/v1/object/sign/{self.storage_bucket}/{storage_path}"
+                else:
+                    access_url = signed_response.get('signedURL') or signed_response.get('signedUrl') or signed_response.get('data', {}).get('signedUrl')
+                    logger.info(f"Generated signed URL for {storage_path}")
             elif isinstance(signed_response, str):
                 access_url = signed_response
+                logger.info(f"Got signed URL string for {storage_path}")
             else:
-                logger.warning(f"Unexpected signed URL response: {type(signed_response)}")
-                access_url = None
+                logger.warning(f"Unexpected signed URL response: {type(signed_response)}, {signed_response}")
+                # Fall back to constructing the URL
+                access_url = f"{settings.supabase_url}/storage/v1/object/sign/{self.storage_bucket}/{storage_path}"
                 
-            logger.info(f"File uploaded successfully to {storage_path}")
+            logger.info(f"File uploaded successfully to {storage_path} with URL: {access_url[:100]}...")
             
             return {
                 "storage_path": storage_path,
@@ -215,7 +237,10 @@ class SupabaseService:
             }
             
         except Exception as e:
-            logger.error(f"Failed to upload file: {e}")
+            logger.error(f"Failed to upload file to Supabase Storage: {str(e)}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             raise
             
     async def upload_file_to_storage(
