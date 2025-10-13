@@ -971,6 +971,34 @@ async def save_job_to_history(
         )
 
 
+@router.delete("/saved-history/all")
+async def delete_all_from_history(
+    user: dict = Depends(get_current_user)
+):
+    """
+    Delete all jobs from user's saved history.
+    
+    This is a destructive operation that removes all saved job history for the user.
+    """
+    try:
+        supabase_service = get_supabase_service()
+        
+        # Delete all from job_history table for this user
+        deleted_count = await supabase_service.delete_all_from_job_history(user['user_id'])
+        
+        return {
+            "success": True, 
+            "message": f"Deleted {deleted_count} jobs from history",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.error(f"Failed to delete all jobs from history for user {user['user_id']}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete jobs from history: {str(e)}"
+        )
+
+
 @router.delete("/saved-history/{job_id}")
 async def delete_from_history(
     job_id: str,
@@ -1004,32 +1032,4 @@ async def delete_from_history(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete job from history: {str(e)}"
-        )
-
-
-@router.delete("/saved-history")
-async def delete_all_from_history(
-    user: dict = Depends(get_current_user)
-):
-    """
-    Delete all jobs from user's saved history.
-    
-    This is a destructive operation that removes all saved job history for the user.
-    """
-    try:
-        supabase_service = get_supabase_service()
-        
-        # Delete all from job_history table for this user
-        deleted_count = await supabase_service.delete_all_from_job_history(user['user_id'])
-        
-        return {
-            "success": True, 
-            "message": f"Deleted {deleted_count} jobs from history",
-            "deleted_count": deleted_count
-        }
-    except Exception as e:
-        logger.error(f"Failed to delete all jobs from history for user {user['user_id']}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete jobs from history: {str(e)}"
         )
