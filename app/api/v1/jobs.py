@@ -746,6 +746,55 @@ async def get_job_history(
         )
 
 
+@router.get("/saved-history")
+async def get_saved_history(
+    user: dict = Depends(get_current_user),
+    limit: int = 50,
+    offset: int = 0
+):
+    """
+    Get saved job history for the authenticated user.
+    
+    Returns a paginated list of explicitly saved completed jobs from job_history table.
+    Only shows jobs that were saved by the user, not all processing jobs.
+    """
+    try:
+        supabase_service = get_supabase_service()
+
+        # Get user's saved jobs from job_history table
+        result = await supabase_service.get_user_saved_history(user['user_id'], limit=limit, offset=offset)
+
+        # Format response with download URLs
+        formatted_jobs = []
+        for job in result.get("jobs", []):
+            formatted_job = {
+                "job_id": job.get("original_job_id", job.get("id")),
+                "filename": job.get("filename", "Unknown"),
+                "status": job.get("status", "completed"),
+                "result_url": job.get("result_url"),
+                "created_at": job.get("created_at"),
+                "updated_at": job.get("updated_at"),
+                "saved_at": job.get("saved_at"),
+                "metadata": job.get("processing_metadata", {})
+            }
+            formatted_jobs.append(formatted_job)
+
+        return {
+            "jobs": formatted_jobs,
+            "total": result.get("total", 0),
+            "limit": limit,
+            "offset": offset,
+            "has_more": result.get("has_more", False)
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get saved job history: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve saved job history: {str(e)}"
+        )
+
+
 @router.post("/{job_id}/save")
 async def save_job_to_history(
     job_id: str,
@@ -794,9 +843,9 @@ async def save_job_to_history(
         # Save to Supabase if not already saved
         supabase_service = get_supabase_service()
         
-        # Check if already exists in user's history
-        existing_jobs = await supabase_service.get_user_jobs(user['user_id'], limit=1000)
-        job_exists = any(job.get('id') == job_id for job in existing_jobs)
+        # Check if already exists in user's saved history (in job_history table)
+        existing_history = await supabase_service.get_user_saved_history(user['user_id'], limit=1000)
+        job_exists = any(job.get('original_job_id') == job_id for job in existing_history.get("jobs", []))
         
         if job_exists:
             return {
@@ -859,14 +908,16 @@ async def save_job_to_history(
                 logger.error(f"Failed to upload file {file_id} to storage: {upload_error}")
                 # Continue with other files even if one fails
 
-        # Create job in Supabase with completed status and storage URLs
+        # Save to job_history table instead of processing_jobs
         primary_url = storage_urls[0]['url'] if storage_urls else None
-        await supabase_service.create_job(
-            job_id=job_id,
+        
+        # Create entry in job_history table
+        await supabase_service.save_to_job_history(
             user_id=user['user_id'],
+            original_job_id=job_id,
             filename=f"batch_{job_data.get('total_images', 0)}_images",
-            status="completed",  # Set status to completed since this is saving a completed job
-            result_url=primary_url,  # Set the primary result URL
+            status="completed",
+            result_url=primary_url,
             metadata={
                 'total_images': job_data.get('total_images', 0),
                 'processed_images': job_data.get('processed_images', 0),
@@ -879,12 +930,8 @@ async def save_job_to_history(
                 'processing_time_seconds': job_data.get('processing_time_seconds')
             }
         )
-        
-        # Note: No need to update job status separately since we already created it with 
-        # status='completed' and result_url set. The update_job_status call is removed
-        # to avoid redundant database operations.
 
-        logger.info(f"Job {job_id} saved to history with {len(storage_urls)} files uploaded to storage")
+        logger.info(f"Job {job_id} saved to job_history table with {len(storage_urls)} files uploaded to storage")
 
         return {
             "success": True,

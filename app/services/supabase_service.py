@@ -318,6 +318,92 @@ class SupabaseService:
             logger.error(f"Failed to get user jobs from Supabase: {e}")
             return []
     
+    async def save_to_job_history(
+        self,
+        user_id: str,
+        original_job_id: str,
+        filename: str,
+        status: str = "completed",
+        result_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Save a job to the job_history table.
+
+        Args:
+            user_id: User identifier
+            original_job_id: Original job ID from processing_jobs
+            filename: Job filename
+            status: Job status (default: completed)
+            result_url: URL to the result file
+            metadata: Additional metadata
+
+        Returns:
+            Created history record
+        """
+        try:
+            import uuid
+            history_data = {
+                "id": str(uuid.uuid4()),  # Generate new UUID for history entry
+                "user_id": user_id,
+                "original_job_id": original_job_id,
+                "filename": filename,
+                "status": status,
+                "result_url": result_url,
+                "processing_metadata": metadata or {},
+                "saved_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }
+
+            response = self.client.table("job_history").insert(history_data).execute()
+            logger.info(f"Saved job {original_job_id} to history for user {user_id}")
+            return response.data[0] if response.data else {}
+
+        except Exception as e:
+            logger.error(f"Failed to save job to history in Supabase: {e}")
+            raise
+    
+    async def get_user_saved_history(self, user_id: str, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+        """
+        Get saved job history for a user from job_history table.
+
+        Args:
+            user_id: User identifier
+            limit: Maximum number of jobs to return
+            offset: Number of records to skip
+
+        Returns:
+            List of saved job records
+        """
+        try:
+            # Get total count first
+            count_response = self.client.table("job_history")\
+                .select("*", count="exact")\
+                .eq("user_id", user_id)\
+                .execute()
+            
+            total_count = count_response.count if hasattr(count_response, 'count') else 0
+            
+            # Get paginated data
+            response = self.client.table("job_history")\
+                .select("*")\
+                .eq("user_id", user_id)\
+                .order("saved_at", desc=True)\
+                .range(offset, offset + limit - 1)\
+                .execute()
+            
+            return {
+                "jobs": response.data,
+                "total": total_count,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total_count
+            }
+        except Exception as e:
+            logger.error(f"Failed to get user saved history from Supabase: {e}")
+            return {"jobs": [], "total": 0, "limit": limit, "offset": offset, "has_more": False}
+    
     async def download_file_from_storage(
         self,
         file_path: str
