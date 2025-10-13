@@ -932,7 +932,10 @@ async def save_job_to_history(
                     metadata={
                         'parent_job_id': job_id,  # Keep reference to parent batch job
                         'file_index': idx,
+                        'total_images': 1,  # Each file represents 1 processed image
                         'total_files': len(storage_urls),
+                        # Include storage_files array that frontend expects
+                        'storage_files': [storage_file],  # Single file in array format
                         'storage_path': storage_file['storage_path'],
                         'file_id': storage_file['file_id'],
                         'size_mb': storage_file['size_mb'],
