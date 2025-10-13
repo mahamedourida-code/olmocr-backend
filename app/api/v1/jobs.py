@@ -844,8 +844,13 @@ async def save_job_to_history(
         supabase_service = get_supabase_service()
         
         # Check if already exists in user's saved history (in job_history table)
+        # Check for the parent job ID in metadata to avoid duplicates
         existing_history = await supabase_service.get_user_saved_history(user['user_id'], limit=1000)
-        job_exists = any(job.get('original_job_id') == job_id for job in existing_history.get("jobs", []))
+        job_exists = any(
+            job.get('original_job_id', '').startswith(f"{job_id}_") or 
+            job.get('processing_metadata', {}).get('parent_job_id') == job_id 
+            for job in existing_history.get("jobs", [])
+        )
         
         if job_exists:
             return {
@@ -908,45 +913,49 @@ async def save_job_to_history(
                 logger.error(f"Failed to upload file {file_id} to storage: {upload_error}")
                 # Continue with other files even if one fails
 
-        # Save to job_history table instead of processing_jobs
-        primary_url = storage_urls[0]['url'] if storage_urls else None
+        # Save EACH FILE as a separate entry in job_history table
+        saved_count = 0
         
-        # Get original filenames from the job data
-        filenames = []
-        for result in results:
-            if result.get('filename'):
-                filenames.append(result.get('filename'))
-        
-        # Use actual filenames or fall back to batch name
-        display_filename = ", ".join(filenames) if filenames else f"batch_{job_data.get('total_images', 0)}_images"
-        
-        # Create entry in job_history table
-        await supabase_service.save_to_job_history(
-            user_id=user['user_id'],
-            original_job_id=job_id,
-            filename=display_filename,
-            status="completed",
-            result_url=primary_url,
-            metadata={
-                'total_images': job_data.get('total_images', 0),
-                'processed_images': job_data.get('processed_images', 0),
-                'consolidation_strategy': job_data.get('consolidation_strategy', 'separate'),
-                'output_format': job_data.get('output_format', 'xlsx'),
-                'session_id': job_data.get('session_id'),
-                'results': results,
-                'storage_files': storage_urls,  # Add storage URLs to metadata
-                'completed_at': job_data.get('updated_at'),
-                'processing_time_seconds': job_data.get('processing_time_seconds')
-            }
-        )
+        # Create a separate history entry for each file
+        for idx, storage_file in enumerate(storage_urls):
+            try:
+                # Get the original filename for this specific file
+                original_filename = storage_file.get('filename', f'file_{idx + 1}.xlsx')
+                
+                # Create individual entry in job_history table for each file
+                await supabase_service.save_to_job_history(
+                    user_id=user['user_id'],
+                    original_job_id=f"{job_id}_{idx}",  # Make unique ID for each file
+                    filename=original_filename,  # Use individual filename
+                    status="completed",
+                    result_url=storage_file['url'],  # Use this file's specific URL
+                    metadata={
+                        'parent_job_id': job_id,  # Keep reference to parent batch job
+                        'file_index': idx,
+                        'total_files': len(storage_urls),
+                        'storage_path': storage_file['storage_path'],
+                        'file_id': storage_file['file_id'],
+                        'size_mb': storage_file['size_mb'],
+                        'consolidation_strategy': job_data.get('consolidation_strategy', 'separate'),
+                        'output_format': job_data.get('output_format', 'xlsx'),
+                        'session_id': job_data.get('session_id'),
+                        'completed_at': job_data.get('updated_at'),
+                        'processing_time_seconds': job_data.get('processing_time_seconds')
+                    }
+                )
+                saved_count += 1
+                logger.info(f"Saved file {original_filename} to job_history as separate entry")
+            except Exception as e:
+                logger.error(f"Failed to save file {idx} to history: {e}")
+                # Continue saving other files even if one fails
 
-        logger.info(f"Job {job_id} saved to job_history table with {len(storage_urls)} files uploaded to storage")
+        logger.info(f"Job {job_id} saved to job_history table with {saved_count} separate file entries")
 
         return {
             "success": True,
-            "message": "Job saved to history successfully",
+            "message": f"Saved {saved_count} files to history successfully",
             "job_id": job_id,
-            "files_uploaded": len(storage_urls)
+            "files_uploaded": saved_count
         }
 
     except HTTPException:

@@ -411,21 +411,35 @@ class SupabaseService:
     ) -> bool:
         """
         Delete a specific job from job_history table.
+        
+        This handles both individual file deletion and parent job deletion.
+        If original_job_id contains underscore, it's a specific file.
+        Otherwise, we delete all files from that parent job.
 
         Args:
             user_id: User identifier
-            original_job_id: Original job ID to delete
+            original_job_id: Original job ID to delete (can be parent_id or parent_id_index)
 
         Returns:
             True if deleted successfully, False if not found
         """
         try:
-            # Delete from job_history where user_id and original_job_id match
-            response = self.client.table("job_history")\
-                .delete()\
-                .eq("user_id", user_id)\
-                .eq("original_job_id", original_job_id)\
-                .execute()
+            # Check if this is a specific file (has _index suffix) or parent job
+            if '_' in original_job_id:
+                # Delete specific file entry
+                response = self.client.table("job_history")\
+                    .delete()\
+                    .eq("user_id", user_id)\
+                    .eq("original_job_id", original_job_id)\
+                    .execute()
+            else:
+                # Delete all entries with this parent job ID
+                # First try to delete by parent_job_id in metadata
+                response = self.client.table("job_history")\
+                    .delete()\
+                    .eq("user_id", user_id)\
+                    .like("original_job_id", f"{original_job_id}_%")\
+                    .execute()
             
             # Check if any rows were deleted
             return len(response.data) > 0 if response.data else False
