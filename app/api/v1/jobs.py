@@ -829,31 +829,29 @@ async def save_job_to_history(
             with open(file_path, 'rb') as f:
                 file_data = f.read()
             
-            # Upload to Supabase Storage with enforced path structure
+            # Upload to Supabase Storage using simplified method
             filename = file_info.get('filename', f'{file_id}.xlsx')
             logger.info(f"Attempting to upload file {file_id} as {filename} to Supabase Storage")
             
             try:
-                upload_result = await supabase_service.upload_file_to_storage(
+                # Use the new simplified upload method
+                upload_result = await supabase_service.upload_job_file(
                     file_data=file_data,
-                    file_path="",  # Deprecated parameter, kept for compatibility
                     user_id=user['user_id'],
                     job_id=job_id,
-                    filename=filename,
-                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    max_file_size_mb=10  # Set reasonable limit
+                    filename=filename
                 )
+                
                 # Log successful upload response
                 logger.info(f"Upload succeeded! Response: {upload_result}")
                 
-                # Handle both public and signed URLs
-                url_key = 'public_url' if 'public_url' in upload_result else 'signed_url'
+                # Store the upload result
                 storage_urls.append({
                     'file_id': file_id,
-                    'filename': filename,
+                    'filename': upload_result['filename'],
                     'storage_path': upload_result['storage_path'],
-                    'url': upload_result[url_key],  # Use generic 'url' key
-                    'url_type': upload_result.get('url_type', 'public'),
+                    'url': upload_result['access_url'],  # The signed URL
+                    'url_type': 'signed_url',  # Always signed for private bucket
                     'size_mb': upload_result['size_mb']
                 })
                 logger.info(f"Successfully uploaded file {file_id} to Supabase Storage at path: {upload_result['storage_path']} ({upload_result['size_mb']:.2f}MB)")

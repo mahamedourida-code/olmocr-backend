@@ -176,24 +176,33 @@ class SupabaseService:
             )
             
             # Log response for debugging
+            logger.info(f"Upload response type: {type(response)}")
             logger.info(f"Upload response: {response}")
             
             # Check for errors
-            if isinstance(response, dict) and response.get('error'):
+            # The Python client returns an UploadResponse object on success
+            if hasattr(response, 'path'):
+                # Success - response is an UploadResponse object
+                logger.info(f"File uploaded successfully to: {response.path}")
+            elif isinstance(response, dict) and response.get('error'):
                 raise Exception(f"Upload error: {response['error']}")
+            else:
+                logger.warning(f"Unexpected response format: {type(response)}")
                 
             # Generate a signed URL for private bucket (7 days expiry)
-            signed_url = self.client.storage.from_(self.storage_bucket).create_signed_url(
+            signed_response = self.client.storage.from_(self.storage_bucket).create_signed_url(
                 storage_path,
                 7 * 24 * 3600  # 7 days
             )
             
-            # Extract URL from response
-            if isinstance(signed_url, str):
-                access_url = signed_url
-            elif isinstance(signed_url, dict):
-                access_url = signed_url.get('signedURL') or signed_url.get('signedUrl') or signed_url.get('data', {}).get('signedUrl')
+            # Extract URL from response (Python client returns dict with signedURL)
+            if isinstance(signed_response, dict):
+                access_url = signed_response.get('signedURL') or signed_response.get('signedUrl')
+                logger.info(f"Generated signed URL for {storage_path}")
+            elif isinstance(signed_response, str):
+                access_url = signed_response
             else:
+                logger.warning(f"Unexpected signed URL response: {type(signed_response)}")
                 access_url = None
                 
             logger.info(f"File uploaded successfully to {storage_path}")
