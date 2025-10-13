@@ -136,6 +136,79 @@ class SupabaseService:
             logger.error(f"Failed to update job status in Supabase: {e}")
             raise
 
+    async def upload_job_file(
+        self,
+        file_data: bytes,
+        user_id: str,
+        job_id: str,
+        filename: str
+    ) -> Dict[str, Any]:
+        """
+        Simplified method to upload a job file to Supabase Storage.
+        
+        This follows the standard cloud storage pattern:
+        - Files stored at: users/{user_id}/jobs/{job_id}/{filename}
+        - Returns storage path and access URL
+        
+        Args:
+            file_data: File content as bytes
+            user_id: User ID (for path organization and access control)
+            job_id: Job ID
+            filename: File name
+            
+        Returns:
+            Dict with storage_path and access_url
+        """
+        try:
+            # Create storage path following standard pattern
+            storage_path = f"users/{user_id}/jobs/{job_id}/{filename}"
+            
+            # Log upload attempt
+            file_size_mb = len(file_data) / (1024 * 1024)
+            logger.info(f"Uploading {filename} ({file_size_mb:.2f}MB) to {storage_path}")
+            
+            # Upload using Python client syntax from documentation
+            # Python client: .upload(path, data, options_dict)
+            response = self.client.storage.from_(self.storage_bucket).upload(
+                storage_path,
+                file_data,
+                {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+            )
+            
+            # Log response for debugging
+            logger.info(f"Upload response: {response}")
+            
+            # Check for errors
+            if isinstance(response, dict) and response.get('error'):
+                raise Exception(f"Upload error: {response['error']}")
+                
+            # Generate a signed URL for private bucket (7 days expiry)
+            signed_url = self.client.storage.from_(self.storage_bucket).create_signed_url(
+                storage_path,
+                7 * 24 * 3600  # 7 days
+            )
+            
+            # Extract URL from response
+            if isinstance(signed_url, str):
+                access_url = signed_url
+            elif isinstance(signed_url, dict):
+                access_url = signed_url.get('signedURL') or signed_url.get('signedUrl') or signed_url.get('data', {}).get('signedUrl')
+            else:
+                access_url = None
+                
+            logger.info(f"File uploaded successfully to {storage_path}")
+            
+            return {
+                "storage_path": storage_path,
+                "access_url": access_url,
+                "size_mb": file_size_mb,
+                "filename": filename
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to upload file: {e}")
+            raise
+            
     async def upload_file_to_storage(
         self,
         file_data: bytes,
@@ -147,82 +220,29 @@ class SupabaseService:
         max_file_size_mb: int = 10
     ) -> Dict[str, str]:
         """
-        Upload a file to Supabase Storage with consistent path structure.
-
-        Args:
-            file_data: File content as bytes
-            file_path: DEPRECATED - will be auto-generated. Keep for backward compatibility.
-            user_id: User ID for path structure
-            job_id: Job ID for path structure
-            filename: Original filename
-            content_type: MIME type of the file
-            max_file_size_mb: Maximum file size in MB
-
-        Returns:
-            Dict with 'public_url' or 'signed_url' and 'storage_path'
+        Legacy upload method - redirects to simplified version.
+        Kept for backward compatibility.
         """
         try:
-            # Validate file size
-            file_size_mb = len(file_data) / (1024 * 1024)
-            if file_size_mb > max_file_size_mb:
-                raise ValueError(f"File size ({file_size_mb:.2f}MB) exceeds maximum allowed ({max_file_size_mb}MB)")
-            
-            # Enforce consistent path structure: {user_id}/{job_id}/{filename}
-            storage_path = f"{user_id}/{job_id}/{filename}"
-            
-            # Upload file to storage with upsert to overwrite if exists
-            # Python client expects different parameters than JS client
-            response = self.client.storage.from_(self.storage_bucket).upload(
-                path=storage_path,
-                file=file_data,
-                file_options={"content-type": content_type, "x-upsert": "true"}
+            result = await self.upload_job_file(
+                file_data=file_data,
+                user_id=user_id,
+                job_id=job_id,
+                filename=filename
             )
             
-            # Check if upload was successful
-            if hasattr(response, 'error') and response.error:
-                raise Exception(f"Storage upload failed: {response.error}")
-            
-            logger.info(f"Successfully uploaded file to path: {storage_path}")
-
-            # Generate URL based on bucket visibility
-            if self.is_bucket_public:
-                # For public buckets, use public URL
-                url_data = self.client.storage.from_(self.storage_bucket).get_public_url(storage_path)
-                url = url_data if isinstance(url_data, str) else url_data.get('publicUrl', url_data.get('publicURL'))
-                url_type = "public_url"
-            else:
-                # For private buckets, create a signed URL with 7 days expiration
-                signed_response = self.client.storage.from_(self.storage_bucket).create_signed_url(
-                    path=storage_path,
-                    expires_in=7 * 24 * 3600  # 7 days expiration for job history
-                )
-                # Handle different response formats from Python client
-                if isinstance(signed_response, dict):
-                    if 'signedURL' in signed_response:
-                        url = signed_response['signedURL']
-                    elif 'signedUrl' in signed_response:
-                        url = signed_response['signedUrl']
-                    elif 'data' in signed_response:
-                        url = signed_response['data'].get('signedURL') or signed_response['data'].get('signedUrl')
-                    else:
-                        raise Exception(f"Unexpected signed URL response format: {signed_response}")
-                else:
-                    url = signed_response
-                url_type = "signed_url"
-
-            logger.info(f"Uploaded file to Supabase Storage: {storage_path} ({file_size_mb:.2f}MB) - {url_type}")
-            
+            # Convert to legacy format
             return {
-                "public_url" if self.is_bucket_public else "signed_url": url,
-                "storage_path": storage_path,
-                "size_mb": file_size_mb,
-                "url_type": url_type
+                "signed_url": result['access_url'],
+                "storage_path": result['storage_path'],
+                "size_mb": result['size_mb'],
+                "url_type": "signed_url"
             }
-
         except Exception as e:
-            logger.error(f"Failed to upload file to Supabase Storage: {e}")
-            logger.error(f"Upload parameters - bucket: {self.storage_bucket}, path: {storage_path}, size: {file_size_mb:.2f}MB")
+            logger.error(f"Legacy upload failed: {e}")
             raise
+            
+    # Old upload method removed - using simplified upload_job_file() instead
 
     async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -272,12 +292,22 @@ class SupabaseService:
         Download a file from Supabase Storage.
 
         Args:
-            file_path: Path within the bucket (e.g., "user_id/job_id/file.xlsx")
+            file_path: Path within the bucket 
+                      New format: "users/user_id/jobs/job_id/file.xlsx"
+                      Old format: "user_id/job_id/file.xlsx" (auto-converted)
 
         Returns:
             File content as bytes
         """
         try:
+            # Ensure the path uses the new format if needed
+            if not file_path.startswith("users/"):
+                # Convert old format to new format
+                parts = file_path.split("/")
+                if len(parts) >= 3:  # old format: user_id/job_id/filename
+                    file_path = f"users/{parts[0]}/jobs/{parts[1]}/{'/'.join(parts[2:])}"
+                    logger.info(f"Converted path to new format: {file_path}")
+            
             # Download file from storage
             response = self.client.storage.from_(self.storage_bucket).download(file_path)
             
