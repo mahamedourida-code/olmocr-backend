@@ -458,22 +458,26 @@ class SupabaseService:
             Number of deleted records
         """
         try:
-            # First get count of records to delete
-            count_response = self.client.table("job_history")\
-                .select("*", count="exact")\
+            # Get all records for this user to count them
+            get_response = self.client.table("job_history")\
+                .select("id")\
                 .eq("user_id", user_id)\
                 .execute()
             
-            count = count_response.count if hasattr(count_response, 'count') else 0
+            # Count the records we're about to delete
+            count = len(get_response.data) if get_response.data else 0
             
-            # Delete all records for this user
+            # Delete all records for this user if any exist
             if count > 0:
-                response = self.client.table("job_history")\
+                delete_response = self.client.table("job_history")\
                     .delete()\
                     .eq("user_id", user_id)\
                     .execute()
                 
+                logger.info(f"Deleted {count} job history records for user {user_id}")
                 return count
+            
+            logger.info(f"No job history records found to delete for user {user_id}")
             return 0
         except Exception as e:
             logger.error(f"Failed to delete all jobs from history: {e}")
