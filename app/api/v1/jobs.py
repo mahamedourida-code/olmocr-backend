@@ -911,11 +911,20 @@ async def save_job_to_history(
         # Save to job_history table instead of processing_jobs
         primary_url = storage_urls[0]['url'] if storage_urls else None
         
+        # Get original filenames from the job data
+        filenames = []
+        for result in results:
+            if result.get('filename'):
+                filenames.append(result.get('filename'))
+        
+        # Use actual filenames or fall back to batch name
+        display_filename = ", ".join(filenames) if filenames else f"batch_{job_data.get('total_images', 0)}_images"
+        
         # Create entry in job_history table
         await supabase_service.save_to_job_history(
             user_id=user['user_id'],
             original_job_id=job_id,
-            filename=f"batch_{job_data.get('total_images', 0)}_images",
+            filename=display_filename,
             status="completed",
             result_url=primary_url,
             metadata={
@@ -947,4 +956,68 @@ async def save_job_to_history(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to save job to history: {str(e)}"
+        )
+
+
+@router.delete("/saved-history/{job_id}")
+async def delete_from_history(
+    job_id: str,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Delete a specific job from saved history.
+    
+    Only the owner of the job can delete it.
+    """
+    try:
+        supabase_service = get_supabase_service()
+        
+        # Delete from job_history table
+        success = await supabase_service.delete_from_job_history(
+            user_id=user['user_id'],
+            original_job_id=job_id
+        )
+        
+        if success:
+            return {"success": True, "message": "Job deleted from history"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found in history"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete job {job_id} from history: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete job from history: {str(e)}"
+        )
+
+
+@router.delete("/saved-history")
+async def delete_all_from_history(
+    user: dict = Depends(get_current_user)
+):
+    """
+    Delete all jobs from user's saved history.
+    
+    This is a destructive operation that removes all saved job history for the user.
+    """
+    try:
+        supabase_service = get_supabase_service()
+        
+        # Delete all from job_history table for this user
+        deleted_count = await supabase_service.delete_all_from_job_history(user['user_id'])
+        
+        return {
+            "success": True, 
+            "message": f"Deleted {deleted_count} jobs from history",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.error(f"Failed to delete all jobs from history for user {user['user_id']}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete jobs from history: {str(e)}"
         )

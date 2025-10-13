@@ -404,6 +404,67 @@ class SupabaseService:
             logger.error(f"Failed to get user saved history from Supabase: {e}")
             return {"jobs": [], "total": 0, "limit": limit, "offset": offset, "has_more": False}
     
+    async def delete_from_job_history(
+        self, 
+        user_id: str, 
+        original_job_id: str
+    ) -> bool:
+        """
+        Delete a specific job from job_history table.
+
+        Args:
+            user_id: User identifier
+            original_job_id: Original job ID to delete
+
+        Returns:
+            True if deleted successfully, False if not found
+        """
+        try:
+            # Delete from job_history where user_id and original_job_id match
+            response = self.client.table("job_history")\
+                .delete()\
+                .eq("user_id", user_id)\
+                .eq("original_job_id", original_job_id)\
+                .execute()
+            
+            # Check if any rows were deleted
+            return len(response.data) > 0 if response.data else False
+        except Exception as e:
+            logger.error(f"Failed to delete job from history: {e}")
+            raise
+    
+    async def delete_all_from_job_history(self, user_id: str) -> int:
+        """
+        Delete all jobs from job_history table for a user.
+
+        Args:
+            user_id: User identifier
+
+        Returns:
+            Number of deleted records
+        """
+        try:
+            # First get count of records to delete
+            count_response = self.client.table("job_history")\
+                .select("*", count="exact")\
+                .eq("user_id", user_id)\
+                .execute()
+            
+            count = count_response.count if hasattr(count_response, 'count') else 0
+            
+            # Delete all records for this user
+            if count > 0:
+                response = self.client.table("job_history")\
+                    .delete()\
+                    .eq("user_id", user_id)\
+                    .execute()
+                
+                return count
+            return 0
+        except Exception as e:
+            logger.error(f"Failed to delete all jobs from history: {e}")
+            raise
+    
     async def download_file_from_storage(
         self,
         file_path: str
