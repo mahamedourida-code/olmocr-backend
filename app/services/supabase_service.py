@@ -18,13 +18,16 @@ class SupabaseService:
 
     def __init__(self):
         """Initialize Supabase client."""
-        # Use anon key for backend operations (respects RLS with user context)
+        # Use service role key for backend operations (bypasses RLS)
         self.client: Client = create_client(
             settings.supabase_url,
-            settings.supabase_anon_key
+            settings.supabase_service_role_key
         )
         self.storage_bucket = settings.supabase_storage_bucket
-        logger.info("Supabase service initialized with service role key")
+        # Configure whether the storage bucket is public or private
+        # For user job data, it should be private for security
+        self.is_bucket_public = False  # Set to False for private bucket
+        logger.info(f"Supabase service initialized with bucket '{self.storage_bucket}' (public: {self.is_bucket_public})")
 
     async def create_job(
         self,
@@ -32,7 +35,9 @@ class SupabaseService:
         user_id: str,
         image_url: Optional[str] = None,
         filename: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        status: str = "pending",
+        result_url: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create a new processing job in Supabase.
@@ -43,6 +48,8 @@ class SupabaseService:
             image_url: Optional URL to the original image
             filename: Optional original filename
             metadata: Optional additional metadata
+            status: Job status (default: "pending")
+            result_url: Optional result URL for completed jobs
 
         Returns:
             Created job record
@@ -61,9 +68,10 @@ class SupabaseService:
             job_data = {
                 "id": job_uuid,  # Use validated UUID
                 "user_id": user_id,
-                "status": "pending",
+                "status": status,  # Use the provided status instead of hardcoding "pending"
                 "image_url": image_url,
                 "filename": filename,
+                "result_url": result_url,  # Include result_url if provided
                 "processing_metadata": metadata or {},
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat()
@@ -126,32 +134,65 @@ class SupabaseService:
         self,
         file_data: bytes,
         file_path: str,
-        content_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    ) -> str:
+        user_id: str,
+        job_id: str,
+        filename: str,
+        content_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        max_file_size_mb: int = 10
+    ) -> Dict[str, str]:
         """
-        Upload a file to Supabase Storage.
+        Upload a file to Supabase Storage with consistent path structure.
 
         Args:
             file_data: File content as bytes
-            file_path: Path within the bucket (e.g., "user_id/job_id/file.xlsx")
+            file_path: DEPRECATED - will be auto-generated. Keep for backward compatibility.
+            user_id: User ID for path structure
+            job_id: Job ID for path structure
+            filename: Original filename
             content_type: MIME type of the file
+            max_file_size_mb: Maximum file size in MB
 
         Returns:
-            Public URL of the uploaded file
+            Dict with 'public_url' or 'signed_url' and 'storage_path'
         """
         try:
+            # Validate file size
+            file_size_mb = len(file_data) / (1024 * 1024)
+            if file_size_mb > max_file_size_mb:
+                raise ValueError(f"File size ({file_size_mb:.2f}MB) exceeds maximum allowed ({max_file_size_mb}MB)")
+            
+            # Enforce consistent path structure: {user_id}/{job_id}/{filename}
+            storage_path = f"{user_id}/{job_id}/{filename}"
+            
             # Upload file to storage with upsert to overwrite if exists
             response = self.client.storage.from_(self.storage_bucket).upload(
-                file_path,
+                storage_path,
                 file_data,
-                {"content-type": content_type, "upsert": "true"}
+                {"content-type": content_type, "x-upsert": "true"}  # Fixed: use x-upsert
             )
 
-            # Get public URL
-            public_url = self.client.storage.from_(self.storage_bucket).get_public_url(file_path)
+            # Generate URL based on bucket visibility
+            if self.is_bucket_public:
+                # For public buckets, use public URL
+                url = self.client.storage.from_(self.storage_bucket).get_public_url(storage_path)
+                url_type = "public_url"
+            else:
+                # For private buckets, create a signed URL with 7 days expiration
+                signed_response = self.client.storage.from_(self.storage_bucket).create_signed_url(
+                    storage_path,
+                    7 * 24 * 3600  # 7 days expiration for job history
+                )
+                url = signed_response['signedUrl'] if 'signedUrl' in signed_response else signed_response.get('data', {}).get('signedUrl')
+                url_type = "signed_url"
 
-            logger.info(f"Uploaded file to Supabase Storage: {file_path}")
-            return public_url
+            logger.info(f"Uploaded file to Supabase Storage: {storage_path} ({file_size_mb:.2f}MB) - {url_type}")
+            
+            return {
+                "public_url" if self.is_bucket_public else "signed_url": url,
+                "storage_path": storage_path,
+                "size_mb": file_size_mb,
+                "url_type": url_type
+            }
 
         except Exception as e:
             logger.error(f"Failed to upload file to Supabase Storage: {e}")
@@ -221,24 +262,35 @@ class SupabaseService:
             logger.error(f"Failed to download file from Supabase Storage: {e}")
             raise
     
-    async def get_storage_public_url(
+    async def create_signed_url(
         self,
-        file_path: str
+        file_path: str,
+        expires_in: int = 3600
     ) -> str:
         """
-        Get the public URL for a file in Supabase Storage.
+        Create a signed URL for temporary access to a file in private bucket.
 
         Args:
             file_path: Path within the bucket
+            expires_in: URL expiration time in seconds (default: 1 hour)
 
         Returns:
-            Public URL of the file
+            Signed URL for the file
         """
         try:
-            public_url = self.client.storage.from_(self.storage_bucket).get_public_url(file_path)
-            return public_url
+            response = self.client.storage.from_(self.storage_bucket).create_signed_url(
+                file_path,
+                expires_in
+            )
+            
+            if response.get('error'):
+                raise Exception(f"Failed to create signed URL: {response['error']}")
+            
+            signed_url = response['data']['signedUrl'] if 'data' in response else response.get('signedUrl')
+            logger.info(f"Created signed URL for {file_path} (expires in {expires_in}s)")
+            return signed_url
         except Exception as e:
-            logger.error(f"Failed to get public URL: {e}")
+            logger.error(f"Failed to create signed URL: {e}")
             raise
 
 

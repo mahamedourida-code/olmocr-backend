@@ -822,30 +822,41 @@ async def save_job_to_history(
             with open(file_path, 'rb') as f:
                 file_data = f.read()
             
-            # Upload to Supabase Storage with organized path: user_id/job_id/filename
-            storage_path = f"{user['user_id']}/{job_id}/{file_info.get('filename', f'{file_id}.xlsx')}"
+            # Upload to Supabase Storage with enforced path structure
+            filename = file_info.get('filename', f'{file_id}.xlsx')
             try:
-                public_url = await supabase_service.upload_file_to_storage(
+                upload_result = await supabase_service.upload_file_to_storage(
                     file_data=file_data,
-                    file_path=storage_path,
-                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    file_path="",  # Deprecated parameter, kept for compatibility
+                    user_id=user['user_id'],
+                    job_id=job_id,
+                    filename=filename,
+                    content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    max_file_size_mb=10  # Set reasonable limit
                 )
+                # Handle both public and signed URLs
+                url_key = 'public_url' if 'public_url' in upload_result else 'signed_url'
                 storage_urls.append({
                     'file_id': file_id,
-                    'filename': file_info.get('filename', f'{file_id}.xlsx'),
-                    'storage_path': storage_path,
-                    'public_url': public_url
+                    'filename': filename,
+                    'storage_path': upload_result['storage_path'],
+                    'url': upload_result[url_key],  # Use generic 'url' key
+                    'url_type': upload_result.get('url_type', 'public'),
+                    'size_mb': upload_result['size_mb']
                 })
-                logger.info(f"Uploaded file {file_id} to Supabase Storage: {storage_path}")
+                logger.info(f"Uploaded file {file_id} to Supabase Storage: {upload_result['storage_path']} ({upload_result['size_mb']:.2f}MB)")
             except Exception as upload_error:
                 logger.error(f"Failed to upload file {file_id} to storage: {upload_error}")
                 # Continue with other files even if one fails
 
-        # Create/update job in Supabase with storage URLs
+        # Create job in Supabase with completed status and storage URLs
+        primary_url = storage_urls[0]['url'] if storage_urls else None
         await supabase_service.create_job(
             job_id=job_id,
             user_id=user['user_id'],
             filename=f"batch_{job_data.get('total_images', 0)}_images",
+            status="completed",  # Set status to completed since this is saving a completed job
+            result_url=primary_url,  # Set the primary result URL
             metadata={
                 'total_images': job_data.get('total_images', 0),
                 'processed_images': job_data.get('processed_images', 0),
@@ -859,16 +870,9 @@ async def save_job_to_history(
             }
         )
         
-        # Update job status to include permanent storage URL
-        if storage_urls:
-            await supabase_service.update_job_status(
-                job_id=job_id,
-                status='completed',
-                result_url=storage_urls[0]['public_url'],  # Primary file URL
-                metadata={
-                    'storage_files': storage_urls
-                }
-            )
+        # Note: No need to update job status separately since we already created it with 
+        # status='completed' and result_url set. The update_job_status call is removed
+        # to avoid redundant database operations.
 
         logger.info(f"Job {job_id} saved to history with {len(storage_urls)} files uploaded to storage")
 
