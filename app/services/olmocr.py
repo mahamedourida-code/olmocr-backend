@@ -130,24 +130,31 @@ class OlmOCRService:
                 raise OlmOCRError("Empty response from OlmOCR API")
             
             raw_content = response.choices[0].message.content.strip()
+            logger.info(f"Received OCR response, length: {len(raw_content)}")
+            logger.debug(f"Raw OCR response (first 500 chars): {raw_content[:500]}...")
             
-            # Clean and process the response
-            csv_content = self._clean_ocr_response(raw_content)
+            # Clean the response (remove code blocks, etc.)
+            cleaned_content = self._clean_ocr_response(raw_content)
             
-            # Convert pipe-separated to CSV format
-            csv_content = self._convert_pipe_to_csv(csv_content)
+            # Extract table data from markdown response
+            table_content = self._extract_csv_from_response(cleaned_content)
             
-            # Validate that we got CSV-like content
+            # Convert to CSV format (handles both pipe-separated and structured data)
+            csv_content = self._convert_pipe_to_csv(table_content)
+            
+            # Validate that we got meaningful content
             if not self._validate_csv_content(csv_content):
-                logger.warning(f"Invalid CSV format in API response. Raw content: {raw_content[:200]}...")
-                # Try to extract CSV from the response if it contains other text
-                csv_content = self._extract_csv_from_response(raw_content)
-                csv_content = self._convert_pipe_to_csv(csv_content)
+                logger.warning(f"Could not extract valid table structure. Attempting fallback processing...")
+                # Try direct processing of the cleaned content
+                csv_content = self._convert_pipe_to_csv(cleaned_content)
                 
                 if not self._validate_csv_content(csv_content):
-                    raise OlmOCRError(f"Could not extract valid CSV from API response: {raw_content[:100]}...")
+                    # Last resort: treat entire content as single-column data
+                    logger.warning("Treating content as single-column data")
+                    lines = cleaned_content.split('\n')
+                    csv_content = '\n'.join([line.strip() for line in lines if line.strip()])
             
-            logger.info("Successfully extracted table data from image")
+            logger.info(f"Successfully processed OCR data: {len(csv_content.split(chr(10)))} rows")
             return csv_content
             
         except OlmOCRError:
@@ -180,13 +187,13 @@ class OlmOCRService:
     
     def _clean_ocr_response(self, content: str) -> str:
         """
-        Clean the OCR response to remove any non-CSV content.
+        Clean the OCR response to remove any non-table content.
         
         Args:
-            content: Raw response content
+            content: Raw response content (likely in markdown format)
             
         Returns:
-            Cleaned CSV content
+            Cleaned table content
         """
         if not content:
             return ""
@@ -197,7 +204,7 @@ class OlmOCRService:
         # Remove markdown code blocks if present
         if content.startswith("```"):
             lines = content.split('\n')
-            # Remove first line (```csv or similar)
+            # Remove first line (```markdown or similar)
             if lines[0].strip().startswith("```"):
                 lines = lines[1:]
             # Remove last line if it's ```
@@ -205,62 +212,153 @@ class OlmOCRService:
                 lines = lines[:-1]
             content = '\n'.join(lines)
         
-        # Remove any lines that look like tokenization info or debugging
-        lines = content.split('\n')
-        clean_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Skip lines that look like tokenization or debugging info
-            if any(token_indicator in line.lower() for token_indicator in [
-                'token', 'tokenization', '[', ']', 'debug', 'processing',
-                'model output', 'response:', 'extracted:', 'result:'
-            ]):
-                continue
-                
-            # Skip lines that don't look like CSV data
-            if line.startswith('#') or line.startswith('//'):
-                continue
-                
-            clean_lines.append(line)
-        
-        return '\n'.join(clean_lines)
+        return content
     
     def _extract_csv_from_response(self, content: str) -> str:
         """
-        Try to extract CSV data from a response that might contain other text.
+        Extract table data from markdown response, handling both normal and handwritten tables.
         
         Args:
-            content: Response content that might contain CSV
+            content: Response content in markdown format
             
         Returns:
-            Extracted CSV content
+            CSV formatted content
         """
         if not content:
             return ""
         
         lines = content.split('\n')
-        csv_lines = []
-        found_csv_start = False
+        table_lines = []
+        in_table = False
         
         for line in lines:
-            line = line.strip()
-            if not line:
+            stripped = line.strip()
+            
+            # Detect markdown table (contains pipes)
+            if '|' in stripped:
+                in_table = True
+                # Skip separator lines (like |---|---|)
+                if not all(c in '|-: ' for c in stripped):
+                    table_lines.append(stripped)
+            # Handle continuation of table data without pipes (common in handwritten OCR)
+            elif in_table and stripped and not stripped.startswith('#'):
+                # Check if this looks like table data
+                if not any(indicator in stripped.lower() for indicator in ['```', '**', '##']):
+                    table_lines.append(stripped)
+            # End of table detection
+            elif in_table and (not stripped or stripped.startswith('#')):
+                in_table = False
+        
+        # If no markdown tables found, try to extract structured data
+        if not table_lines:
+            return self._extract_structured_data(content)
+        
+        return '\n'.join(table_lines)
+    
+    def _extract_structured_data(self, content: str) -> str:
+        """
+        Extract structured data from content when no markdown tables are found.
+        Particularly useful for handwritten data that may not be formatted as tables.
+        
+        Args:
+            content: Raw markdown content
+            
+        Returns:
+            Structured data in CSV-like format
+        """
+        if not content:
+            return ""
+        
+        lines = content.split('\n')
+        structured_lines = []
+        
+        for line in lines:
+            stripped = line.strip()
+            
+            # Skip empty lines and markdown headers
+            if not stripped or stripped.startswith('#'):
                 continue
             
-            # Look for lines that look like pipe-separated tables or headers
-            if '|' in line or (not found_csv_start and any(char.isalpha() for char in line)):
-                found_csv_start = True
-                csv_lines.append(line)
-            elif found_csv_start and not any(token_indicator in line.lower() for token_indicator in [
-                'token', 'tokenization', '[', ']', 'debug', 'processing'
-            ]):
-                csv_lines.append(line)
+            # Skip markdown formatting
+            if any(indicator in stripped for indicator in ['```', '**', '---']):
+                continue
+            
+            # Remove bullet points and lists markers
+            if stripped.startswith(('- ', '* ', '+ ', '• ')):
+                stripped = stripped[2:].strip()
+            
+            # Remove numbering (1., 2., etc.)
+            import re
+            stripped = re.sub(r'^\d+\.\s+', '', stripped)
+            
+            if stripped:
+                structured_lines.append(stripped)
         
-        return '\n'.join(csv_lines)
+        # Try to detect if this is columnar data by looking for patterns
+        if structured_lines:
+            # Check if lines have consistent delimiters (spaces, tabs, etc.)
+            return self._detect_and_format_columns(structured_lines)
+        
+        return '\n'.join(structured_lines)
+    
+    def _detect_and_format_columns(self, lines: List[str]) -> str:
+        """
+        Detect if lines contain columnar data and format appropriately.
+        Enhanced to better handle handwritten data with irregular spacing.
+        
+        Args:
+            lines: List of text lines
+            
+        Returns:
+            CSV formatted string
+        """
+        if not lines:
+            return ""
+        
+        import re
+        
+        # Try to detect column patterns
+        formatted_lines = []
+        
+        # First, analyze the first line (likely headers) to detect column positions
+        if lines:
+            # Look for consistent spacing patterns across all lines
+            has_multi_columns = any('  ' in line or '\t' in line for line in lines)
+            
+            if has_multi_columns:
+                for line in lines:
+                    # Smart column detection: preserve single spaces within data,
+                    # but treat 2+ spaces as column separators
+                    # This helps with names like "John Doe" vs column gaps
+                    parts = re.split(r'\s{2,}|\t+', line)
+                    # Clean up each part
+                    parts = [part.strip() for part in parts if part.strip()]
+                    formatted_lines.append(','.join(parts))
+            else:
+                # Single column data or tightly spaced data
+                for line in lines:
+                    formatted_lines.append(line)
+        
+        # Check if we have consistent column counts
+        column_counts = []
+        for line in formatted_lines:
+            column_counts.append(len(line.split(',')))
+        
+        # If column counts vary too much, it's probably not tabular data
+        if column_counts:
+            most_common_count = max(set(column_counts), key=column_counts.count)
+            
+            # Normalize all lines to have the same number of columns
+            normalized_lines = []
+            for line in formatted_lines:
+                parts = line.split(',')
+                while len(parts) < most_common_count:
+                    parts.append('')
+                normalized_lines.append(','.join(parts[:most_common_count]))
+            
+            return '\n'.join(normalized_lines)
+        
+        return '\n'.join(formatted_lines)
     
     def _validate_csv_content(self, content: str) -> bool:
         """
@@ -296,10 +394,11 @@ class OlmOCRService:
     
     def _convert_pipe_to_csv(self, content: str) -> str:
         """
-        Convert pipe-separated content to CSV format.
+        Convert pipe-separated markdown table content to CSV format.
+        Enhanced to handle both normal and handwritten table structures.
         
         Args:
-            content: Pipe-separated content
+            content: Pipe-separated or structured content
             
         Returns:
             CSV formatted content
@@ -309,28 +408,73 @@ class OlmOCRService:
         
         lines = content.strip().split('\n')
         csv_lines = []
+        max_columns = 0
         
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('|---') or all(c in '|-' for c in line.strip()):
-                continue  # Skip empty lines and separator lines
-            
-            # Remove leading/trailing pipes and split by pipes
-            if line.startswith('|') and line.endswith('|'):
-                line = line[1:-1]  # Remove outer pipes
-            
-            # Split by pipes and clean each cell
-            cells = [cell.strip() for cell in line.split('|')]
-            
-            # Convert to CSV format (escape commas in cell content)
-            csv_cells = []
-            for cell in cells:
-                if ',' in cell or '"' in cell:
-                    # Escape quotes and wrap in quotes
-                    cell = '"' + cell.replace('"', '""') + '"'
-                csv_cells.append(cell)
-            
-            csv_lines.append(','.join(csv_cells))
+        # First pass: detect if we have pipe-separated content
+        has_pipes = any('|' in line for line in lines)
+        
+        if has_pipes:
+            # Process markdown table format
+            for line in lines:
+                line = line.strip()
+                
+                # Skip separator lines
+                if not line or all(c in '|-: ' for c in line):
+                    continue
+                
+                # Process pipe-separated line
+                if '|' in line:
+                    # Remove leading/trailing pipes
+                    if line.startswith('|'):
+                        line = line[1:]
+                    if line.endswith('|'):
+                        line = line[:-1]
+                    
+                    # Split by pipes and clean each cell
+                    cells = [cell.strip() for cell in line.split('|')]
+                    max_columns = max(max_columns, len(cells))
+                    
+                    # Convert to CSV format
+                    csv_cells = []
+                    for cell in cells:
+                        # Handle empty cells
+                        if not cell:
+                            csv_cells.append('')
+                        elif ',' in cell or '"' in cell or '\n' in cell:
+                            # Escape quotes and wrap in quotes
+                            cell = '"' + cell.replace('"', '""') + '"'
+                            csv_cells.append(cell)
+                        else:
+                            csv_cells.append(cell)
+                    
+                    csv_lines.append(','.join(csv_cells))
+                else:
+                    # Line without pipes in a table context - treat as single column continuation
+                    if line and csv_lines:
+                        # Append to the last cell of the previous row
+                        csv_lines[-1] += ' ' + line
+        else:
+            # No pipes found - process as structured data
+            # This handles cases where handwritten data might not have clear delimiters
+            for line in lines:
+                line = line.strip()
+                if line:
+                    # Try to detect natural column separators (multiple spaces, tabs)
+                    import re
+                    if '  ' in line or '\t' in line:
+                        # Replace multiple spaces/tabs with comma
+                        line = re.sub(r'\s{2,}|\t+', ',', line)
+                    csv_lines.append(line)
+        
+        # Ensure all rows have the same number of columns if we detected a table
+        if max_columns > 1 and csv_lines:
+            normalized_lines = []
+            for line in csv_lines:
+                parts = line.split(',')
+                while len(parts) < max_columns:
+                    parts.append('')
+                normalized_lines.append(','.join(parts[:max_columns]))
+            return '\n'.join(normalized_lines)
         
         return '\n'.join(csv_lines)
     
