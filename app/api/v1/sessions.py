@@ -71,7 +71,7 @@ def generate_session_id(length: int = 10) -> str:
 @router.post("/create", response_model=SessionCreateResponse)
 async def create_share_session(
     request: SessionCreateRequest,
-    user = Depends(get_current_user),
+    user = Depends(get_optional_user),
     supabase: SupabaseService = Depends(get_supabase_service)
 ) -> SessionCreateResponse:
     """
@@ -80,6 +80,9 @@ async def create_share_session(
     This endpoint creates a unique session ID that can be shared to provide
     access to multiple files at once.
     """
+    logger.info(f"Creating share session for user: {user.get('id') if user else 'anonymous'}")
+    logger.info(f"Request data: file_ids={request.file_ids}, title={request.title}")
+    
     try:
         # Generate unique session ID
         max_attempts = 10
