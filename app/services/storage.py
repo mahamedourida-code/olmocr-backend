@@ -497,6 +497,84 @@ class FileStorageManager:
         except Exception as e:
             logger.error(f"Failed to update session metadata for {session.session_id}: {e}")
 
+    async def get_file_info(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get information about a file.
+        
+        Args:
+            file_id: File identifier
+            
+        Returns:
+            Dictionary with file information or None if not found
+        """
+        try:
+            # Try to find the file in the storage directory
+            # First check if it's a direct file
+            file_path = self.storage_path / f"{file_id}.xlsx"
+            if file_path.exists():
+                stat = file_path.stat()
+                return {
+                    'file_id': file_id,
+                    'filename': f"{file_id}.xlsx",
+                    'size_bytes': stat.st_size,
+                    'created_at': datetime.fromtimestamp(stat.st_ctime),
+                    'modified_at': datetime.fromtimestamp(stat.st_mtime)
+                }
+            
+            # Check in session directories
+            for session_dir in self.sessions_path.iterdir():
+                if session_dir.is_dir():
+                    file_path = session_dir / f"{file_id}.xlsx"
+                    if file_path.exists():
+                        stat = file_path.stat()
+                        return {
+                            'file_id': file_id,
+                            'filename': f"{file_id}.xlsx",
+                            'size_bytes': stat.st_size,
+                            'created_at': datetime.fromtimestamp(stat.st_ctime),
+                            'modified_at': datetime.fromtimestamp(stat.st_mtime),
+                            'session_id': session_dir.name
+                        }
+            
+            logger.debug(f"File {file_id} not found in storage")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to get file info for {file_id}: {e}")
+            return None
+
+    async def download_file(self, file_id: str) -> Optional[bytes]:
+        """
+        Download a file from storage.
+        
+        Args:
+            file_id: File identifier
+            
+        Returns:
+            File content as bytes or None if not found
+        """
+        try:
+            # Try to find the file
+            file_path = self.storage_path / f"{file_id}.xlsx"
+            if file_path.exists():
+                with open(file_path, 'rb') as f:
+                    return f.read()
+            
+            # Check in session directories
+            for session_dir in self.sessions_path.iterdir():
+                if session_dir.is_dir():
+                    file_path = session_dir / f"{file_id}.xlsx"
+                    if file_path.exists():
+                        with open(file_path, 'rb') as f:
+                            return f.read()
+            
+            logger.debug(f"File {file_id} not found for download")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to download file {file_id}: {e}")
+            return None
+
 
 # Global storage manager instance
 storage_manager = FileStorageManager()

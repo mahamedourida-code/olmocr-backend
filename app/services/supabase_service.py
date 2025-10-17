@@ -562,6 +562,97 @@ class SupabaseService:
             logger.error(f"Failed to create signed URL: {e}")
             raise
 
+    async def create_share_session(
+        self,
+        session_id: str,
+        user_id: Optional[str],
+        file_ids: List[str],
+        title: str,
+        description: Optional[str] = None,
+        expires_at: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """Create a new share session."""
+        try:
+            data = {
+                'session_id': session_id,
+                'user_id': user_id,
+                'file_ids': file_ids,
+                'title': title,
+                'description': description,
+                'expires_at': expires_at.isoformat() if expires_at else None,
+                'is_active': True
+            }
+            
+            result = self.client.table('share_sessions').insert(data).execute()
+            
+            if result.data:
+                logger.info(f"Created share session {session_id} with {len(file_ids)} files")
+                return result.data[0]
+            else:
+                raise Exception("Failed to create share session")
+                
+        except Exception as e:
+            logger.error(f"Failed to create share session: {e}")
+            raise
+
+    async def get_share_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get a share session by ID."""
+        try:
+            result = self.client.table('share_sessions').select('*').eq(
+                'session_id', session_id
+            ).execute()
+            
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to get share session: {e}")
+            return None
+
+    async def increment_session_access(self, session_id: str) -> None:
+        """Increment the access count for a share session."""
+        try:
+            # Call the stored function
+            self.client.rpc('increment_session_access', {
+                'p_session_id': session_id
+            }).execute()
+            
+            logger.debug(f"Incremented access count for session {session_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to increment session access: {e}")
+            # Don't raise, this is not critical
+
+    async def deactivate_share_session(self, session_id: str) -> None:
+        """Deactivate a share session."""
+        try:
+            result = self.client.table('share_sessions').update({
+                'is_active': False
+            }).eq('session_id', session_id).execute()
+            
+            if result.data:
+                logger.info(f"Deactivated share session {session_id}")
+            else:
+                raise Exception("Failed to deactivate share session")
+                
+        except Exception as e:
+            logger.error(f"Failed to deactivate share session: {e}")
+            raise
+
+    async def get_user_share_sessions(self, user_id: str) -> List[Dict[str, Any]]:
+        """Get all share sessions for a user."""
+        try:
+            result = self.client.table('share_sessions').select('*').eq(
+                'user_id', user_id
+            ).order('created_at', desc=True).execute()
+            
+            return result.data or []
+            
+        except Exception as e:
+            logger.error(f"Failed to get user share sessions: {e}")
+            return []
+
 
 # Global instance
 _supabase_service: Optional[SupabaseService] = None

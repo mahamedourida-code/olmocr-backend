@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from datetime import datetime
 
-from app.api.v1 import jobs, download, websocket
+from app.api.v1 import jobs, download, websocket, sessions
 
 api_router = APIRouter()
 
@@ -20,3 +20,4 @@ async def health_check():
 api_router.include_router(jobs.router)
 api_router.include_router(download.router)
 api_router.include_router(websocket.router)
+api_router.include_router(sessions.router)
