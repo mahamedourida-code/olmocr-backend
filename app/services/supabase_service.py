@@ -575,13 +575,16 @@ class SupabaseService:
         try:
             data = {
                 'session_id': session_id,
-                'user_id': user_id,
                 'file_ids': file_ids,
                 'title': title,
                 'description': description,
                 'expires_at': expires_at.isoformat() if expires_at else None,
                 'is_active': True
             }
+            
+            # Only include user_id if it's not None
+            if user_id is not None:
+                data['user_id'] = user_id
             
             result = self.client.table('share_sessions').insert(data).execute()
             

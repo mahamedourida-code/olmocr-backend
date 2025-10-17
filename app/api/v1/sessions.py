@@ -108,9 +108,14 @@ async def create_share_session(
             expires_at = datetime.utcnow() + timedelta(days=request.expires_in_days)
         
         # Create session in database
+        # Fix: Only pass user_id if user exists and has an id
+        user_id = None
+        if user and user.get('id'):
+            user_id = str(user.get('id'))
+        
         session_data = await supabase.create_share_session(
             session_id=session_id,
-            user_id=str(user.get('id')) if user else None,
+            user_id=user_id,
             file_ids=request.file_ids,
             title=request.title or f"Batch of {len(request.file_ids)} files",
             description=request.description,
