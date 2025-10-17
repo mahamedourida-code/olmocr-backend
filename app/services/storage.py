@@ -578,3 +578,7 @@ class FileStorageManager:
 
 # Global storage manager instance
 storage_manager = FileStorageManager()
+
+def get_storage_service() -> FileStorageManager:
+    """Get the global storage manager instance."""
+    return storage_manager

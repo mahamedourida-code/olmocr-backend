@@ -310,7 +310,7 @@ class SupabaseService:
             response = self.client.table("processing_jobs")\
                 .select("*")\
                 .eq("user_id", user_id)\
-                .order("created_at", desc=True)\
+                .order("created_at.desc")\
                 .limit(limit)\
                 .execute()
             return response.data
@@ -389,7 +389,7 @@ class SupabaseService:
             response = self.client.table("job_history")\
                 .select("*")\
                 .eq("user_id", user_id)\
-                .order("saved_at", desc=True)\
+                .order("saved_at.desc")\
                 .range(offset, offset + limit - 1)\
                 .execute()
             
@@ -645,7 +645,7 @@ class SupabaseService:
         try:
             result = self.client.table('share_sessions').select('*').eq(
                 'user_id', user_id
-            ).order('created_at', desc=True).execute()
+            ).order('created_at.desc').execute()
             
             return result.data or []
             
