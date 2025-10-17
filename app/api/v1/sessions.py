@@ -123,7 +123,7 @@ async def create_share_session(
         )
         
         # Build share URL
-        frontend_url = settings.allowed_origins[0] if isinstance(settings.allowed_origins, list) else "https://exceletto.vercel.app"
+        frontend_url = settings.allowed_origins[0] if isinstance(settings.allowed_origins, list) else "https://frontend-six-rho-53.vercel.app"
         share_url = f"{frontend_url}/share/{session_id}"
         
         logger.info(f"Created share session {session_id} with {len(request.file_ids)} files")

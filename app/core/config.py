@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     olmocr_exponential_backoff: bool = Field(True, env="OLMOCR_EXPONENTIAL_BACKOFF")
     
     # CORS Configuration
-    allowed_origins: Union[str, list] = Field(["https://exceletto.vercel.app", "http://localhost:3000"], env="ALLOWED_ORIGINS")
+    allowed_origins: Union[str, list] = Field(["https://frontend-six-rho-53.vercel.app", "http://localhost:3000"], env="ALLOWED_ORIGINS")
     allowed_hosts: Union[str, list] = Field(["*"], env="ALLOWED_HOSTS")
     cors_allow_credentials: bool = Field(True, env="CORS_ALLOW_CREDENTIALS")
     cors_allow_methods: Union[str, list] = Field(["GET", "POST", "PUT", "DELETE", "OPTIONS"], env="CORS_ALLOW_METHODS")
