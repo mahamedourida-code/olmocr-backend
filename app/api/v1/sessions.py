@@ -5,7 +5,7 @@ Session management endpoints for batch file sharing.
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, Field
 import logging
 import random
@@ -105,7 +105,8 @@ async def create_share_session(
         # Calculate expiration
         expires_at = None
         if request.expires_in_days:
-            expires_at = datetime.utcnow() + timedelta(days=request.expires_in_days)
+            # Use timezone-aware datetime for consistency
+            expires_at = datetime.now(timezone.utc) + timedelta(days=request.expires_in_days)
         
         # Create session in database
         # Fix: Only pass user_id if user exists and has an id
@@ -173,8 +174,11 @@ async def get_session_details(
         
         expires_at = session.get('expires_at')
         if expires_at:
+            # Parse expiry time as timezone-aware datetime
             expiry_time = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-            if datetime.utcnow() > expiry_time:
+            # Get current time as timezone-aware UTC datetime
+            current_time = datetime.now(timezone.utc)
+            if current_time > expiry_time:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Session has expired"
@@ -249,8 +253,11 @@ async def download_all_session_files(
         # Check expiration
         expires_at = session.get('expires_at')
         if expires_at:
+            # Parse expiry time as timezone-aware datetime
             expiry_time = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-            if datetime.utcnow() > expiry_time:
+            # Get current time as timezone-aware UTC datetime
+            current_time = datetime.now(timezone.utc)
+            if current_time > expiry_time:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Session has expired"
