@@ -91,7 +91,7 @@ class SupabaseService:
             logger.error(f"Failed to create job in Supabase: {e}")
             raise
 
-    async def check_and_use_credits(
+    def check_and_use_credits(
         self,
         user_id: str,
         credits_needed: int
@@ -121,7 +121,7 @@ class SupabaseService:
             # Return False on error to block processing
             return False
 
-    async def get_user_credits(
+    def get_user_credits(
         self,
         user_id: str
     ) -> Dict[str, int]:

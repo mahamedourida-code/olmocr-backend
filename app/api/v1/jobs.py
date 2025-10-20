@@ -60,7 +60,7 @@ async def get_user_credits(
     """Get user's credit information."""
     try:
         supabase_service = get_supabase_service()
-        credits = await supabase_service.get_user_credits(user['user_id'])
+        credits = supabase_service.get_user_credits(user['user_id'])
         return credits
     except Exception as e:
         logger.error(f"Failed to get user credits: {e}")
@@ -97,7 +97,7 @@ async def create_batch_job(
         supabase_service = get_supabase_service()
         try:
             # Check if user has enough credits
-            credits_result = await supabase_service.check_and_use_credits(
+            credits_result = supabase_service.check_and_use_credits(
                 user['user_id'], 
                 len(request.images)
             )
@@ -106,6 +106,9 @@ async def create_batch_job(
                     status_code=status.HTTP_402_PAYMENT_REQUIRED,
                     detail=f"Insufficient credits. You need {len(request.images)} credits but don't have enough remaining."
                 )
+        except HTTPException:
+            # Re-raise HTTP exceptions
+            raise
         except Exception as e:
             logger.error(f"Error checking credits: {e}")
             # Allow processing to continue if credit check fails (fail open)
