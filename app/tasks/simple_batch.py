@@ -101,6 +101,23 @@ async def process_single_image_simple(
             'current_image': img.get('id'),
             'updated_at': datetime.utcnow().isoformat()
         })
+        
+        # Update progress in Supabase for real-time dashboard
+        if user_id and processed_count == total_images:
+            # Only update Supabase on the last image to avoid too many updates
+            try:
+                supabase = get_supabase_service()
+                await supabase.update_job_status(
+                    job_id=job_id,
+                    status='processing',
+                    metadata={
+                        'progress': current_progress,
+                        'processed_images': processed_count,
+                        'total_images': total_images
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Failed to update Supabase progress: {e}")
 
         # Publish progress (will fail silently if Redis unavailable)
         try:
@@ -215,6 +232,22 @@ async def process_batch_simple(
     start_time = datetime.utcnow()
 
     logger.info(f"[Job {job_id}] Starting batch processing: {len(images)} images")
+    
+    # Update job status to "processing" in Supabase at start
+    if user_id:
+        try:
+            supabase = get_supabase_service()
+            await supabase.update_job_status(
+                job_id=job_id,
+                status='processing',
+                metadata={
+                    'started_at': datetime.utcnow().isoformat(),
+                    'total_images': len(images)
+                }
+            )
+            logger.info(f"[Job {job_id}] Updated Supabase status to processing")
+        except Exception as e:
+            logger.warning(f"[Job {job_id}] Failed to update initial status in Supabase: {e}")
 
     try:
         # Update job to processing (gracefully handle Redis unavailability)
@@ -291,6 +324,26 @@ async def process_batch_simple(
         except Exception as redis_error:
             logger.warning(f"[Job {job_id}] Failed to update final status in Redis: {redis_error}")
 
+        # Update job status in Supabase database (CRITICAL for dashboard)
+        if user_id:
+            try:
+                supabase = get_supabase_service()
+                await supabase.update_job_status(
+                    job_id=job_id,
+                    status='completed' if final_status in ['completed', 'partially_completed'] else 'failed',
+                    result_url=download_urls[0] if download_urls else None,
+                    metadata={
+                        'processing_time': processing_time,
+                        'successful_images': len(successful_results),
+                        'failed_images': len(failed_results),
+                        'total_images': len(images),
+                        'completed_at': datetime.utcnow().isoformat()
+                    }
+                )
+                logger.info(f"[Job {job_id}] Updated status in Supabase: {final_status}")
+            except Exception as supabase_error:
+                logger.error(f"[Job {job_id}] Failed to update Supabase status: {supabase_error}")
+
         # Build files list for completion message
         files_info = []
         for file_data in generated_files:
@@ -339,3 +392,16 @@ async def process_batch_simple(
             })
         except Exception as redis_error:
             logger.warning(f"[Job {job_id}] Failed to update failed status in Redis: {redis_error}")
+        
+        # Update failed status in Supabase
+        if user_id:
+            try:
+                supabase = get_supabase_service()
+                await supabase.update_job_status(
+                    job_id=job_id,
+                    status='failed',
+                    error_message=str(e)
+                )
+                logger.info(f"[Job {job_id}] Updated failed status in Supabase")
+            except Exception as supabase_error:
+                logger.error(f"[Job {job_id}] Failed to update Supabase status: {supabase_error}")
