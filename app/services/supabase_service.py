@@ -91,6 +91,73 @@ class SupabaseService:
             logger.error(f"Failed to create job in Supabase: {e}")
             raise
 
+    async def check_and_use_credits(
+        self,
+        user_id: str,
+        credits_needed: int
+    ) -> bool:
+        """
+        Check if user has enough credits and deduct them.
+
+        Args:
+            user_id: User ID to check credits for
+            credits_needed: Number of credits needed
+
+        Returns:
+            True if credits were successfully deducted, False if insufficient
+        """
+        try:
+            # Call the database function to check and use credits
+            response = self.client.rpc(
+                'use_credits', 
+                {'p_user_id': user_id, 'p_credits': credits_needed}
+            ).execute()
+            
+            # The function returns a boolean
+            return response.data if response.data is not None else False
+
+        except Exception as e:
+            logger.error(f"Failed to check/use credits for user {user_id}: {e}")
+            # Return False on error to block processing
+            return False
+
+    async def get_user_credits(
+        self,
+        user_id: str
+    ) -> Dict[str, int]:
+        """
+        Get user's credit information.
+
+        Args:
+            user_id: User ID to get credits for
+
+        Returns:
+            Dictionary with total_credits, used_credits, and available_credits
+        """
+        try:
+            response = self.client.rpc(
+                'get_user_credits',
+                {'p_user_id': user_id}
+            ).execute()
+            
+            if response.data and len(response.data) > 0:
+                return response.data[0]
+            else:
+                # Return default values if no record found
+                return {
+                    'total_credits': 80,
+                    'used_credits': 0,
+                    'available_credits': 80
+                }
+
+        except Exception as e:
+            logger.error(f"Failed to get credits for user {user_id}: {e}")
+            return {
+                'total_credits': 80,
+                'used_credits': 0,
+                'available_credits': 80
+            }
+
     async def update_job_status(
         self,
         job_id: str,

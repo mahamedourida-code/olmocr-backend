@@ -53,6 +53,23 @@ def simple_batch_validation(image_count: int) -> None:
 
 router = APIRouter(prefix="/jobs", tags=["Batch Jobs"])
 
+@router.get("/credits")
+async def get_user_credits(
+    user: dict = Depends(get_current_user)
+):
+    """Get user's credit information."""
+    try:
+        supabase_service = get_supabase_service()
+        credits = await supabase_service.get_user_credits(user['user_id'])
+        return credits
+    except Exception as e:
+        logger.error(f"Failed to get user credits: {e}")
+        return {
+            'total_credits': 80,
+            'used_credits': 0,
+            'available_credits': 80
+        }
+
 
 @router.post("/batch", response_model=BatchConvertResponse)
 async def create_batch_job(
@@ -74,6 +91,25 @@ async def create_batch_job(
     
     # Validate batch request
     simple_batch_validation(len(request.images))
+    
+    # Check credits if user is authenticated
+    if user:
+        supabase_service = get_supabase_service()
+        try:
+            # Check if user has enough credits
+            credits_result = await supabase_service.check_and_use_credits(
+                user['user_id'], 
+                len(request.images)
+            )
+            if not credits_result:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail=f"Insufficient credits. You need {len(request.images)} credits but don't have enough remaining."
+                )
+        except Exception as e:
+            logger.error(f"Error checking credits: {e}")
+            # Allow processing to continue if credit check fails (fail open)
+            pass
     
     # Generate job ID
     job_id = str(uuid.uuid4())
