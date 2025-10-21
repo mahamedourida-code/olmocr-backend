@@ -107,19 +107,31 @@ class SupabaseService:
             True if credits were successfully deducted, False if insufficient
         """
         try:
+            logger.info(f"[Credits] Calling use_credits RPC with user_id={user_id}, credits={credits_needed}")
+            
             # Call the database function to check and use credits
             response = self.client.rpc(
                 'use_credits', 
                 {'p_user_id': user_id, 'p_credits': credits_needed}
             ).execute()
             
+            logger.info(f"[Credits] RPC response: {response.data}")
+            
             # The function returns a boolean
-            return response.data if response.data is not None else False
+            result = response.data if response.data is not None else False
+            
+            if result:
+                logger.info(f"[Credits] Successfully used {credits_needed} credits for user {user_id}")
+            else:
+                logger.warning(f"[Credits] Failed to use credits - insufficient balance for user {user_id}")
+                
+            return result
 
         except Exception as e:
-            logger.error(f"Failed to check/use credits for user {user_id}: {e}")
-            # Return False on error to block processing
-            return False
+            logger.error(f"[Credits] Exception in check_and_use_credits for user {user_id}: {e}", exc_info=True)
+            logger.error(f"[Credits] RPC params were: user_id={user_id}, credits_needed={credits_needed}")
+            # Raise the exception to be handled by the caller
+            raise
 
     def get_user_credits(
         self,
@@ -135,15 +147,35 @@ class SupabaseService:
             Dictionary with total_credits, used_credits, and available_credits
         """
         try:
+            logger.info(f"[Credits] Getting credits for user {user_id}")
+            
             response = self.client.rpc(
                 'get_user_credits',
                 {'p_user_id': user_id}
             ).execute()
             
+            logger.info(f"[Credits] Get credits response: {response.data}")
+            
             if response.data and len(response.data) > 0:
                 return response.data[0]
             else:
-                # Return default values if no record found
+                # No record found, create one for the user
+                logger.warning(f"[Credits] No credit record found for user {user_id}, creating default record")
+                
+                # Insert default credits for the user
+                try:
+                    insert_response = self.client.table('user_credits').insert({
+                        'user_id': user_id,
+                        'total_credits': 80,
+                        'used_credits': 0,
+                        'reset_date': 'CURRENT_DATE'
+                    }).execute()
+                    
+                    logger.info(f"[Credits] Created credit record for user {user_id}")
+                except Exception as insert_error:
+                    logger.error(f"[Credits] Failed to create credit record: {insert_error}")
+                
+                # Return default values
                 return {
                     'total_credits': 80,
                     'used_credits': 0,
@@ -151,7 +183,7 @@ class SupabaseService:
                 }
 
         except Exception as e:
-            logger.error(f"Failed to get credits for user {user_id}: {e}")
+            logger.error(f"[Credits] Failed to get credits for user {user_id}: {e}", exc_info=True)
             return {
                 'total_credits': 80,
                 'used_credits': 0,

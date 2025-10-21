@@ -95,24 +95,35 @@ async def create_batch_job(
     # Check credits if user is authenticated
     if user:
         supabase_service = get_supabase_service()
+        logger.info(f"[Credits] Checking credits for user {user['user_id']}, need {len(request.images)} credits")
+        
         try:
             # Check if user has enough credits
             credits_result = supabase_service.check_and_use_credits(
                 user['user_id'], 
                 len(request.images)
             )
+            logger.info(f"[Credits] Credit check result: {credits_result}")
+            
             if not credits_result:
+                logger.warning(f"[Credits] Insufficient credits for user {user['user_id']}")
                 raise HTTPException(
                     status_code=status.HTTP_402_PAYMENT_REQUIRED,
                     detail=f"Insufficient credits. You need {len(request.images)} credits but don't have enough remaining."
                 )
+            else:
+                logger.info(f"[Credits] Successfully deducted {len(request.images)} credits for user {user['user_id']}")
+                
         except HTTPException:
             # Re-raise HTTP exceptions
             raise
         except Exception as e:
-            logger.error(f"Error checking credits: {e}")
-            # Allow processing to continue if credit check fails (fail open)
-            pass
+            logger.error(f"[Credits] Critical error checking credits: {e}", exc_info=True)
+            # DO NOT allow processing on credit check failure - this is money!
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Credit system error. Please try again or contact support."
+            )
     
     # Generate job ID
     job_id = str(uuid.uuid4())
