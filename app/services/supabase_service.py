@@ -154,10 +154,41 @@ class SupabaseService:
                 {'p_user_id': user_id}
             ).execute()
             
-            logger.info(f"[Credits] Get credits response: {response.data}")
-            
+            logger.info(f"[Credits] Get credits RPC response: {response.data}")
+
             if response.data and len(response.data) > 0:
-                return response.data[0]
+                # The RPC returns a single record, extract it properly
+                result = response.data[0]
+
+                # Check if result is a dict (already parsed) or needs parsing
+                if isinstance(result, dict):
+                    # Already a dictionary, just ensure all required keys exist
+                    return {
+                        'total_credits': result.get('total_credits', 80),
+                        'used_credits': result.get('used_credits', 0),
+                        'available_credits': result.get('available_credits', 80)
+                    }
+                else:
+                    # Result might be a tuple or string, try to extract values
+                    logger.warning(f"[Credits] Unexpected response format: {type(result)}, value: {result}")
+
+                    # Try to parse if it's a string representation of a tuple like "(80,3,77)"
+                    if isinstance(result, str) and result.startswith('(') and result.endswith(')'):
+                        # Parse the tuple string
+                        values = result.strip('()').split(',')
+                        if len(values) >= 3:
+                            total_credits = int(values[0])
+                            used_credits = int(values[1])
+                            available_credits = int(values[2])
+                            logger.info(f"[Credits] Parsed tuple string: total={total_credits}, used={used_credits}, available={available_credits}")
+                            return {
+                                'total_credits': total_credits,
+                                'used_credits': used_credits,
+                                'available_credits': available_credits
+                            }
+
+                    # Fall through to defaults if we can't parse
+                    logger.error(f"[Credits] Could not parse RPC response: {result}")
             else:
                 # No record found, create one for the user
                 logger.warning(f"[Credits] No credit record found for user {user_id}, creating default record")
