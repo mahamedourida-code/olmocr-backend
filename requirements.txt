@@ -25,3 +25,8 @@ websockets  # WebSocket client/server implementation
 # Supabase integration
 supabase  # Supabase Python client
 pyjwt  # JWT token verification
+
+# Google Sheets API integration
+google-api-python-client==2.95.0
+google-auth==2.22.0
+google-auth-httplib2==0.1.0
