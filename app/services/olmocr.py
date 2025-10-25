@@ -135,9 +135,14 @@ class OlmOCRService:
             
             # Clean the response (remove code blocks, etc.)
             cleaned_content = self._clean_ocr_response(raw_content)
-            
-            # Extract table data from markdown response
-            table_content = self._extract_csv_from_response(cleaned_content)
+
+            # Check if response contains HTML table format
+            if '<table' in cleaned_content.lower() or '<tr' in cleaned_content.lower():
+                logger.info("Detected HTML table format in response, converting to CSV")
+                table_content = self._parse_html_table(cleaned_content)
+            else:
+                # Extract table data from markdown response
+                table_content = self._extract_csv_from_response(cleaned_content)
             
             # Convert to CSV format (handles both pipe-separated and structured data)
             csv_content = self._convert_pipe_to_csv(table_content)
@@ -185,22 +190,85 @@ class OlmOCRService:
         )
         return response
     
+    def _parse_html_table(self, content: str) -> str:
+        """
+        Parse HTML table format and convert to CSV-compatible format.
+
+        Args:
+            content: HTML content containing table tags
+
+        Returns:
+            CSV-formatted string extracted from HTML table
+        """
+        import re
+
+        if not content:
+            return ""
+
+        csv_rows = []
+
+        # Extract all table rows (both <tr> and </tr> variations)
+        # This regex finds content between <tr> and </tr> tags
+        tr_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.IGNORECASE | re.DOTALL)
+        rows = tr_pattern.findall(content)
+
+        for row in rows:
+            cells = []
+
+            # Extract header cells (<th>)
+            th_pattern = re.compile(r'<th[^>]*>(.*?)</th>', re.IGNORECASE | re.DOTALL)
+            headers = th_pattern.findall(row)
+
+            # Extract data cells (<td>)
+            td_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.IGNORECASE | re.DOTALL)
+            data_cells = td_pattern.findall(row)
+
+            # Combine headers and data cells
+            all_cells = headers + data_cells
+
+            # Clean each cell (remove nested HTML tags, trim whitespace)
+            for cell in all_cells:
+                # Remove any remaining HTML tags
+                clean_cell = re.sub(r'<[^>]+>', '', cell)
+                # Decode HTML entities
+                clean_cell = clean_cell.replace('&nbsp;', ' ')
+                clean_cell = clean_cell.replace('&amp;', '&')
+                clean_cell = clean_cell.replace('&lt;', '<')
+                clean_cell = clean_cell.replace('&gt;', '>')
+                clean_cell = clean_cell.replace('&quot;', '"')
+                # Strip whitespace
+                clean_cell = clean_cell.strip()
+
+                # Handle CSV escaping if cell contains comma or quotes
+                if ',' in clean_cell or '"' in clean_cell or '\n' in clean_cell:
+                    clean_cell = '"' + clean_cell.replace('"', '""') + '"'
+
+                cells.append(clean_cell)
+
+            # Only add non-empty rows
+            if cells and any(cell.strip() for cell in cells):
+                csv_rows.append(','.join(cells))
+
+        result = '\n'.join(csv_rows)
+        logger.info(f"Parsed HTML table: {len(csv_rows)} rows extracted")
+        return result
+
     def _clean_ocr_response(self, content: str) -> str:
         """
         Clean the OCR response to remove any non-table content.
-        
+
         Args:
             content: Raw response content (likely in markdown format)
-            
+
         Returns:
             Cleaned table content
         """
         if not content:
             return ""
-        
+
         # Remove common prefixes/suffixes that might be added by the model
         content = content.strip()
-        
+
         # Remove markdown code blocks if present
         if content.startswith("```"):
             lines = content.split('\n')
@@ -211,7 +279,7 @@ class OlmOCRService:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             content = '\n'.join(lines)
-        
+
         return content
     
     def _extract_csv_from_response(self, content: str) -> str:
