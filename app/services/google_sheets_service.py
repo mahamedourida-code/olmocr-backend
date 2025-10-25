@@ -85,37 +85,31 @@ class GoogleSheetsService:
             excel_file = pd.ExcelFile(excel_path)
             sheet_names = excel_file.sheet_names
             
-            # Create Google Sheets file via Drive API
-            file_metadata = {
-                'name': filename,
-                'mimeType': 'application/vnd.google-apps.spreadsheet'
+            # Create Google Sheets using Sheets API directly
+            spreadsheet_body = {
+                'properties': {
+                    'title': filename
+                },
+                'sheets': [{
+                    'properties': {
+                        'title': sheet_names[0] if sheet_names else 'Sheet1'
+                    }
+                }]
             }
             
-            drive_file = self.drive_service.files().create(
-                body=file_metadata,
-                fields='id'
+            spreadsheet = self.sheets_service.spreadsheets().create(
+                body=spreadsheet_body,
+                fields='spreadsheetId'
             ).execute()
             
-            spreadsheet_id = drive_file.get('id')
+            spreadsheet_id = spreadsheet.get('spreadsheetId')
             logger.info(f"Created Google Sheets: {spreadsheet_id}")
             
-            # If multiple sheets, add them to the spreadsheet
+            # If multiple sheets, add the remaining sheets
             if len(sheet_names) > 1:
-                # Rename first sheet and add others
                 batch_requests = []
                 
-                # Rename the default sheet to first sheet name
-                batch_requests.append({
-                    'updateSheetProperties': {
-                        'properties': {
-                            'sheetId': 0,
-                            'title': sheet_names[0]
-                        },
-                        'fields': 'title'
-                    }
-                })
-                
-                # Add remaining sheets
+                # Add remaining sheets (first sheet already created)
                 for sheet_name in sheet_names[1:]:
                     batch_requests.append({
                         'addSheet': {
@@ -176,30 +170,43 @@ class GoogleSheetsService:
             }
             
         except HttpError as e:
-            logger.error(f"Google API error: {e}")
+            error_content = e.content.decode('utf-8') if hasattr(e, 'content') else str(e)
+            logger.error(f"Google API HTTP error: Status={e.resp.status if hasattr(e, 'resp') else 'unknown'}, Content={error_content}")
+            
+            # Parse error details
             error_message = str(e)
             
-            # Provide helpful error messages
-            if "403" in error_message:
-                if "Drive API has not been used" in error_message:
+            # Provide helpful error messages based on status code
+            if hasattr(e, 'resp') and e.resp.status == 403:
+                if "Drive API has not been used" in error_content:
                     return {
                         "success": False,
                         "error": "Google Drive API is not enabled. Please enable it in Google Cloud Console."
                     }
-                elif "Sheets API has not been used" in error_message:
+                elif "Sheets API has not been used" in error_content:
                     return {
                         "success": False,
                         "error": "Google Sheets API is not enabled. Please enable it in Google Cloud Console."
                     }
+                elif "does not have storage.objects.create access" in error_content:
+                    return {
+                        "success": False,
+                        "error": "Service account lacks permissions. Please grant 'Editor' role to the service account."
+                    }
                 else:
                     return {
                         "success": False,
-                        "error": "Permission denied. Please check service account permissions."
+                        "error": f"Permission denied: {error_content[:200]}"
                     }
+            elif hasattr(e, 'resp') and e.resp.status == 400:
+                return {
+                    "success": False,
+                    "error": f"Bad request: {error_content[:200]}"
+                }
             
             return {
                 "success": False,
-                "error": f"Google API error: {error_message}"
+                "error": f"Google API error (Status {e.resp.status if hasattr(e, 'resp') else 'unknown'}): {error_content[:200]}"
             }
             
         except Exception as e:
