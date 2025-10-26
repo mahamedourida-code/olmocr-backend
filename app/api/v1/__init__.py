@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from datetime import datetime
 
-from app.api.v1 import jobs, download, websocket, sessions, sheets_export, google_oauth_export
+from app.api.v1 import jobs, download, websocket, sessions
 
 api_router = APIRouter()
 
@@ -21,5 +21,3 @@ api_router.include_router(jobs.router)
 api_router.include_router(download.router)
 api_router.include_router(websocket.router)
 api_router.include_router(sessions.router)
-api_router.include_router(sheets_export.router)
-api_router.include_router(google_oauth_export.router)
