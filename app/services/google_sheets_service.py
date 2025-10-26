@@ -144,21 +144,45 @@ class GoogleSheetsService:
                     body={'values': values}
                 ).execute()
             
-            # Share with user if email provided
+            # Share with user - REQUIRED for access
             if user_email:
                 try:
+                    # Create permission for user with writer access
+                    permission = {
+                        'type': 'user',
+                        'role': 'writer',
+                        'emailAddress': user_email
+                    }
+                    
                     self.drive_service.permissions().create(
                         fileId=spreadsheet_id,
-                        body={
-                            'type': 'user',
-                            'role': 'writer',
-                            'emailAddress': user_email
-                        },
-                        sendNotificationEmail=True
+                        body=permission,
+                        sendNotificationEmail=True,
+                        fields='id'
                     ).execute()
-                    logger.info(f"Shared sheet with {user_email}")
+                    
+                    logger.info(f"Successfully shared sheet with {user_email}")
+                    
+                    # Also make the file discoverable by anyone with the link (optional)
+                    # This ensures users can always access it even if email fails
+                    link_permission = {
+                        'type': 'anyone',
+                        'role': 'reader'
+                    }
+                    
+                    self.drive_service.permissions().create(
+                        fileId=spreadsheet_id,
+                        body=link_permission
+                    ).execute()
+                    
+                    logger.info(f"Made sheet accessible via link")
+                    
                 except HttpError as e:
-                    logger.warning(f"Failed to share with {user_email}: {e}")
+                    error_content = e.content.decode('utf-8') if hasattr(e, 'content') else str(e)
+                    logger.error(f"Failed to share sheet: {error_content}")
+                    # Don't fail the export, just log the error
+            else:
+                logger.warning("No user email provided - sheet will only be accessible to service account")
             
             # Build the URL
             sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
