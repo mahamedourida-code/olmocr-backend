@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     # OlmOCR API Configuration
     olmocr_api_key: str = Field(..., env="OLMOCR_API_KEY")
     olmocr_base_url: str = Field("https://api.deepinfra.com/v1/openai", env="OLMOCR_BASE_URL")
-    olmocr_model: str = Field("allenai/olmOCR-7B-0725-FP8", env="OLMOCR_MODEL")
+    olmocr_model: str = Field("allenai/olmOCR-2-7B-1025", env="OLMOCR_MODEL")
     
     # Application Configuration
     environment: str = Field("development", env="ENVIRONMENT")
