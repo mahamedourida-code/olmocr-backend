@@ -91,43 +91,47 @@ class SupabaseService:
             logger.error(f"Failed to create job in Supabase: {e}")
             raise
 
-    def increment_user_processed_count(
+    def check_and_use_credits(
         self,
         user_id: str,
-        count: int
-    ) -> dict:
+        credits_needed: int
+    ) -> bool:
         """
-        Increment user's processed image count with monthly limit.
+        Check if user has enough credits and deduct them.
 
         Args:
-            user_id: User ID to increment count for
-            count: Number to increment by
+            user_id: User ID to check credits for
+            credits_needed: Number of credits needed
 
         Returns:
-            Dict with success status and counts
+            True if credits were successfully deducted, False if insufficient
         """
         try:
-            logger.info(f"[Stats] Incrementing processed count for user {user_id} by {count}")
+            logger.info(f"[Credits] Calling use_credits RPC with user_id={user_id}, credits={credits_needed}")
             
-            # Call the database function to increment count
+            # Call the database function to check and use credits
             response = self.client.rpc(
-                'increment_processed_count', 
-                {'p_user_id': user_id, 'p_count': count}
+                'use_credits', 
+                {'p_user_id': user_id, 'p_credits': credits_needed}
             ).execute()
             
-            logger.info(f"[Stats] Response: {response.data}")
+            logger.info(f"[Credits] RPC response: {response.data}")
             
-            # Check if limit was reached
-            if response.data and not response.data.get('success'):
-                logger.warning(f"[Stats] Monthly limit reached for user {user_id}: {response.data}")
-                return response.data
+            # The function returns a boolean
+            result = response.data if response.data is not None else False
             
-            return response.data if response.data else {'success': False, 'error': 'Unknown error'}
+            if result:
+                logger.info(f"[Credits] Successfully used {credits_needed} credits for user {user_id}")
+            else:
+                logger.warning(f"[Credits] Failed to use credits - insufficient balance for user {user_id}")
+                
+            return result
 
         except Exception as e:
-            logger.error(f"[Stats] Exception incrementing count for user {user_id}: {e}", exc_info=True)
-            # Return error response
-            return {'success': False, 'error': str(e)}
+            logger.error(f"[Credits] Exception in check_and_use_credits for user {user_id}: {e}", exc_info=True)
+            logger.error(f"[Credits] RPC params were: user_id={user_id}, credits_needed={credits_needed}")
+            # Raise the exception to be handled by the caller
+            raise
 
     def get_user_credits(
         self,
