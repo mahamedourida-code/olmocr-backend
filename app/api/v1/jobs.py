@@ -92,38 +92,33 @@ async def create_batch_job(
     # Validate batch request
     simple_batch_validation(len(request.images))
     
-    # Check credits if user is authenticated
+    # Check monthly limit and increment count if user is authenticated
     if user:
         supabase_service = get_supabase_service()
-        logger.info(f"[Credits] Checking credits for user {user['user_id']}, need {len(request.images)} credits")
+        logger.info(f"[Stats] Recording {len(request.images)} images for user {user['user_id']}")
         
         try:
-            # Check if user has enough credits
-            credits_result = supabase_service.check_and_use_credits(
+            # Increment the processed count with monthly limit check
+            result = supabase_service.increment_user_processed_count(
                 user['user_id'], 
                 len(request.images)
             )
-            logger.info(f"[Credits] Credit check result: {credits_result}")
             
-            if not credits_result:
-                logger.warning(f"[Credits] Insufficient credits for user {user['user_id']}")
+            if not result.get('success'):
+                logger.warning(f"[Stats] Monthly limit reached for user {user['user_id']}: {result}")
                 raise HTTPException(
                     status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail=f"Insufficient credits. You need {len(request.images)} credits but don't have enough remaining."
+                    detail=f"Monthly limit reached! You have {result.get('images_left', 0)} images left. Limit resets on {result.get('reset_date', 'next month')}."
                 )
-            else:
-                logger.info(f"[Credits] Successfully deducted {len(request.images)} credits for user {user['user_id']}")
+                
+            logger.info(f"[Stats] Successfully recorded {len(request.images)} images for user {user['user_id']}: {result}")
                 
         except HTTPException:
             # Re-raise HTTP exceptions
             raise
         except Exception as e:
-            logger.error(f"[Credits] Critical error checking credits: {e}", exc_info=True)
-            # DO NOT allow processing on credit check failure - this is money!
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Credit system error. Please try again or contact support."
-            )
+            # Log but don't fail on other errors
+            logger.error(f"[Stats] Error recording stats: {e}", exc_info=True)
     
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -1082,4 +1077,270 @@ async def delete_from_history(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete job from history: {str(e)}"
+        )
+
+
+@router.post("/upload-only")
+async def upload_files_only(
+    files: List[UploadFile] = File(..., description="Image files to upload (PNG, JPEG, WebP)"),
+    session: SessionMetadata = Depends(get_or_create_session),
+    storage: FileStorageManager = Depends(get_storage_service),
+    redis_service: RedisService = Depends(get_redis_service),
+    user: Optional[dict] = Depends(get_optional_user),
+    http_request: Request = None
+):
+    """
+    Upload files without starting processing.
+    
+    This endpoint:
+    1. Validates and uploads files to storage
+    2. Stores file metadata in Redis
+    3. Returns session_id and file_ids for later processing
+    """
+    logger.info(f"[UPLOAD-ONLY] Received request with {len(files)} files")
+    logger.info(f"[UPLOAD-ONLY] Session ID: {session.session_id}")
+    logger.info(f"[UPLOAD-ONLY] User ID: {user['user_id'] if user else 'None'}")
+    
+    # Rate limiting
+    simple_rate_limit_check(http_request)
+    
+    # Validate batch request
+    simple_batch_validation(len(files))
+    
+    # Validate each file
+    SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    MAX_FILE_SIZE = settings.max_file_size_bytes
+    
+    file_ids = []
+    images_data = []
+    
+    for i, file in enumerate(files):
+        logger.info(f"[UPLOAD-ONLY] Processing file {i+1}: {file.filename}")
+        
+        # Check content type
+        if file.content_type not in SUPPORTED_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'"
+            )
+        
+        # Read and validate file size
+        file_content = await file.read()
+        file_size = len(file_content)
+        
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File {i+1} '{file.filename}': File size exceeds maximum"
+            )
+        
+        if file_size < 100:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File {i+1} '{file.filename}': File appears to be empty"
+            )
+        
+        # Convert to base64
+        base64_data = base64.b64encode(file_content).decode('utf-8')
+        
+        file_id = f"file_{uuid.uuid4()}"
+        file_ids.append(file_id)
+        
+        images_data.append({
+            'id': file_id,
+            'data': base64_data,
+            'filename': file.filename or f"image_{i}.png"
+        })
+        
+        await file.seek(0)
+        logger.info(f"[UPLOAD-ONLY] File {i+1} uploaded successfully with ID: {file_id}")
+    
+    # Store uploaded files in Redis with session
+    try:
+        upload_key = f"upload:{session.session_id}"
+        upload_data = {
+            'session_id': session.session_id,
+            'user_id': user['user_id'] if user else '',
+            'file_ids': file_ids,
+            'images': images_data,
+            'created_at': datetime.utcnow().isoformat()
+        }
+        
+        # Store in Redis with 1 hour expiration
+        await redis_service.set_value(upload_key, upload_data, expiration=3600)
+        
+        logger.info(f"[UPLOAD-ONLY] Stored {len(files)} files in Redis for session {session.session_id}")
+        
+        return {
+            'session_id': session.session_id,
+            'file_ids': file_ids,
+            'message': f'{len(files)} file(s) uploaded successfully'
+        }
+    
+    except Exception as e:
+        logger.error(f"[UPLOAD-ONLY] Failed to store upload data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to store uploaded files: {str(e)}"
+        )
+
+
+@router.post("/start-processing", response_model=BatchConvertResponse)
+async def start_processing(
+    session_id: str = Form(..., description="Session ID from upload-only endpoint"),
+    output_format: str = Form("xlsx", description="Output format"),
+    consolidation_strategy: str = Form("consolidated", description="Consolidation strategy"),
+    language: str = Form("en", description="OCR language"),
+    session: SessionMetadata = Depends(get_or_create_session),
+    storage: FileStorageManager = Depends(get_storage_service),
+    redis_service: RedisService = Depends(get_redis_service),
+    user: Optional[dict] = Depends(get_optional_user),
+    http_request: Request = None
+):
+    """
+    Start processing already uploaded files.
+    
+    This endpoint:
+    1. Retrieves uploaded files from Redis using session_id
+    2. Creates a processing job
+    3. Starts batch processing via Celery
+    """
+    logger.info(f"[START-PROCESSING] Received request for session {session_id}")
+    logger.info(f"[START-PROCESSING] Parameters: output_format={output_format}, consolidation={consolidation_strategy}, language={language}")
+    
+    # Retrieve upload data from Redis
+    try:
+        upload_key = f"upload:{session_id}"
+        upload_data = await redis_service.get_value(upload_key)
+        
+        if not upload_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No uploaded files found for session {session_id}. Files may have expired."
+            )
+        
+        images_data = upload_data.get('images', [])
+        if not images_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No images found in upload session"
+            )
+        
+        logger.info(f"[START-PROCESSING] Found {len(images_data)} uploaded images")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[START-PROCESSING] Failed to retrieve upload data: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve uploaded files: {str(e)}"
+        )
+    
+    # Check monthly limit if user is authenticated
+    if user:
+        supabase_service = get_supabase_service()
+        logger.info(f"[START-PROCESSING] Recording {len(images_data)} images for user {user['user_id']}")
+        
+        try:
+            stats = supabase_service.increment_user_processed_count(user['user_id'], len(images_data))
+            
+            if not stats.get('success'):
+                logger.warning(f"[START-PROCESSING] User {user['user_id']} exceeded monthly limit")
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail=stats.get('error', 'Monthly limit exceeded')
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[START-PROCESSING] Failed to check/increment user stats: {e}")
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    logger.info(f"[START-PROCESSING] Generated job ID: {job_id}")
+    
+    try:
+        # Create job metadata
+        job_data = {
+            'job_id': job_id,
+            'session_id': session_id,
+            'user_id': user['user_id'] if user else '',
+            'status': 'queued',
+            'total_images': len(images_data),
+            'processed_images': 0,
+            'progress': 0,
+            'output_format': output_format,
+            'consolidation_strategy': consolidation_strategy,
+            'language': language,
+            'images': images_data,
+            'results': [],
+            'errors': [],
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        # Store job in Redis
+        await redis_service.create_job(job_id, job_data)
+        logger.info(f"[START-PROCESSING] Job {job_id} created in Redis")
+        
+        # Create job in Supabase if user is authenticated
+        if user:
+            try:
+                supabase_service = get_supabase_service()
+                await supabase_service.create_job(
+                    job_id=job_id,
+                    user_id=user['user_id'],
+                    filename=f"batch_{len(images_data)}_images",
+                    metadata={
+                        'total_images': len(images_data),
+                        'consolidation_strategy': consolidation_strategy,
+                        'output_format': output_format,
+                        'language': language,
+                        'session_id': session_id
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"[START-PROCESSING] Failed to create job in Supabase: {e}")
+        
+        # Start Celery task
+        logger.info(f"[START-PROCESSING] Starting Celery task for job {job_id}")
+        batch_context = BatchProcessingContext(
+            job_id=job_id,
+            session_id=session_id,
+            images=images_data,
+            output_format=output_format,
+            consolidation_strategy=consolidation_strategy,
+            user_id=user['user_id'] if user else None
+        )
+        
+        # Queue the Celery task
+        process_batch_images.delay(batch_context.dict())
+        
+        estimated_time_seconds = len(images_data) * 10
+        estimated_completion = (datetime.utcnow() + timedelta(seconds=estimated_time_seconds)).isoformat()
+        
+        logger.info(f"[START-PROCESSING] Job {job_id} queued successfully")
+        
+        return BatchConvertResponse(
+            job_id=job_id,
+            status='queued',
+            message=f'Processing {len(images_data)} images',
+            estimated_completion=estimated_completion,
+            status_url=f"/api/v1/jobs/{job_id}/status",
+            session_id=session_id
+        )
+        
+    except Exception as e:
+        # Clean up job if creation failed
+        try:
+            await redis_service.delete_job(job_id)
+        except:
+            pass
+        
+        logger.error(f"[START-PROCESSING] Failed to start processing: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start processing: {str(e)}"
         )

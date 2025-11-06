@@ -828,6 +828,72 @@ class RedisService:
             logger.error(f"Failed to clear buffered messages for topic '{topic}': {e}")
             return False
 
+    async def set_value(self, key: str, value: Any, expiration: Optional[int] = None) -> bool:
+        """
+        Set a value in Redis with optional expiration.
+
+        Args:
+            key: Redis key
+            value: Value to store (will be JSON encoded if dict/list)
+            expiration: Optional expiration time in seconds
+
+        Returns:
+            bool: True if successful
+        """
+        if not self._is_connected or not self.client:
+            logger.warning(f"Redis unavailable - cannot set value for key {key}")
+            return False
+
+        try:
+            # JSON encode if dict or list
+            if isinstance(value, (dict, list)):
+                value_str = json.dumps(value)
+            else:
+                value_str = str(value)
+
+            if expiration:
+                await self.client.setex(key, expiration, value_str)
+            else:
+                await self.client.set(key, value_str)
+
+            logger.info(f"Set value for key {key} with expiration={expiration}s")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to set value for key {key}: {e}")
+            return False
+
+    async def get_value(self, key: str) -> Optional[Any]:
+        """
+        Get a value from Redis.
+
+        Args:
+            key: Redis key
+
+        Returns:
+            Value (JSON decoded if possible) or None
+        """
+        if not self._is_connected or not self.client:
+            logger.warning(f"Redis unavailable - cannot get value for key {key}")
+            return None
+
+        try:
+            value_str = await self.client.get(key)
+
+            if not value_str:
+                return None
+
+            # Try to JSON decode
+            try:
+                return json.loads(value_str)
+            except (json.JSONDecodeError, TypeError):
+                # Return as string if not JSON
+                return value_str
+
+        except Exception as e:
+            logger.error(f"Failed to get value for key {key}: {e}")
+            return None
+
     # Cleanup Methods
     
     async def cleanup_expired_jobs(self) -> int:
