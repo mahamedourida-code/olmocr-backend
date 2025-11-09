@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
@@ -93,6 +94,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="OlmOCR Backend Service",
+    max_request_size=100 * 1024 * 1024,  # 100 MB max request size
     description="""
     A FastAPI backend service that converts table screenshots and document images 
     into downloadable XLSX files with batch processing capabilities.
@@ -147,6 +149,13 @@ app.add_middleware(
     allow_headers=settings.parsed_cors_allow_headers,
     expose_headers=settings.parsed_cors_expose_headers,
     max_age=settings.cors_max_age,
+)
+
+# Add GZip middleware for response compression
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1000,  # Only compress responses larger than 1KB
+    compresslevel=5     # Medium compression level (1-9)
 )
 
 # Add trusted host middleware for security
@@ -251,10 +260,10 @@ async def general_exception_handler(request: Request, exc: Exception):
         )
 
 
-# Request logging middleware
+# Request logging middleware with proper error handling
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all incoming requests."""
+    """Log all incoming requests with proper error handling."""
     start_time = time.time()
     
     # Log request
@@ -263,8 +272,33 @@ async def log_requests(request: Request, call_next):
         f"from {request.client.host if request.client else 'unknown'}"
     )
     
-    # Process request
-    response = await call_next(request)
+    try:
+        # Process request with timeout protection
+        response = await asyncio.wait_for(
+            call_next(request),
+            timeout=60.0  # 60 second timeout for all requests
+        )
+    except asyncio.TimeoutError:
+        duration = time.time() - start_time
+        logger.error(f"Request timeout after {duration:.3f}s: {request.method} {request.url.path}")
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={
+                "error": "REQUEST_TIMEOUT",
+                "message": "Request processing timed out",
+                "duration": duration
+            }
+        )
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error(f"Request processing error after {duration:.3f}s: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "error": "PROCESSING_ERROR",
+                "message": "Error processing request"
+            }
+        )
     
     # Log response
     duration = time.time() - start_time

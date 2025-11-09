@@ -15,13 +15,18 @@ def main():
     print(f"Starting service type: {service_type}")
     
     if service_type == "web":
-        # Start the FastAPI web server
+        # Start the FastAPI web server with proper timeout and limit settings
         cmd = [
             "uvicorn",
             "app.main:app",
             "--host", "0.0.0.0",
             "--port", str(os.getenv("PORT", "8080")),
-            "--workers", "1"
+            "--workers", "1",
+            "--timeout-keep-alive", "75",    # Keep-alive timeout in seconds
+            "--timeout-graceful-shutdown", "30",  # Graceful shutdown timeout
+            "--limit-concurrency", "100",    # Max concurrent connections
+            "--limit-max-requests", "1000",  # Max requests before worker restart
+            "--backlog", "2048"              # Socket backlog
         ]
     elif service_type == "worker":
         # Start Celery worker
