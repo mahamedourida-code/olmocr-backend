@@ -124,14 +124,21 @@ class FileStorageManager:
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(file_data)
         
-        # Also create a symlink in downloads directory for direct access
+        # Also create a copy in downloads directory for direct access
         download_path = self.downloads_path / f"{file_id}.xlsx"
         try:
-            download_path.symlink_to(file_path)
-        except OSError:
-            # If symlink fails, copy the file
+            # Always copy the file instead of symlinking (symlinks can cause issues)
             import asyncio
             await asyncio.to_thread(shutil.copy2, file_path, download_path)
+            
+            # Touch the file to update timestamps
+            import os
+            await asyncio.to_thread(os.utime, download_path, None)
+            logger.info(f"Copied file to downloads: {download_path}")
+        except Exception as e:
+            logger.error(f"Failed to copy file to downloads: {e}")
+            # Don't fail the whole operation if copy fails
+            pass
         
         # Update session metadata to include this file
         try:
@@ -179,13 +186,19 @@ class FileStorageManager:
         with open(file_path, "wb") as f:
             f.write(file_data)
         
-        # Also create a symlink in downloads directory for direct access
+        # Also create a copy in downloads directory for direct access
         download_path = self.downloads_path / f"{file_id}.xlsx"
         try:
-            download_path.symlink_to(file_path)
-        except OSError:
-            # If symlink fails, copy the file
+            # Always copy the file instead of symlinking (symlinks can cause issues)
             shutil.copy2(file_path, download_path)
+            
+            # Touch the file to update timestamps
+            os.utime(download_path, None)
+            logger.info(f"Copied file to downloads: {download_path}")
+        except Exception as e:
+            logger.error(f"Failed to copy file to downloads: {e}")
+            # Don't fail the whole operation if copy fails
+            pass
         
         # Update session metadata to include this file
         try:
@@ -245,11 +258,17 @@ class FileStorageManager:
         cleanup_count = 0
         cutoff_time = time.time() - settings.file_retention_seconds
         
+        # Add safety buffer - only delete files older than retention time + 1 hour
+        safety_buffer = 3600  # 1 hour safety buffer
+        safe_cutoff_time = cutoff_time - safety_buffer
+        
+        logger.info(f"Starting cleanup with retention: {settings.file_retention_hours} hours, cutoff time: {datetime.fromtimestamp(safe_cutoff_time)}")
+        
         # Clean up sessions
         for session_path in self.sessions_path.iterdir():
             if session_path.is_dir():
                 # Check if session is expired based on modification time
-                if session_path.stat().st_mtime < cutoff_time:
+                if session_path.stat().st_mtime < safe_cutoff_time:
                     try:
                         shutil.rmtree(session_path)
                         cleanup_count += 1
@@ -257,16 +276,23 @@ class FileStorageManager:
                     except Exception as e:
                         logger.error(f"Failed to cleanup session {session_path.name}: {e}")
         
-        # Clean up download files
+        # Clean up download files with more careful checking
         for file_path in self.downloads_path.iterdir():
             if file_path.is_file():
-                if file_path.stat().st_mtime < cutoff_time:
+                # Use creation time instead of modification time for downloads
+                file_stat = file_path.stat()
+                file_age = time.time() - file_stat.st_ctime
+                
+                # Only delete if file is definitely expired
+                if file_age > (settings.file_retention_seconds + safety_buffer):
                     try:
+                        logger.info(f"Deleting expired file {file_path.name}, age: {file_age/3600:.1f} hours")
                         file_path.unlink()
                         cleanup_count += 1
-                        logger.info(f"Cleaned up expired download file: {file_path.name}")
                     except Exception as e:
                         logger.error(f"Failed to cleanup file {file_path.name}: {e}")
+                else:
+                    logger.debug(f"Keeping file {file_path.name}, age: {file_age/3600:.1f} hours")
         
         logger.info(f"Cleanup completed. Removed {cleanup_count} items.")
         return cleanup_count

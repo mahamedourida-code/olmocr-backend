@@ -113,7 +113,7 @@ async def download_file(
                         import os
 
                         file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
-                        if datetime.utcnow() - file_mtime < timedelta(hours=24):  # Extended to 24h
+                        if datetime.utcnow() - file_mtime < timedelta(hours=72):  # Extended to 72h for safety
                             logger.info(f"Found file {file_or_job_id} on disk (modified {file_mtime})")
                             actual_file_id = file_or_job_id
 
