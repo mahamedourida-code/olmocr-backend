@@ -257,20 +257,29 @@ async def create_batch_job_multipart(
     simple_batch_validation(len(files))
 
     # Validate each file
-    SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif"}
     MAX_FILE_SIZE = settings.max_file_size_bytes
 
     for i, file in enumerate(files):
         logger.info(f"[BATCH-UPLOAD] Validating file {i+1}: {file.filename}")
 
-        # Check content type
-        if file.content_type not in SUPPORTED_TYPES:
-            error_msg = f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'. Supported types: PNG, JPEG, WebP"
+        # Check content type or file extension
+        # HEIC files might not have proper MIME type, so check extension too
+        file_ext = file.filename.lower().split('.')[-1] if file.filename else ""
+        is_heic_by_extension = file_ext in ['heic', 'heif']
+        
+        # Accept if content type is valid OR if it's a HEIC/HEIF by extension
+        if file.content_type not in SUPPORTED_TYPES and not is_heic_by_extension:
+            error_msg = f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'. Supported types: PNG, JPEG, WebP, HEIC, HEIF"
             logger.error(f"[BATCH-UPLOAD] Validation failed - {error_msg}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=error_msg
             )
+        
+        # Log if we're accepting based on extension
+        if is_heic_by_extension and file.content_type not in SUPPORTED_TYPES:
+            logger.info(f"[BATCH-UPLOAD] File {i+1} accepted as HEIC/HEIF based on extension (content_type={file.content_type})")
 
         # Check file size (read first to get size, then seek back)
         file_content = await file.read()
