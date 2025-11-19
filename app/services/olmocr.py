@@ -3,13 +3,23 @@ import asyncio
 import logging
 import time
 import random
+import io
 from typing import Optional, List, Dict, Any, Union
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
 import backoff
+from PIL import Image
 
 from app.core.config import settings
 from app.utils.exceptions import OlmOCRError
+
+# Register HEIC/HEIF support
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIC_SUPPORT = True
+except ImportError:
+    HEIC_SUPPORT = False
 
 logger = logging.getLogger(__name__)
 
@@ -91,15 +101,51 @@ class OlmOCRService:
 
             # Handle both bytes and base64 string input
             if isinstance(image_data, bytes):
-                # Convert binary image to base64
-                img_b64 = base64.b64encode(image_data).decode("utf-8")
+                image_bytes = image_data
             else:
-                # Already base64 string - use directly (optimization!)
-                # Remove data URL prefix if present
+                # Decode base64 string to bytes
                 if image_data.startswith('data:'):
-                    img_b64 = image_data.split(',', 1)[1]
+                    img_b64_str = image_data.split(',', 1)[1]
                 else:
-                    img_b64 = image_data
+                    img_b64_str = image_data
+                image_bytes = base64.b64decode(img_b64_str)
+            
+            # Check if this is a HEIC/HEIF image and convert to JPEG if needed
+            try:
+                # Try to open the image with PIL
+                img = Image.open(io.BytesIO(image_bytes))
+                
+                # Check if it's HEIC/HEIF format
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    logger.info(f"Detected HEIC/HEIF image (format: {img.format}), converting to JPEG...")
+                    
+                    # Convert to RGB if necessary (HEIC might be in different mode)
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'RGBA':
+                        # Convert RGBA to RGB (JPEG doesn't support transparency)
+                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                        rgb_img.paste(img, mask=img.split()[3] if len(img.split()) > 3 else None)
+                        img = rgb_img
+                    
+                    # Save as JPEG to bytes
+                    output_buffer = io.BytesIO()
+                    img.save(output_buffer, format='JPEG', quality=95)
+                    output_buffer.seek(0)
+                    converted_bytes = output_buffer.read()
+                    
+                    logger.info(f"Successfully converted HEIC to JPEG ({len(image_bytes)} bytes -> {len(converted_bytes)} bytes)")
+                    image_bytes = converted_bytes
+                    
+                # Close the image
+                img.close()
+                    
+            except Exception as e:
+                # If PIL can't open it, it might be a valid format that doesn't need conversion
+                logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
+            
+            # Convert to base64 for API
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             
             # Prepare the request
             messages = [
