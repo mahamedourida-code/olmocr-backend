@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for backend-lively-hill-7043 on 2025-11-06T23:36:07+01:00
+# fly.toml app configuration file generated for backend-lively-hill-7043 on 2025-11-13T23:18:26+01:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -41,20 +41,20 @@ primary_region = 'arn'
   auto_start_machines = true
   min_machines_running = 0
   processes = ['app']
-  
+
   [http_service.concurrency]
-    type = "connections"
+    type = 'connections'
     hard_limit = 25
     soft_limit = 20
-    
+
   [[http_service.checks]]
-    grace_period = "30s"
-    interval = "15s"
-    method = "GET"
-    timeout = "10s"
-    path = "/docs"
+    interval = '15s'
+    timeout = '10s'
+    grace_period = '30s'
+    method = 'GET'
+    path = '/docs'
 
 [[vm]]
-  memory = '2gb'
+  memory = '8gb'
   cpu_kind = 'shared'
-  cpus = 2
+  cpus = 8

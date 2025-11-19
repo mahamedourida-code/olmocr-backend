@@ -4,6 +4,7 @@ pandas
 openpyxl
 openai
 pillow
+pillow-heif  # HEIC/HEIF image support
 uvicorn[standard]
 python-dotenv
 aiofiles

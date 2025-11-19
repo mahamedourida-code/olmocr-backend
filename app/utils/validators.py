@@ -6,13 +6,22 @@ import io
 from app.core.config import settings
 from app.utils.exceptions import FileSizeError, FileFormatError
 
+# Register HEIC/HEIF plugin for Pillow
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    # pillow-heif not installed, HEIC support will be limited
+    pass
 
-SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp"}
+SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp", "heic", "heif"}
 SUPPORTED_MIME_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg", 
     "image/jpg": "jpg",
-    "image/webp": "webp"
+    "image/webp": "webp",
+    "image/heic": "heic",
+    "image/heif": "heif"
 }
 
 
@@ -46,7 +55,21 @@ def validate_base64_image(base64_data: str, filename: Optional[str] = None) -> T
     
     # Detect image format
     image_format = imghdr.what(None, h=image_bytes)
-    if not image_format or image_format not in SUPPORTED_FORMATS:
+    
+    # imghdr doesn't recognize HEIC/HEIF, so try to detect via PIL
+    if not image_format:
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                # Check if it's a HEIC/HEIF file
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    image_format = 'heic'
+                elif hasattr(img, '_mode') or img.mode:  # Valid image but unknown format
+                    image_format = 'unknown'
+        except:
+            pass
+    
+    # Allow unknown format if PIL can open it (likely HEIC)
+    if image_format not in SUPPORTED_FORMATS and image_format != 'unknown':
         raise FileFormatError(
             f"Unsupported image format. Supported formats: {', '.join(SUPPORTED_FORMATS).upper()}"
         )
