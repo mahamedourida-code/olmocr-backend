@@ -7,10 +7,12 @@ from typing import Optional
 from app.models.requests import BatchConvertRequest
 from app.models.responses import ConvertResponse, ErrorResponse
 from app.core.dependencies import (
-    get_or_create_session, get_storage_service, get_optional_user
+    get_or_create_session, get_storage_service, get_optional_user,
+    enforce_upload_rate_limits
 )
 from app.core.config import settings
 from app.services.storage import FileStorageManager
+from app.services.redis_service import get_redis_service, RedisService
 from app.services.olmocr import get_olmocr_service
 from app.services.excel import ExcelService
 from app.services.supabase_service import get_supabase_service
@@ -44,15 +46,6 @@ def validate_image_upload(file_size: int, content_type: str) -> None:
             detail=f"Unsupported file type: {content_type}. Allowed types: {', '.join(allowed_types)}"
         )
 
-
-def simple_rate_limit_check(request: Request) -> None:
-    """Simple rate limit check without dependencies."""
-    # For now, just skip rate limiting to simplify debugging
-    # In production, implement proper rate limiting
-    pass
-
-
-
 async def schedule_file_cleanup(
     file_id: str,
     storage: FileStorageManager,
@@ -84,6 +77,7 @@ async def convert_batch_images(
     background_tasks: BackgroundTasks,
     session: SessionMetadata = Depends(get_or_create_session),
     storage: FileStorageManager = Depends(get_storage_service),
+    redis_service: RedisService = Depends(get_redis_service),
     user: Optional[dict] = Depends(get_optional_user),
     http_request: Request = None
 ):
@@ -100,9 +94,6 @@ async def convert_batch_images(
     4. XLSX generation with multiple sheets or consolidated data
     5. Secure file storage with expiration
     """
-    # Rate limiting
-    simple_rate_limit_check(http_request)
-    
     if not request.images:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -114,6 +105,14 @@ async def convert_batch_images(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Batch size ({len(request.images)}) exceeds maximum allowed (20)"
         )
+
+    await enforce_upload_rate_limits(
+        request=http_request,
+        redis_service=redis_service,
+        user=user,
+        session_id=session.session_id,
+        image_count=len(request.images)
+    )
     
     try:
         # Generate unique job ID for the batch

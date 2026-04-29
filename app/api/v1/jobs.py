@@ -14,7 +14,8 @@ from app.models.responses import BatchConvertResponse, JobStatusResponse, ErrorR
 from app.models.jobs import JobStatus, BatchProcessingContext, ImageProcessingResult
 from app.core.dependencies import (
     get_or_create_session, get_storage_service,
-    verify_job_ownership, get_optional_user, get_current_user
+    verify_job_ownership, get_optional_user, get_current_user,
+    enforce_upload_rate_limits
 )
 from app.core.config import settings
 from app.services.storage import FileStorageManager
@@ -26,13 +27,6 @@ from app.models.jobs import SessionMetadata
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-
-def simple_rate_limit_check(request: Request) -> None:
-    """Simple rate limit check without dependencies."""
-    # For now, just skip rate limiting to simplify debugging
-    # In production, implement proper rate limiting
-    pass
 
 
 def simple_batch_validation(image_count: int) -> None:
@@ -86,11 +80,16 @@ async def create_batch_job(
     This endpoint accepts multiple base64-encoded images and starts a distributed
     Celery job to process them concurrently and generate consolidated XLSX output.
     """
-    # Rate limiting
-    simple_rate_limit_check(http_request)
-    
     # Validate batch request
     simple_batch_validation(len(request.images))
+
+    await enforce_upload_rate_limits(
+        request=http_request,
+        redis_service=redis_service,
+        user=user,
+        session_id=session.session_id,
+        image_count=len(request.images)
+    )
     
     # Check credits if user is authenticated
     if user:
@@ -267,11 +266,16 @@ async def create_batch_job_multipart(
     for i, file in enumerate(files):
         logger.info(f"[BATCH-UPLOAD] File {i+1}: name={file.filename}, content_type={file.content_type}, size=pending")
 
-    # Rate limiting
-    simple_rate_limit_check(http_request)
-
     # Validate batch request
     simple_batch_validation(len(files))
+
+    await enforce_upload_rate_limits(
+        request=http_request,
+        redis_service=redis_service,
+        user=user,
+        session_id=session.session_id,
+        image_count=len(files)
+    )
 
     # Validate each file
     SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif"}

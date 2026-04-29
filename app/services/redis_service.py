@@ -427,6 +427,70 @@ class RedisService:
         except Exception as e:
             logger.error(f"Failed to get queue length for {queue_name}: {e}")
             return 0
+
+    async def get_celery_queue_depth(self, queue_name: str, priority_steps: Optional[List[int]] = None) -> int:
+        """
+        Get waiting task count for a Celery Redis queue.
+
+        Celery stores priority queues across the base queue key and priority
+        suffix keys. The configured separator is ':', so sum those keys.
+        """
+        if not self._is_connected or not self.client:
+            raise RedisConnectionError("Redis unavailable")
+
+        priority_steps = priority_steps or list(range(10))
+        queue_keys = {queue_name}
+        queue_keys.update(f"{queue_name}:{priority}" for priority in priority_steps)
+        queue_keys.update(f"{queue_name}\x06\x16{priority}" for priority in priority_steps)
+
+        try:
+            total = 0
+            for key in queue_keys:
+                total += await self.client.llen(key)
+            return total
+        except Exception as e:
+            logger.error(f"Failed to get Celery queue depth for {queue_name}: {e}")
+            raise
+
+    async def count_jobs_by_status(self, statuses: List[str]) -> int:
+        """
+        Count active indexed jobs whose Redis status is in the supplied list.
+        """
+        if not self._is_connected or not self.client:
+            raise RedisConnectionError("Redis unavailable")
+
+        try:
+            status_set = set(statuses)
+            count = 0
+            for job_id in await self.get_active_jobs():
+                status_value = await self.client.hget(f"job:{job_id}", "status")
+                if status_value in status_set:
+                    count += 1
+            return count
+        except Exception as e:
+            logger.error(f"Failed to count jobs by status: {e}")
+            raise
+
+    async def increment_limited_counter(self, key: str, amount: int, expire_seconds: int) -> Dict[str, int]:
+        """
+        Increment a Redis counter and set expiry on first use.
+        """
+        if not self._is_connected or not self.client:
+            raise RedisConnectionError("Redis unavailable")
+
+        try:
+            count = await self.client.incrby(key, amount)
+            if count == amount:
+                await self.client.expire(key, expire_seconds)
+
+            ttl = await self.client.ttl(key)
+            return {
+                "count": int(count),
+                "ttl": int(ttl if ttl and ttl > 0 else expire_seconds)
+            }
+        except Exception as e:
+            logger.error(f"Failed to increment limited counter {key}: {e}")
+            raise
     
     # Caching Methods
     

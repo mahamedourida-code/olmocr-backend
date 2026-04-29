@@ -1,12 +1,14 @@
 from fastapi import Depends, HTTPException, Request, status, Cookie, WebSocket
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
+from datetime import datetime
 import time
 import jwt
 import logging
 
 from app.core.config import Settings, get_settings
 from app.services.storage import FileStorageManager
+from app.services.redis_service import RedisService
 from app.models.jobs import SessionMetadata
 
 logger = logging.getLogger(__name__)
@@ -168,8 +170,8 @@ def check_rate_limit(
     
     if not rate_limiter.is_allowed(
         client_ip, 
-        settings.rate_limit_requests, 
-        settings.rate_limit_window
+        settings.rate_limit_per_minute,
+        settings.rate_limit_window_seconds
     ):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -190,6 +192,124 @@ def get_client_ip(request: Request) -> str:
     
     # Fallback to direct client IP
     return request.client.host if request.client else "unknown"
+
+
+def _safe_rate_limit_key(value: str) -> str:
+    return "".join(
+        char if char.isalnum() or char in ("-", "_", ".") else "_"
+        for char in str(value)
+    )
+
+
+async def _enforce_redis_limit(
+    redis_service: RedisService,
+    key: str,
+    amount: int,
+    limit: int,
+    expire_seconds: int,
+    detail: str
+) -> None:
+    counter = await redis_service.increment_limited_counter(key, amount, expire_seconds)
+    if counter["count"] > limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=detail,
+            headers={"Retry-After": str(counter["ttl"])}
+        )
+
+
+async def enforce_upload_rate_limits(
+    request: Optional[Request],
+    redis_service: RedisService,
+    user: Optional[dict],
+    session_id: str,
+    image_count: int,
+    queue_name: str = "batch_processing",
+    settings: Settings = get_settings()
+) -> None:
+    """
+    Redis-backed upload admission control.
+
+    Applies per-IP, per-user/session, daily image, and queue-depth limits before
+    uploads are stored or OCR work is queued.
+    """
+    if not redis_service or not redis_service._is_connected or not redis_service.client:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Queue controls are temporarily unavailable. Please try again shortly."
+        )
+
+    try:
+        queued_jobs = await redis_service.get_celery_queue_depth(queue_name)
+        if queued_jobs >= settings.queue_admission_max_queued_jobs:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Processing queue is busy. Please try again shortly.",
+                headers={"Retry-After": "30"}
+            )
+
+        active_jobs = await redis_service.count_jobs_by_status(["queued", "processing"])
+        if active_jobs >= settings.queue_admission_max_active_jobs:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many active jobs are running. Please try again shortly.",
+                headers={"Retry-After": "30"}
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to check queue admission: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Queue controls are temporarily unavailable. Please try again shortly."
+        )
+
+    client_ip = get_client_ip(request) if request else "unknown"
+    safe_ip = _safe_rate_limit_key(client_ip)
+    is_authenticated = bool(user and user.get("user_id"))
+    actor_type = "user" if is_authenticated else "anon"
+    actor_id = user["user_id"] if is_authenticated else (session_id or client_ip)
+    safe_actor = _safe_rate_limit_key(actor_id)
+
+    window_seconds = settings.rate_limit_window_seconds
+    minute_bucket = int(time.time() // window_seconds)
+    day_bucket = datetime.utcnow().strftime("%Y%m%d")
+
+    actor_jobs_limit = (
+        settings.rate_limit_authenticated_jobs_per_minute
+        if is_authenticated
+        else settings.rate_limit_anonymous_jobs_per_minute
+    )
+    daily_image_limit = (
+        settings.rate_limit_authenticated_images_per_day
+        if is_authenticated
+        else settings.rate_limit_anonymous_images_per_day
+    )
+
+    await _enforce_redis_limit(
+        redis_service,
+        f"rate:v1:ip:{safe_ip}:jobs:{minute_bucket}",
+        1,
+        settings.rate_limit_ip_jobs_per_minute,
+        window_seconds * 2,
+        "Too many upload requests from this network. Please slow down."
+    )
+    await _enforce_redis_limit(
+        redis_service,
+        f"rate:v1:{actor_type}:{safe_actor}:jobs:{minute_bucket}",
+        1,
+        actor_jobs_limit,
+        window_seconds * 2,
+        "Too many upload jobs. Please wait before starting another conversion."
+    )
+    await _enforce_redis_limit(
+        redis_service,
+        f"rate:v1:{actor_type}:{safe_actor}:images:{day_bucket}",
+        image_count,
+        daily_image_limit,
+        172800,
+        "Daily image limit reached. Please try again tomorrow or upgrade your plan."
+    )
 
 
 async def verify_job_ownership(

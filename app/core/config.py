@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     # Rate Limiting Configuration
     rate_limit_per_minute: int = Field(100, env="RATE_LIMIT_PER_MINUTE")
     rate_limit_burst: int = Field(20, env="RATE_LIMIT_BURST")
+    rate_limit_window_seconds: int = Field(60, env="RATE_LIMIT_WINDOW_SECONDS")
+    rate_limit_ip_jobs_per_minute: int = Field(20, env="RATE_LIMIT_IP_JOBS_PER_MINUTE")
+    rate_limit_anonymous_jobs_per_minute: int = Field(3, env="RATE_LIMIT_ANONYMOUS_JOBS_PER_MINUTE")
+    rate_limit_authenticated_jobs_per_minute: int = Field(12, env="RATE_LIMIT_AUTHENTICATED_JOBS_PER_MINUTE")
+    rate_limit_anonymous_images_per_day: int = Field(20, env="RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY")
+    rate_limit_authenticated_images_per_day: int = Field(200, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
+    queue_admission_max_queued_jobs: int = Field(50, env="QUEUE_ADMISSION_MAX_QUEUED_JOBS")
+    queue_admission_max_active_jobs: int = Field(100, env="QUEUE_ADMISSION_MAX_ACTIVE_JOBS")
     
     # OlmOCR API Rate Limiting Configuration
     olmocr_base_delay_seconds: float = Field(2.0, env="OLMOCR_BASE_DELAY_SECONDS")
