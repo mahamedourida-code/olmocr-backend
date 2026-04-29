@@ -430,7 +430,7 @@ class SupabaseService:
                 path=storage_path,
                 file=file_data,
                 file_options={
-                    "content-type": content_type or "application/octet-stream",
+                    "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     "upsert": "true"
                 }
             )
