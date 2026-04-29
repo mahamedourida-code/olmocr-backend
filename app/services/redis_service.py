@@ -188,7 +188,7 @@ class RedisService:
             job_data_copy['updated_at'] = datetime.utcnow().isoformat()
             
             # Convert complex objects to JSON (same as update_job method)
-            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files']:
+            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files', 'image_results']:
                 if field in job_data_copy and isinstance(job_data_copy[field], (list, dict)):
                     job_data_copy[field] = json.dumps(job_data_copy[field])
             
@@ -254,7 +254,7 @@ class RedisService:
                 job_data_str[str_key] = str_value
             
             # Parse JSON fields
-            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files']:
+            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files', 'image_results']:
                 if field in job_data_str and job_data_str[field]:
                     try:
                         job_data_str[field] = json.loads(job_data_str[field])
@@ -290,7 +290,7 @@ class RedisService:
             updates_copy['updated_at'] = datetime.utcnow().isoformat()
             
             # Convert complex objects to JSON
-            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files']:
+            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files', 'image_results']:
                 if field in updates_copy and isinstance(updates_copy[field], (list, dict)):
                     updates_copy[field] = json.dumps(updates_copy[field])
             
@@ -328,6 +328,67 @@ class RedisService:
         except Exception as e:
             logger.error(f"Failed to update job {job_id}: {e}")
             return False
+
+    async def set_job_image_result(
+        self,
+        job_id: str,
+        image_id: str,
+        result_data: Dict[str, Any],
+        expire_seconds: Optional[int] = None
+    ) -> bool:
+        """
+        Store one completed image result for idempotent batch retries.
+        """
+        if not self._is_connected or not self.client:
+            logger.debug(f"Redis unavailable - cannot store image result {job_id}/{image_id}")
+            return False
+
+        try:
+            result_key = f"job:{job_id}:image_results"
+            await self.client.hset(result_key, image_id, json.dumps(result_data))
+            await self.client.expire(result_key, expire_seconds or settings.job_expiry_seconds)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to store image result {job_id}/{image_id}: {e}")
+            return False
+
+    async def get_job_image_result(self, job_id: str, image_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a completed image result for idempotent retry skip checks.
+        """
+        if not self._is_connected or not self.client:
+            return None
+
+        try:
+            value = await self.client.hget(f"job:{job_id}:image_results", image_id)
+            if not value:
+                return None
+            return json.loads(value)
+        except Exception as e:
+            logger.error(f"Failed to get image result {job_id}/{image_id}: {e}")
+            return None
+
+    async def get_job_image_results(self, job_id: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Get all completed image results for a job.
+        """
+        if not self._is_connected or not self.client:
+            return {}
+
+        try:
+            raw_results = await self.client.hgetall(f"job:{job_id}:image_results")
+            results: Dict[str, Dict[str, Any]] = {}
+            for image_id, value in raw_results.items():
+                str_image_id = image_id.decode("utf-8") if isinstance(image_id, bytes) else image_id
+                str_value = value.decode("utf-8") if isinstance(value, bytes) else value
+                try:
+                    results[str_image_id] = json.loads(str_value)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse image result {job_id}/{str_image_id}")
+            return results
+        except Exception as e:
+            logger.error(f"Failed to get image results for {job_id}: {e}")
+            return {}
     
     async def delete_job(self, job_id: str) -> bool:
         """
@@ -343,7 +404,7 @@ class RedisService:
             job_key = f"job:{job_id}"
             
             # Remove job data
-            await self.client.delete(job_key)
+            await self.client.delete(job_key, f"job:{job_id}:image_results")
             
             # Remove from active jobs index
             await self.client.srem("jobs:active", job_id)
