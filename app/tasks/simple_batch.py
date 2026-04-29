@@ -89,7 +89,10 @@ async def process_single_image_simple(
                     {
                         "storage_path": supabase_storage_path,
                         "filename": excel_filename,
-                        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "job_id": job_id,
+                        "session_id": session_id,
+                        "user_id": user_id or ""
                     },
                     settings.file_retention_seconds
                 )

@@ -201,6 +201,101 @@ def _safe_rate_limit_key(value: str) -> str:
     )
 
 
+def _clean_owner_value(value: Optional[str]) -> Optional[str]:
+    if value in (None, "", "None", "null"):
+        return None
+    return str(value)
+
+
+def _owner_from_storage_path(storage_path: Optional[str]) -> Optional[str]:
+    if not storage_path:
+        return None
+
+    parts = storage_path.split("/")
+    if len(parts) >= 2 and parts[0] == "users":
+        return parts[1]
+    if len(parts) >= 3:
+        return parts[0]
+    return None
+
+
+def verify_job_data_access(
+    job_data: dict,
+    user: Optional[dict],
+    session_id: Optional[str]
+) -> None:
+    """
+    Enforce job ownership for Redis/Supabase-backed job metadata.
+    Authenticated jobs require the same user; anonymous jobs require the original session.
+    """
+    job_user_id = _clean_owner_value(job_data.get("user_id"))
+    request_user_id = _clean_owner_value(user.get("user_id") if user else None)
+
+    if job_user_id:
+        if not request_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required to access this job"
+            )
+        if request_user_id != job_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this job"
+            )
+        return
+
+    job_session_id = _clean_owner_value(job_data.get("session_id"))
+    if not job_session_id or _clean_owner_value(session_id) != job_session_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to this anonymous job"
+        )
+
+
+def verify_file_metadata_access(
+    file_metadata: dict,
+    user: Optional[dict],
+    session_id: Optional[str]
+) -> None:
+    """
+    Enforce file ownership for Redis cached file metadata or inferred storage owner.
+    """
+    file_user_id = _clean_owner_value(file_metadata.get("user_id"))
+    file_session_id = _clean_owner_value(file_metadata.get("session_id"))
+    request_user_id = _clean_owner_value(user.get("user_id") if user else None)
+    request_session_id = _clean_owner_value(session_id)
+
+    if file_user_id:
+        if not request_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required to download this file"
+            )
+        if request_user_id != file_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this file"
+            )
+        return
+
+    if file_session_id:
+        if request_session_id != file_session_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this anonymous file"
+            )
+        return
+
+    inferred_owner = _owner_from_storage_path(file_metadata.get("storage_path"))
+    if inferred_owner and (request_user_id == inferred_owner or request_session_id == inferred_owner):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Access denied to this file"
+    )
+
+
 async def _enforce_redis_limit(
     redis_service: RedisService,
     key: str,

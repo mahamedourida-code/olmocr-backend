@@ -1,8 +1,14 @@
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
-from app.core.dependencies import get_storage_service, get_current_user, get_optional_user
+from app.core.dependencies import (
+    get_storage_service,
+    get_current_user,
+    get_optional_user,
+    verify_file_metadata_access,
+    verify_job_data_access,
+)
 from app.services.storage import FileStorageManager
 from app.services.redis_service import get_redis_service, RedisService
 from app.services.supabase_service import get_supabase_service
@@ -15,9 +21,11 @@ router = APIRouter(prefix="/download", tags=["File Downloads"])
 @router.get("/{file_or_job_id}")
 async def download_file(
     file_or_job_id: str,
+    request: Request,
     session_id: Optional[str] = None,  # Accept session_id as query param
     storage: FileStorageManager = Depends(get_storage_service),
-    redis_service: RedisService = Depends(get_redis_service)
+    redis_service: RedisService = Depends(get_redis_service),
+    user: Optional[dict] = Depends(get_optional_user),
 ):
     """
     Download a generated XLSX file.
@@ -33,17 +41,12 @@ async def download_file(
     logger = logging.getLogger(__name__)
 
     try:
-        # CRITICAL FIX: Use session_id from query param OR try to find it from the job
-        target_session_id = session_id
+        target_session_id = (
+            session_id
+            or request.headers.get("x-session-id")
+            or request.cookies.get("session_id")
+        )
         session = None
-
-        # If no session_id provided, try to get it from job data
-        if not target_session_id:
-            logger.info(f"No session_id provided, looking up job {file_or_job_id}")
-            job_data = await redis_service.get_job(file_or_job_id)
-            if job_data and job_data.get('session_id'):
-                target_session_id = job_data['session_id']
-                logger.info(f"Found session_id from job: {target_session_id}")
 
         # Load the session if we have a session_id
         if target_session_id:
@@ -60,10 +63,14 @@ async def download_file(
         
         actual_file_id = file_or_job_id  # This might be either a file_id or job_id
 
-        # First, try to use the ID as a file_id (original behavior)
+        authorized_by_session = False
+        authorized_by_job = False
+
+        # First, try to use the ID as a file_id for the current session.
         if session and file_or_job_id in session.result_files:
             logger.info(f"Found {file_or_job_id} in session result_files - treating as file_id")
             actual_file_id = file_or_job_id
+            authorized_by_session = True
         else:
             # ID not found in session result_files (or no session)
             # Check if this might be a job_id instead
@@ -73,8 +80,9 @@ async def download_file(
             job_data = await redis_service.get_job(file_or_job_id)
 
             if job_data:
-                # This is a valid job_id for this session
                 logger.info(f"Found job data for job_id {file_or_job_id}")
+                verify_job_data_access(job_data, user, target_session_id)
+                authorized_by_job = True
                 
                 # Extract file_id from job data
                 if job_data.get('file_id'):
@@ -103,6 +111,15 @@ async def download_file(
                 # local-disk/Supabase lookup below decide whether it exists.
                 logger.info(f"No job data found for {file_or_job_id}, checking as file_id")
                 actual_file_id = file_or_job_id
+
+        file_metadata = await redis_service.get_cache(f"file:{actual_file_id}")
+        if isinstance(file_metadata, dict) and not authorized_by_session and not authorized_by_job:
+            verify_file_metadata_access(file_metadata, user, target_session_id)
+        elif not authorized_by_session and not authorized_by_job:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this file"
+            )
         
         # Now we have the actual_file_id, try local disk first, then durable storage.
         logger.info(f"Using actual_file_id: {actual_file_id}")
@@ -126,7 +143,6 @@ async def download_file(
         except Exception as local_error:
             logger.info(f"Local download miss for {actual_file_id}: {local_error}")
 
-        file_metadata = await redis_service.get_cache(f"file:{actual_file_id}")
         storage_path = file_metadata.get("storage_path") if isinstance(file_metadata, dict) else None
 
         if storage_path:
@@ -160,7 +176,7 @@ async def download_file(
 @router.get("/storage/{storage_path:path}")
 async def download_from_storage(
     storage_path: str,
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict = Depends(get_current_user),
 ):
     """
     Download a file from Supabase Storage.
@@ -182,8 +198,7 @@ async def download_from_storage(
     try:
         logger.info(f"Storage download request for path: {storage_path}")
         
-        # If user is authenticated, verify they have access to this file
-        if user and not (
+        if not (
             storage_path.startswith(f"{user['user_id']}/")
             or storage_path.startswith(f"users/{user['user_id']}/")
         ):

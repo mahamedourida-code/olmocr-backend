@@ -15,7 +15,7 @@ from app.models.jobs import JobStatus, BatchProcessingContext, ImageProcessingRe
 from app.core.dependencies import (
     get_or_create_session, get_storage_service,
     verify_job_ownership, get_optional_user, get_current_user,
-    enforce_upload_rate_limits
+    enforce_upload_rate_limits, verify_job_data_access
 )
 from app.core.config import settings
 from app.services.storage import FileStorageManager
@@ -458,7 +458,8 @@ async def get_job_status(
     job_id: str,
     session: SessionMetadata = Depends(get_or_create_session),
     storage: FileStorageManager = Depends(get_storage_service),
-    redis_service: RedisService = Depends(get_redis_service)
+    redis_service: RedisService = Depends(get_redis_service),
+    user: Optional[dict] = Depends(get_optional_user)
 ):
     """
     Get the current status of a batch processing job.
@@ -501,32 +502,10 @@ async def get_job_status(
                     'updated_at': datetime.utcnow().isoformat()
                 }
             else:
-                # Check if file exists in storage (fallback check for old jobs)
-                try:
-                    file_path = storage.get_download_file_path(job_id)
-                    if file_path.exists():
-                        job_data = {
-                            'status': 'completed',
-                            'total_images': 1,
-                            'processed_images': 1,
-                            'progress': 100,
-                            'download_url': f"/api/v1/download/{job_id}",
-                            'results': [{'job_id': job_id}],
-                            'errors': [],
-                            'session_id': session.session_id,
-                            'created_at': datetime.utcnow().isoformat(),
-                            'updated_at': datetime.utcnow().isoformat()
-                        }
-                    else:
-                        raise HTTPException(
-                            status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"Job '{job_id}' not found. Make sure you're using the same session (cookies/headers) as when you created the job."
-                        )
-                except Exception:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=f"Job '{job_id}' not found. Make sure you're using the same session (cookies/headers) as when you created the job."
-                    )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Job '{job_id}' not found. Make sure you're using the same session (cookies/headers) as when you created the job."
+                )
         except HTTPException:
             raise
         except Exception as e:
@@ -535,6 +514,8 @@ async def get_job_status(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Job not found"
             )
+    else:
+        verify_job_data_access(job_data, user, session.session_id)
     
     # Build progress info
     progress = None
