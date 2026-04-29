@@ -1,7 +1,10 @@
-# fly.toml app configuration file generated for backend-lively-hill-7043 on 2025-11-13T23:18:26+01:00
+# fly.toml app configuration file
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# For a new Fly account:
+# 1. Run `fly launch`
+# 2. Let Fly replace the app name below
+# 3. Attach/create Upstash Redis
+# 4. Set private values with `fly secrets set`
 
 app = 'backend-lively-hill-7043'
 primary_region = 'arn'
@@ -11,10 +14,10 @@ primary_region = 'arn'
 [processes]
   app = 'python start.py'
   worker = 'env SERVICE_TYPE=worker python start.py'
+
 [env]
-  ALLOWED_ORIGINS = 'http://localhost:3000,https://exceletto.vercel.app,https://frontend-six-rho-53.vercel.app,https://frontend-44j5hlb03-hamas-projects-104eb9bb.vercel.app'
+  ALLOWED_ORIGINS = 'https://axliner.com,https://www.axliner.com'
   API_V1_PREFIX = '/api/v1'
-  CELERY_WORKER_CONCURRENCY = '2'
   CLEANUP_INTERVAL_HOURS = '4'
   CORS_ALLOW_CREDENTIALS = 'true'
   CORS_ALLOW_HEADERS = '["*"]'
@@ -36,6 +39,7 @@ primary_region = 'arn'
   REDOC_URL = '/redoc'
   SUPABASE_STORAGE_BUCKET = 'jobs'
   TEMP_STORAGE_PATH = '/app/temp_storage'
+  WORKER_CONCURRENCY = '4'
 
 [http_service]
   internal_port = 8080
@@ -58,6 +62,6 @@ primary_region = 'arn'
     path = '/docs'
 
 [[vm]]
-  memory = '8gb'
-  cpu_kind = 'shared'
-  cpus = 8
+  memory = '4gb'
+  cpus = 2
+  memory_mb = 4096
