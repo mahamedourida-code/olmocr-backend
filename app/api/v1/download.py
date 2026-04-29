@@ -99,49 +99,10 @@ async def download_file(
                         detail="Job completed but no download file available"
                     )
             else:
-                # Not a valid job_id, try fallback: check if file exists on disk
-                logger.info(f"No job data found for {file_or_job_id}, trying file system fallback")
-
-                # FALLBACK: Check if file exists on disk
-                try:
-                    file_path = storage.get_download_file_path(file_or_job_id)
-
-                    if file_path.exists():
-                        # File exists on disk - allow download even without session verification
-                        # This handles cases where session management fails but files are valid
-                        from datetime import datetime, timedelta
-                        import os
-
-                        file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
-                        if datetime.utcnow() - file_mtime < timedelta(hours=72):  # Extended to 72h for safety
-                            logger.info(f"Found file {file_or_job_id} on disk (modified {file_mtime})")
-                            actual_file_id = file_or_job_id
-
-                            # Update session if we have one
-                            if session and file_or_job_id not in session.result_files:
-                                session.result_files.append(file_or_job_id)
-                                await storage.update_session_metadata(session)
-                                logger.info(f"Added {file_or_job_id} to session {session.session_id}")
-                        else:
-                            logger.error(f"File {file_or_job_id} exists but is too old ({file_mtime})")
-                            raise HTTPException(
-                                status_code=status.HTTP_410_GONE,
-                                detail="File has expired"
-                            )
-                    else:
-                        logger.error(f"File {file_or_job_id} not found anywhere (disk, job, session)")
-                        raise HTTPException(
-                            status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"File {file_or_job_id} not found or expired"
-                        )
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    logger.error(f"Error in fallback file check: {e}")
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=f"File {file_or_job_id} not found or expired"
-                    )
+                # Not a valid job_id. Treat it as a file_id and let the unified
+                # local-disk/Supabase lookup below decide whether it exists.
+                logger.info(f"No job data found for {file_or_job_id}, checking as file_id")
+                actual_file_id = file_or_job_id
         
         # Now we have the actual_file_id, try local disk first, then durable storage.
         logger.info(f"Using actual_file_id: {actual_file_id}")
