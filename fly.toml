@@ -8,6 +8,9 @@ primary_region = 'arn'
 
 [build]
 
+[processes]
+  app = 'python start.py'
+  worker = 'env SERVICE_TYPE=worker python start.py'
 [env]
   ALLOWED_ORIGINS = 'http://localhost:3000,https://exceletto.vercel.app,https://frontend-six-rho-53.vercel.app,https://frontend-44j5hlb03-hamas-projects-104eb9bb.vercel.app'
   API_V1_PREFIX = '/api/v1'
