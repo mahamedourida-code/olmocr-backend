@@ -6,6 +6,7 @@ including single image processing, batch coordination, and cleanup tasks.
 """
 
 import asyncio
+import base64
 import logging
 import traceback
 from typing import Dict, Any, List, Optional
@@ -223,6 +224,87 @@ def process_batch_images(self, job_id: str, images: List[Dict[str, str]]) -> Dic
                 main_loop.close()
             except Exception as e:
                 logger.error(f"[Celery] Error closing event loop: {e}")
+
+
+@celery_app.task(
+    bind=True,
+    base=BaseTask,
+    name="process_batch_from_storage",
+    max_retries=2,
+    default_retry_delay=120,
+    queue='batch_processing',
+    priority=6
+)
+def process_batch_from_storage(
+    self,
+    job_id: str,
+    session_id: str,
+    stored_images: List[Dict[str, Any]],
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Process a batch from durable storage paths.
+
+    The web API uploads source images first and queues only small metadata here.
+    """
+    main_loop = None
+
+    try:
+        logger.info(f"[Celery] Starting storage-backed batch job {job_id} with {len(stored_images)} images")
+        main_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(main_loop)
+        result = main_loop.run_until_complete(
+            _process_batch_from_storage_async(job_id, session_id, stored_images, user_id)
+        )
+        logger.info(f"[Celery] Storage-backed batch job {job_id} completed")
+        return result
+    except Exception as exc:
+        logger.error(f"[Celery] Storage-backed batch job {job_id} failed: {exc}")
+        logger.error(f"[Celery] Traceback: {traceback.format_exc()}")
+        raise self.retry(exc=exc, countdown=120, max_retries=2)
+    finally:
+        if main_loop:
+            try:
+                main_loop.close()
+            except Exception as e:
+                logger.error(f"[Celery] Error closing event loop: {e}")
+
+
+async def _process_batch_from_storage_async(
+    job_id: str,
+    session_id: str,
+    stored_images: List[Dict[str, Any]],
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    supabase_service = get_supabase_service()
+    images: List[Dict[str, str]] = []
+
+    for i, image_info in enumerate(stored_images):
+        storage_path = image_info.get('storage_path')
+        if not storage_path:
+            raise ValueError(f"Missing storage_path for image {i + 1}")
+
+        image_bytes = await supabase_service.download_file_from_storage(storage_path)
+        images.append({
+            'id': image_info.get('id', f"img_{i}"),
+            'data': base64.b64encode(image_bytes).decode('utf-8'),
+            'filename': image_info.get('filename', f"image_{i}.png")
+        })
+
+    from app.tasks.simple_batch import process_batch_simple
+
+    await process_batch_simple(
+        job_id=job_id,
+        session_id=session_id,
+        images=images,
+        user_id=user_id
+    )
+
+    return {
+        'job_id': job_id,
+        'status': 'submitted',
+        'images': len(images)
+    }
 
 
 @celery_app.task(
@@ -892,7 +974,8 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
 # Export tasks for import
 __all__ = [
     'process_single_image',
-    'process_batch_images', 
+    'process_batch_images',
+    'process_batch_from_storage',
     'cleanup_job_files',
     'cleanup_expired_jobs',
     'process_batch_images_direct'

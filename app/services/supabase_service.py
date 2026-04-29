@@ -405,6 +405,51 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Legacy upload failed: {e}")
             raise
+
+    async def upload_source_file(
+        self,
+        file_data: bytes,
+        owner_id: str,
+        job_id: str,
+        filename: str,
+        content_type: str = "application/octet-stream"
+    ) -> Dict[str, Any]:
+        """
+        Upload an original input image to durable storage before queueing work.
+
+        Workers should receive this storage path instead of the raw image bytes.
+        """
+        try:
+            safe_filename = "".join(
+                char if char.isalnum() or char in ("-", "_", ".") else "_"
+                for char in filename
+            ).strip("._") or "image"
+            storage_path = f"users/{owner_id}/jobs/{job_id}/inputs/{safe_filename}"
+
+            response = self.client.storage.from_(self.storage_bucket).upload(
+                path=storage_path,
+                file=file_data,
+                file_options={
+                    "content-type": content_type or "application/octet-stream",
+                    "upsert": "true"
+                }
+            )
+
+            if hasattr(response, "error") and response.error:
+                raise Exception(f"Upload error: {response.error}")
+            if isinstance(response, dict) and response.get("error"):
+                raise Exception(f"Upload error: {response['error']}")
+
+            logger.info(f"Uploaded source file to Supabase Storage: {storage_path}")
+            return {
+                "storage_path": storage_path,
+                "filename": safe_filename,
+                "content_type": content_type,
+                "size_bytes": len(file_data)
+            }
+        except Exception as e:
+            logger.error(f"Failed to upload source file to Supabase Storage: {e}")
+            raise
             
     # Old upload method removed - using simplified upload_job_file() instead
 

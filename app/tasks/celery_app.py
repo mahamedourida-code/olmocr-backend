@@ -119,6 +119,8 @@ celery_app.conf.update(
     task_routes={
         'app.tasks.batch_tasks.process_single_image': {'queue': 'image_processing'},
         'app.tasks.batch_tasks.process_batch_images': {'queue': 'batch_processing'},
+        'app.tasks.batch_tasks.process_batch_from_storage': {'queue': 'batch_processing'},
+        'process_batch_from_storage': {'queue': 'batch_processing'},
         'app.tasks.batch_tasks.cleanup_job_files': {'queue': 'cleanup'},
     },
     

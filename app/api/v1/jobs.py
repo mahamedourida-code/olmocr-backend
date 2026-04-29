@@ -20,7 +20,7 @@ from app.core.config import settings
 from app.services.storage import FileStorageManager
 from app.services.redis_service import get_redis_service, RedisService
 from app.services.supabase_service import get_supabase_service
-from app.tasks.batch_tasks import process_batch_images
+from app.tasks.batch_tasks import process_batch_from_storage
 from app.utils.exceptions import ProcessingError, ValidationError
 from app.models.jobs import SessionMetadata
 from typing import Optional
@@ -129,7 +129,30 @@ async def create_batch_job(
     job_id = str(uuid.uuid4())
     
     try:
-        # Create job metadata for Redis (convert None values to empty strings for Redis compatibility)
+        supabase_service = get_supabase_service()
+        storage_owner_id = user['user_id'] if user else session.session_id
+        stored_images = []
+
+        for i, img in enumerate(request.images):
+            image_data = img.image.split(',', 1)[1] if img.image.startswith('data:') else img.image
+            image_bytes = base64.b64decode(image_data)
+            filename = img.filename or f"image_{i}.png"
+            source_file = await supabase_service.upload_source_file(
+                file_data=image_bytes,
+                owner_id=storage_owner_id,
+                job_id=job_id,
+                filename=f"{i}_{filename}",
+                content_type="image/png"
+            )
+            stored_images.append({
+                'id': f"img_{i}",
+                'storage_path': source_file['storage_path'],
+                'filename': filename,
+                'content_type': source_file['content_type'],
+                'size_bytes': source_file['size_bytes']
+            })
+
+        # Create job metadata for Redis with storage paths, not raw image payloads.
         job_data = {
             'job_id': job_id,
             'session_id': session.session_id,
@@ -140,7 +163,7 @@ async def create_batch_job(
             'progress': 0,
             'output_format': request.output_format,
             'consolidation_strategy': request.consolidation_strategy,
-            'images': [{'id': f"img_{i}", 'data': img.image, 'filename': img.filename or f"image_{i}.png"} for i, img in enumerate(request.images)],
+            'images': stored_images,
             'results': [],
             'errors': [],
             'created_at': datetime.utcnow().isoformat(),
@@ -176,19 +199,13 @@ async def create_batch_job(
                 detail="Failed to store job in Redis"
             )
         
-        # Start simple async batch processing
-        from app.tasks.simple_batch import process_batch_simple
-        import asyncio
+        process_batch_from_storage.apply_async(
+            args=[job_id, session.session_id, stored_images, user['user_id'] if user else None],
+            queue='batch_processing',
+            priority=6
+        )
 
-        # Launch background task to process batch
-        asyncio.create_task(process_batch_simple(
-            job_id=job_id,
-            session_id=session.session_id,
-            images=job_data['images'],
-            user_id=user['user_id'] if user else None
-        ))
-
-        logger.info(f"Started background processing for job {job_id} with {len(job_data['images'])} images")
+        logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} images")
         
         # Update session
         session.jobs_count += 1
@@ -311,26 +328,34 @@ async def create_batch_job_multipart(
     logger.info(f"[BATCH-UPLOAD] Generated job ID: {job_id}")
 
     try:
-        # Convert uploaded files to base64 format expected by existing processing pipeline
-        # In future, we can refactor the pipeline to work directly with binary data
-        images_data = []
+        supabase_service = get_supabase_service()
+        storage_owner_id = user['user_id'] if user else session.session_id
+        stored_images = []
+
         for i, file in enumerate(files):
             # Read binary data (we already validated it above)
             file_content = await file.read()
 
-            # Convert to base64 for compatibility with existing processing pipeline
-            base64_data = base64.b64encode(file_content).decode('utf-8')
+            source_file = await supabase_service.upload_source_file(
+                file_data=file_content,
+                owner_id=storage_owner_id,
+                job_id=job_id,
+                filename=f"{i}_{file.filename or f'image_{i}.png'}",
+                content_type=file.content_type or "application/octet-stream"
+            )
 
-            images_data.append({
+            stored_images.append({
                 'id': f"img_{i}",
-                'data': base64_data,
-                'filename': file.filename or f"image_{i}.png"
+                'storage_path': source_file['storage_path'],
+                'filename': file.filename or f"image_{i}.png",
+                'content_type': source_file['content_type'],
+                'size_bytes': source_file['size_bytes']
             })
 
             # Reset file pointer (in case we need to read again)
             await file.seek(0)
 
-        # Create job metadata for Redis (convert None values to empty strings for Redis compatibility)
+        # Create job metadata for Redis with storage paths, not raw image payloads.
         job_data = {
             'job_id': job_id,
             'session_id': session.session_id,
@@ -341,7 +366,7 @@ async def create_batch_job_multipart(
             'progress': 0,
             'output_format': output_format,
             'consolidation_strategy': consolidation_strategy,
-            'images': images_data,
+            'images': stored_images,
             'results': [],
             'errors': [],
             'created_at': datetime.utcnow().isoformat(),
@@ -377,19 +402,13 @@ async def create_batch_job_multipart(
                 detail="Failed to store job in Redis"
             )
 
-        # Start simple async batch processing
-        from app.tasks.simple_batch import process_batch_simple
-        import asyncio
+        process_batch_from_storage.apply_async(
+            args=[job_id, session.session_id, stored_images, user['user_id'] if user else None],
+            queue='batch_processing',
+            priority=6
+        )
 
-        # Launch background task to process batch
-        asyncio.create_task(process_batch_simple(
-            job_id=job_id,
-            session_id=session.session_id,
-            images=job_data['images'],
-            user_id=user['user_id'] if user else None
-        ))
-
-        logger.info(f"Started background processing for job {job_id} with {len(job_data['images'])} images")
+        logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} images")
 
         # Update session
         session.jobs_count += 1

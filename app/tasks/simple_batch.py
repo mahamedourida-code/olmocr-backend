@@ -68,19 +68,34 @@ async def process_single_image_simple(
         # Save file
         file_id = storage.save_result_file_sync(session_id, excel_filename, excel_data)
 
-        # Upload to Supabase if authenticated
+        # Upload result to durable storage so downloads work from separate workers.
         supabase_url = None
-        if user_id:
-            try:
-                supabase = get_supabase_service()
-                file_path = f"{user_id}/{job_id}/{excel_filename}"
-                supabase_url = await supabase.upload_file_to_storage(
-                    file_data=excel_data,
-                    file_path=file_path
+        supabase_storage_path = None
+        try:
+            supabase = get_supabase_service()
+            storage_owner_id = user_id or session_id
+            upload_result = await supabase.upload_file_to_storage(
+                file_data=excel_data,
+                file_path=f"users/{storage_owner_id}/jobs/{job_id}/{excel_filename}",
+                user_id=storage_owner_id,
+                job_id=job_id,
+                filename=excel_filename
+            )
+            supabase_url = upload_result.get('signed_url')
+            supabase_storage_path = upload_result.get('storage_path')
+            if supabase_storage_path:
+                await redis.set_cache(
+                    f"file:{file_id}",
+                    {
+                        "storage_path": supabase_storage_path,
+                        "filename": excel_filename,
+                        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    },
+                    settings.file_retention_seconds
                 )
-                logger.info(f"[Job {job_id}] Uploaded to Supabase: {file_path}")
-            except Exception as upload_error:
-                logger.warning(f"[Job {job_id}] Supabase upload failed: {upload_error}")
+            logger.info(f"[Job {job_id}] Uploaded result to Supabase: {supabase_storage_path}")
+        except Exception as upload_error:
+            logger.warning(f"[Job {job_id}] Supabase result upload failed: {upload_error}")
 
         # Get current job to read processed count (with fallback if Redis unavailable)
         job_data = await redis.get_job(job_id)
@@ -174,7 +189,8 @@ async def process_single_image_simple(
                 'filename': excel_filename,
                 'image_id': img.get('id'),
                 'size_bytes': len(excel_data),
-                'supabase_url': supabase_url
+                'supabase_url': supabase_url,
+                'storage_path': supabase_storage_path
             },
             'download_url': f"/api/v1/download/{file_id}"
         }

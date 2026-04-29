@@ -143,29 +143,48 @@ async def download_file(
                         detail=f"File {file_or_job_id} not found or expired"
                     )
         
-        # Now we have the actual_file_id, get the file path
+        # Now we have the actual_file_id, try local disk first, then durable storage.
         logger.info(f"Using actual_file_id: {actual_file_id}")
-        file_path = storage.get_download_file_path(actual_file_id)
-        
-        if not file_path.exists():
-            logger.error(f"File not found on disk: {file_path}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="File not found on disk"
+
+        try:
+            file_path = storage.get_download_file_path(actual_file_id)
+
+            if file_path.exists():
+                logger.info(f"Serving file: {file_path}")
+                return FileResponse(
+                    path=str(file_path),
+                    filename=f"{actual_file_id}.xlsx",
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={
+                        "Content-Disposition": f"attachment; filename=\"{actual_file_id}.xlsx\"",
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0"
+                    }
+                )
+        except Exception as local_error:
+            logger.info(f"Local download miss for {actual_file_id}: {local_error}")
+
+        file_metadata = await redis_service.get_cache(f"file:{actual_file_id}")
+        storage_path = file_metadata.get("storage_path") if isinstance(file_metadata, dict) else None
+
+        if storage_path:
+            supabase_service = get_supabase_service()
+            file_data = await supabase_service.download_file_from_storage(storage_path)
+            filename = file_metadata.get("filename", f"{actual_file_id}.xlsx")
+            return StreamingResponse(
+                io.BytesIO(file_data),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={
+                    "Content-Disposition": f"attachment; filename=\"{filename}\"",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Content-Length": str(len(file_data))
+                }
             )
-        
-        # Return file as download
-        logger.info(f"Serving file: {file_path}")
-        return FileResponse(
-            path=str(file_path),
-            filename=f"{actual_file_id}.xlsx",
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": f"attachment; filename=\"{actual_file_id}.xlsx\"",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0"
-            }
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found on disk or durable storage"
         )
         
     except HTTPException:
@@ -203,7 +222,10 @@ async def download_from_storage(
         logger.info(f"Storage download request for path: {storage_path}")
         
         # If user is authenticated, verify they have access to this file
-        if user and not storage_path.startswith(f"{user['user_id']}/"):
+        if user and not (
+            storage_path.startswith(f"{user['user_id']}/")
+            or storage_path.startswith(f"users/{user['user_id']}/")
+        ):
             logger.warning(f"User {user['user_id']} attempted to access file outside their directory: {storage_path}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
