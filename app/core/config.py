@@ -16,7 +16,11 @@ class Settings(BaseSettings):
     environment: str = Field("development", env="ENVIRONMENT")
     debug: bool = Field(False, env="DEBUG")
     max_file_size_mb: int = Field(10, env="MAX_FILE_SIZE_MB")
-    max_batch_size: int = Field(100, env="MAX_BATCH_SIZE")
+    max_batch_size: int = Field(50, env="MAX_BATCH_SIZE")
+    anonymous_max_files_per_batch: int = Field(5, env="ANONYMOUS_MAX_FILES_PER_BATCH")
+    free_max_files_per_batch: int = Field(10, env="FREE_MAX_FILES_PER_BATCH")
+    pro_max_files_per_batch: int = Field(25, env="PRO_MAX_FILES_PER_BATCH")
+    enterprise_max_files_per_batch: int = Field(50, env="ENTERPRISE_MAX_FILES_PER_BATCH")
     file_retention_hours: int = Field(24, env="FILE_RETENTION_HOURS")
     
     # Server Configuration
@@ -29,6 +33,7 @@ class Settings(BaseSettings):
     
     # API Configuration
     api_v1_prefix: str = Field("/api/v1", env="API_V1_PREFIX")
+    frontend_url: str = Field("https://www.axliner.com", env="FRONTEND_URL")
     docs_url: Optional[str] = Field("/docs", env="DOCS_URL")
     redoc_url: Optional[str] = Field("/redoc", env="REDOC_URL")
     
@@ -60,10 +65,23 @@ class Settings(BaseSettings):
     rate_limit_ip_jobs_per_minute: int = Field(20, env="RATE_LIMIT_IP_JOBS_PER_MINUTE")
     rate_limit_anonymous_jobs_per_minute: int = Field(3, env="RATE_LIMIT_ANONYMOUS_JOBS_PER_MINUTE")
     rate_limit_authenticated_jobs_per_minute: int = Field(12, env="RATE_LIMIT_AUTHENTICATED_JOBS_PER_MINUTE")
-    rate_limit_anonymous_images_per_day: int = Field(20, env="RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY")
+    rate_limit_anonymous_images_per_day: int = Field(5, env="RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY")
     rate_limit_authenticated_images_per_day: int = Field(200, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
+    rate_limit_pro_images_per_day: int = Field(1000, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
+    rate_limit_enterprise_images_per_day: int = Field(5000, env="RATE_LIMIT_ENTERPRISE_IMAGES_PER_DAY")
     queue_admission_max_queued_jobs: int = Field(50, env="QUEUE_ADMISSION_MAX_QUEUED_JOBS")
     queue_admission_max_active_jobs: int = Field(100, env="QUEUE_ADMISSION_MAX_ACTIVE_JOBS")
+
+    # Lemon Squeezy Billing Configuration
+    lemonsqueezy_api_key: str = Field("", env="LEMONSQUEEZY_API_KEY")
+    lemonsqueezy_store_id: str = Field("", env="LEMONSQUEEZY_STORE_ID")
+    lemonsqueezy_webhook_secret: str = Field("", env="LEMONSQUEEZY_WEBHOOK_SECRET")
+    lemonsqueezy_pro_monthly_variant_id: str = Field("", env="LEMONSQUEEZY_PRO_MONTHLY_VARIANT_ID")
+    lemonsqueezy_pro_yearly_variant_id: str = Field("", env="LEMONSQUEEZY_PRO_YEARLY_VARIANT_ID")
+    lemonsqueezy_business_monthly_variant_id: str = Field("", env="LEMONSQUEEZY_BUSINESS_MONTHLY_VARIANT_ID")
+    lemonsqueezy_pro_monthly_credits: int = Field(1000, env="LEMONSQUEEZY_PRO_MONTHLY_CREDITS")
+    lemonsqueezy_pro_yearly_credits: int = Field(12000, env="LEMONSQUEEZY_PRO_YEARLY_CREDITS")
+    lemonsqueezy_business_monthly_credits: int = Field(5000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_CREDITS")
     
     # OlmOCR API Rate Limiting Configuration
     olmocr_base_delay_seconds: float = Field(2.0, env="OLMOCR_BASE_DELAY_SECONDS")
@@ -72,7 +90,7 @@ class Settings(BaseSettings):
     olmocr_exponential_backoff: bool = Field(True, env="OLMOCR_EXPONENTIAL_BACKOFF")
     
     # CORS Configuration
-    allowed_origins: Union[str, list] = Field(["https://frontend-six-rho-53.vercel.app", "http://localhost:3000"], env="ALLOWED_ORIGINS")
+    allowed_origins: Union[str, list] = Field(["https://axliner.com", "https://www.axliner.com", "http://localhost:3000"], env="ALLOWED_ORIGINS")
     allowed_hosts: Union[str, list] = Field(["*"], env="ALLOWED_HOSTS")
     cors_allow_credentials: bool = Field(True, env="CORS_ALLOW_CREDENTIALS")
     cors_allow_methods: Union[str, list] = Field(["GET", "POST", "PUT", "DELETE", "OPTIONS"], env="CORS_ALLOW_METHODS")
@@ -88,7 +106,7 @@ class Settings(BaseSettings):
 
     # Concurrency Configuration
     max_concurrent_tasks: int = Field(50, env="MAX_CONCURRENT_TASKS")
-    worker_concurrency: int = Field(4, env="WORKER_CONCURRENCY")
+    worker_concurrency: int = Field(2, env="WORKER_CONCURRENCY")
 
     # Supabase Configuration
     supabase_url: str = Field(..., env="SUPABASE_URL")
@@ -135,6 +153,35 @@ class Settings(BaseSettings):
     def cleanup_interval_seconds(self) -> int:
         """Convert hours to seconds for cleanup interval."""
         return self.cleanup_interval_hours * 3600
+
+    @property
+    def lemonsqueezy_plan_variants(self) -> dict:
+        """Map local billing plan keys to Lemon Squeezy variant IDs and entitlements."""
+        return {
+            "pro_monthly": {
+                "variant_id": self.lemonsqueezy_pro_monthly_variant_id,
+                "plan": "pro",
+                "credits": self.lemonsqueezy_pro_monthly_credits,
+            },
+            "pro_yearly": {
+                "variant_id": self.lemonsqueezy_pro_yearly_variant_id,
+                "plan": "pro",
+                "credits": self.lemonsqueezy_pro_yearly_credits,
+            },
+            "business_monthly": {
+                "variant_id": self.lemonsqueezy_business_monthly_variant_id,
+                "plan": "enterprise",
+                "credits": self.lemonsqueezy_business_monthly_credits,
+            },
+        }
+
+    def lemonsqueezy_plan_for_variant(self, variant_id: str) -> Optional[dict]:
+        """Return local plan metadata for a Lemon Squeezy variant ID."""
+        variant = str(variant_id)
+        for plan_key, plan_data in self.lemonsqueezy_plan_variants.items():
+            if plan_data.get("variant_id") and str(plan_data["variant_id"]) == variant:
+                return {"plan_key": plan_key, **plan_data}
+        return None
     
     @property
     def parsed_allowed_origins(self) -> list:

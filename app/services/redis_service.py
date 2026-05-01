@@ -9,6 +9,7 @@ Uses async Redis for optimal performance with FastAPI.
 import json
 import logging
 import asyncio
+import time
 from typing import Optional, Dict, Any, List, Callable, Union
 from datetime import datetime, timedelta
 
@@ -160,6 +161,84 @@ class RedisService:
             return True
         except Exception as e:
             logger.error(f"Redis health check failed: {e}")
+            return False
+
+    async def acquire_distributed_semaphore(
+        self,
+        name: str,
+        holder_id: str,
+        limit: int,
+        lease_seconds: int = 180,
+        wait_timeout_seconds: int = 60,
+        poll_interval_seconds: float = 0.5
+    ) -> bool:
+        """
+        Acquire a Redis-backed semaphore shared by all workers.
+
+        The sorted-set score is the lease expiry timestamp. Expired holders are
+        removed on every attempt so a crashed worker does not block forever.
+        """
+        if not self._is_connected or not self.client:
+            logger.error(f"Redis unavailable - cannot acquire semaphore {name}")
+            return False
+
+        limit = max(1, int(limit))
+        key = f"semaphore:{name}"
+        deadline = time.monotonic() + max(0, wait_timeout_seconds)
+        script = """
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
+        if redis.call('ZSCORE', KEYS[1], ARGV[3]) then
+            redis.call('ZADD', KEYS[1], ARGV[1], ARGV[3])
+            redis.call('EXPIRE', KEYS[1], ARGV[4])
+            return 1
+        end
+        if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[5]) then
+            redis.call('ZADD', KEYS[1], ARGV[1], ARGV[3])
+            redis.call('EXPIRE', KEYS[1], ARGV[4])
+            return 1
+        end
+        return 0
+        """
+
+        while True:
+            now = time.time()
+            expires_at = now + lease_seconds
+            try:
+                acquired = await self.client.eval(
+                    script,
+                    1,
+                    key,
+                    expires_at,
+                    now,
+                    holder_id,
+                    lease_seconds,
+                    limit
+                )
+                if int(acquired) == 1:
+                    logger.debug(f"Acquired semaphore {name} as {holder_id}")
+                    return True
+            except Exception as e:
+                logger.error(f"Failed to acquire semaphore {name}: {e}")
+                return False
+
+            if time.monotonic() >= deadline:
+                logger.warning(f"Timed out waiting for semaphore {name} as {holder_id}")
+                return False
+
+            await asyncio.sleep(poll_interval_seconds)
+
+    async def release_distributed_semaphore(self, name: str, holder_id: str) -> bool:
+        """Release a Redis-backed semaphore slot."""
+        if not self._is_connected or not self.client:
+            return False
+
+        try:
+            removed = await self.client.zrem(f"semaphore:{name}", holder_id)
+            if removed:
+                logger.debug(f"Released semaphore {name} for {holder_id}")
+            return bool(removed)
+        except Exception as e:
+            logger.error(f"Failed to release semaphore {name}: {e}")
             return False
     
     # Job Management Methods
@@ -532,14 +611,63 @@ class RedisService:
             logger.error(f"Failed to count jobs by status: {e}")
             raise
 
-    async def increment_limited_counter(self, key: str, amount: int, expire_seconds: int) -> Dict[str, int]:
+    async def increment_limited_counter(
+        self,
+        key: str,
+        amount: int,
+        expire_seconds: int,
+        limit: Optional[int] = None
+    ) -> Dict[str, int]:
         """
         Increment a Redis counter and set expiry on first use.
+
+        When a limit is supplied, the increment is reserved atomically only if
+        the resulting count stays within the limit.
         """
         if not self._is_connected or not self.client:
             raise RedisConnectionError("Redis unavailable")
 
         try:
+            if limit is not None:
+                script = """
+                local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+                local amount = tonumber(ARGV[1])
+                local limit = tonumber(ARGV[2])
+                local expire_seconds = tonumber(ARGV[3])
+
+                if current + amount > limit then
+                    local ttl = redis.call('TTL', KEYS[1])
+                    if ttl < 0 then
+                        ttl = expire_seconds
+                    end
+                    return {current, ttl, 0}
+                end
+
+                local count = redis.call('INCRBY', KEYS[1], amount)
+                if count == amount then
+                    redis.call('EXPIRE', KEYS[1], expire_seconds)
+                end
+
+                local ttl = redis.call('TTL', KEYS[1])
+                if ttl < 0 then
+                    ttl = expire_seconds
+                end
+                return {count, ttl, 1}
+                """
+                count, ttl, allowed = await self.client.eval(
+                    script,
+                    1,
+                    key,
+                    amount,
+                    limit,
+                    expire_seconds
+                )
+                return {
+                    "count": int(count),
+                    "ttl": int(ttl if ttl and ttl > 0 else expire_seconds),
+                    "allowed": int(allowed)
+                }
+
             count = await self.client.incrby(key, amount)
             if count == amount:
                 await self.client.expire(key, expire_seconds)
@@ -547,7 +675,8 @@ class RedisService:
             ttl = await self.client.ttl(key)
             return {
                 "count": int(count),
-                "ttl": int(ttl if ttl and ttl > 0 else expire_seconds)
+                "ttl": int(ttl if ttl and ttl > 0 else expire_seconds),
+                "allowed": 1
             }
         except Exception as e:
             logger.error(f"Failed to increment limited counter {key}: {e}")

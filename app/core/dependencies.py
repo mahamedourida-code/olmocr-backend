@@ -302,13 +302,23 @@ async def _enforce_redis_limit(
     amount: int,
     limit: int,
     expire_seconds: int,
-    detail: str
+    detail: str,
+    code: str = "RATE_LIMIT_EXCEEDED",
+    status_code: int = status.HTTP_429_TOO_MANY_REQUESTS
 ) -> None:
-    counter = await redis_service.increment_limited_counter(key, amount, expire_seconds)
-    if counter["count"] > limit:
+    counter = await redis_service.increment_limited_counter(key, amount, expire_seconds, limit)
+    if not counter.get("allowed"):
         raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=detail,
+            status_code=status_code,
+            detail={
+                "code": code,
+                "message": detail,
+                "limit": limit,
+                "used": counter["count"],
+                "remaining": max(0, limit - counter["count"]),
+                "requested": amount,
+                "retry_after_seconds": counter["ttl"]
+            },
             headers={"Retry-After": str(counter["ttl"])}
         )
 
@@ -320,6 +330,7 @@ async def enforce_upload_rate_limits(
     session_id: str,
     image_count: int,
     queue_name: str = "batch_processing",
+    daily_image_limit_override: Optional[int] = None,
     settings: Settings = get_settings()
 ) -> None:
     """
@@ -339,7 +350,13 @@ async def enforce_upload_rate_limits(
         if queued_jobs >= settings.queue_admission_max_queued_jobs:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Processing queue is busy. Please try again shortly.",
+                detail={
+                    "code": "QUEUE_BUSY",
+                    "message": "Processing queue is busy. Please try again shortly.",
+                    "max_queued_jobs": settings.queue_admission_max_queued_jobs,
+                    "queued_jobs": queued_jobs,
+                    "retry_after_seconds": 30
+                },
                 headers={"Retry-After": "30"}
             )
 
@@ -347,7 +364,13 @@ async def enforce_upload_rate_limits(
         if active_jobs >= settings.queue_admission_max_active_jobs:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many active jobs are running. Please try again shortly.",
+                detail={
+                    "code": "TOO_MANY_ACTIVE_JOBS",
+                    "message": "Too many active jobs are running. Please try again shortly.",
+                    "max_active_jobs": settings.queue_admission_max_active_jobs,
+                    "active_jobs": active_jobs,
+                    "retry_after_seconds": 30
+                },
                 headers={"Retry-After": "30"}
             )
     except HTTPException:
@@ -376,7 +399,9 @@ async def enforce_upload_rate_limits(
         else settings.rate_limit_anonymous_jobs_per_minute
     )
     daily_image_limit = (
-        settings.rate_limit_authenticated_images_per_day
+        daily_image_limit_override
+        if daily_image_limit_override is not None
+        else settings.rate_limit_authenticated_images_per_day
         if is_authenticated
         else settings.rate_limit_anonymous_images_per_day
     )
@@ -387,7 +412,8 @@ async def enforce_upload_rate_limits(
         1,
         settings.rate_limit_ip_jobs_per_minute,
         window_seconds * 2,
-        "Too many upload requests from this network. Please slow down."
+        "Too many upload requests from this network. Please slow down.",
+        "IP_RATE_LIMIT_EXCEEDED"
     )
     await _enforce_redis_limit(
         redis_service,
@@ -395,7 +421,8 @@ async def enforce_upload_rate_limits(
         1,
         actor_jobs_limit,
         window_seconds * 2,
-        "Too many upload jobs. Please wait before starting another conversion."
+        "Too many upload jobs. Please wait before starting another conversion.",
+        "ACTOR_RATE_LIMIT_EXCEEDED"
     )
     await _enforce_redis_limit(
         redis_service,
@@ -403,8 +430,26 @@ async def enforce_upload_rate_limits(
         image_count,
         daily_image_limit,
         172800,
-        "Daily image limit reached. Please try again tomorrow or upgrade your plan."
+        (
+            "Your free trial includes 5 images. Create an account or upgrade to keep converting."
+            if not is_authenticated
+            else "Daily image limit reached. Please try again tomorrow or upgrade your plan."
+        ),
+        "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED" if not is_authenticated else "DAILY_IMAGE_LIMIT_EXCEEDED",
+        status.HTTP_402_PAYMENT_REQUIRED if not is_authenticated else status.HTTP_429_TOO_MANY_REQUESTS
     )
+
+    if not is_authenticated:
+        await _enforce_redis_limit(
+            redis_service,
+            f"rate:v1:ip:{safe_ip}:images:{day_bucket}",
+            image_count,
+            daily_image_limit,
+            172800,
+            "Your free trial includes 5 images. Create an account or upgrade to keep converting.",
+            "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED",
+            status.HTTP_402_PAYMENT_REQUIRED
+        )
 
 
 async def verify_job_ownership(
