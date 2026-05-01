@@ -79,9 +79,15 @@ class Settings(BaseSettings):
     lemonsqueezy_pro_monthly_variant_id: str = Field("", env="LEMONSQUEEZY_PRO_MONTHLY_VARIANT_ID")
     lemonsqueezy_pro_yearly_variant_id: str = Field("", env="LEMONSQUEEZY_PRO_YEARLY_VARIANT_ID")
     lemonsqueezy_business_monthly_variant_id: str = Field("", env="LEMONSQUEEZY_BUSINESS_MONTHLY_VARIANT_ID")
+    lemonsqueezy_business_yearly_variant_id: str = Field("", env="LEMONSQUEEZY_BUSINESS_YEARLY_VARIANT_ID")
+    lemonsqueezy_pro_monthly_price_cents: int = Field(500, env="LEMONSQUEEZY_PRO_MONTHLY_PRICE_CENTS")
+    lemonsqueezy_pro_yearly_price_cents: int = Field(5000, env="LEMONSQUEEZY_PRO_YEARLY_PRICE_CENTS")
+    lemonsqueezy_business_monthly_price_cents: int = Field(2500, env="LEMONSQUEEZY_BUSINESS_MONTHLY_PRICE_CENTS")
+    lemonsqueezy_business_yearly_price_cents: int = Field(25000, env="LEMONSQUEEZY_BUSINESS_YEARLY_PRICE_CENTS")
     lemonsqueezy_pro_monthly_credits: int = Field(1000, env="LEMONSQUEEZY_PRO_MONTHLY_CREDITS")
     lemonsqueezy_pro_yearly_credits: int = Field(12000, env="LEMONSQUEEZY_PRO_YEARLY_CREDITS")
     lemonsqueezy_business_monthly_credits: int = Field(5000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_CREDITS")
+    lemonsqueezy_business_yearly_credits: int = Field(60000, env="LEMONSQUEEZY_BUSINESS_YEARLY_CREDITS")
     
     # OlmOCR API Rate Limiting Configuration
     olmocr_base_delay_seconds: float = Field(2.0, env="OLMOCR_BASE_DELAY_SECONDS")
@@ -161,17 +167,34 @@ class Settings(BaseSettings):
             "pro_monthly": {
                 "variant_id": self.lemonsqueezy_pro_monthly_variant_id,
                 "plan": "pro",
+                "display_name": "Pro",
+                "interval": "month",
+                "price_cents": self.lemonsqueezy_pro_monthly_price_cents,
                 "credits": self.lemonsqueezy_pro_monthly_credits,
             },
             "pro_yearly": {
                 "variant_id": self.lemonsqueezy_pro_yearly_variant_id,
                 "plan": "pro",
+                "display_name": "Pro",
+                "interval": "year",
+                "price_cents": self.lemonsqueezy_pro_yearly_price_cents,
                 "credits": self.lemonsqueezy_pro_yearly_credits,
             },
             "business_monthly": {
                 "variant_id": self.lemonsqueezy_business_monthly_variant_id,
                 "plan": "enterprise",
+                "display_name": "Business",
+                "interval": "month",
+                "price_cents": self.lemonsqueezy_business_monthly_price_cents,
                 "credits": self.lemonsqueezy_business_monthly_credits,
+            },
+            "business_yearly": {
+                "variant_id": self.lemonsqueezy_business_yearly_variant_id,
+                "plan": "enterprise",
+                "display_name": "Business",
+                "interval": "year",
+                "price_cents": self.lemonsqueezy_business_yearly_price_cents,
+                "credits": self.lemonsqueezy_business_yearly_credits,
             },
         }
 

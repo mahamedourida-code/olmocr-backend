@@ -9,6 +9,7 @@ uvicorn[standard]
 python-dotenv
 aiofiles
 backoff
+httpx
 
 # Redis and Celery for distributed task processing
 redis

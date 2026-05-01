@@ -3,8 +3,9 @@ Supabase service for database and storage operations.
 """
 
 import logging
+import json
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from supabase import create_client, Client
@@ -221,6 +222,324 @@ class SupabaseService:
                 'available_credits': 80
             }
 
+    def get_user_plan_type(self, user_id: str) -> str:
+        """Return the user's plan from profiles, defaulting to free."""
+        try:
+            response = self.client.table("profiles")\
+                .select("plan_type")\
+                .eq("id", user_id)\
+                .limit(1)\
+                .execute()
+
+            if response.data:
+                return response.data[0].get("plan_type") or "free"
+            return "free"
+        except Exception as e:
+            logger.error(f"Failed to get plan type for user {user_id}: {e}")
+            return "free"
+
+    def refund_credits(self, user_id: str, credits_to_refund: int) -> bool:
+        """
+        Refund reserved credits by reducing used_credits.
+
+        This is used after batch completion/cancellation so users only pay for
+        successfully generated spreadsheets.
+        """
+        try:
+            credits_to_refund = int(credits_to_refund or 0)
+            if credits_to_refund <= 0:
+                return True
+
+            response = self.client.table("user_credits")\
+                .select("used_credits")\
+                .eq("user_id", user_id)\
+                .limit(1)\
+                .execute()
+
+            if not response.data:
+                logger.warning(f"[Credits] No credit record found for refund user {user_id}")
+                return False
+
+            used_credits = int(response.data[0].get("used_credits") or 0)
+            new_used_credits = max(0, used_credits - credits_to_refund)
+
+            self.client.table("user_credits")\
+                .update({
+                    "used_credits": new_used_credits,
+                    "last_updated": datetime.utcnow().isoformat()
+                })\
+                .eq("user_id", user_id)\
+                .execute()
+
+            logger.info(f"[Credits] Refunded {credits_to_refund} credits for user {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"[Credits] Failed to refund {credits_to_refund} credits for user {user_id}: {e}", exc_info=True)
+            return False
+
+    def update_user_plan_type(self, user_id: str, plan_type: str) -> bool:
+        """Update the user's application plan in profiles."""
+        try:
+            self.client.table("profiles")\
+                .update({
+                    "plan_type": plan_type,
+                    "updated_at": datetime.utcnow().isoformat()
+                })\
+                .eq("id", user_id)\
+                .execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update plan for user {user_id}: {e}", exc_info=True)
+            return False
+
+    def upsert_billing_customer(
+        self,
+        user_id: str,
+        provider_customer_id: str,
+        email: Optional[str] = None,
+        name: Optional[str] = None,
+        portal_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        provider: str = "lemonsqueezy"
+    ) -> Dict[str, Any]:
+        """Create or update a provider customer mapping."""
+        data = {
+            "user_id": user_id,
+            "provider": provider,
+            "provider_customer_id": str(provider_customer_id),
+            "email": email,
+            "name": name,
+            "portal_url": portal_url,
+            "metadata": metadata or {},
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+        existing = self.client.table("billing_customers")\
+            .select("*")\
+            .eq("provider", provider)\
+            .eq("provider_customer_id", str(provider_customer_id))\
+            .limit(1)\
+            .execute()
+        if not existing.data:
+            existing = self.client.table("billing_customers")\
+                .select("*")\
+                .eq("provider", provider)\
+                .eq("user_id", user_id)\
+                .limit(1)\
+                .execute()
+
+        if existing.data:
+            response = self.client.table("billing_customers")\
+                .update(data)\
+                .eq("id", existing.data[0]["id"])\
+                .execute()
+        else:
+            response = self.client.table("billing_customers").insert(data).execute()
+
+        return response.data[0] if response.data else {}
+
+    def upsert_subscription(
+        self,
+        user_id: str,
+        provider_subscription_id: str,
+        provider_customer_id: Optional[str],
+        provider_variant_id: Optional[str],
+        plan: str,
+        status: str,
+        renews_at: Optional[str] = None,
+        ends_at: Optional[str] = None,
+        cancelled: bool = False,
+        customer_portal_url: Optional[str] = None,
+        update_payment_method_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        provider: str = "lemonsqueezy"
+    ) -> Dict[str, Any]:
+        """Create or update subscription state from a provider webhook."""
+        data = {
+            "user_id": user_id,
+            "provider": provider,
+            "provider_subscription_id": str(provider_subscription_id),
+            "provider_customer_id": str(provider_customer_id) if provider_customer_id else None,
+            "provider_variant_id": str(provider_variant_id) if provider_variant_id else None,
+            "plan": plan,
+            "status": status,
+            "renews_at": renews_at,
+            "ends_at": ends_at,
+            "cancelled": cancelled,
+            "customer_portal_url": customer_portal_url,
+            "update_payment_method_url": update_payment_method_url,
+            "metadata": metadata or {},
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+        existing = self.client.table("subscriptions")\
+            .select("*")\
+            .eq("provider", provider)\
+            .eq("provider_subscription_id", str(provider_subscription_id))\
+            .limit(1)\
+            .execute()
+
+        if existing.data:
+            response = self.client.table("subscriptions")\
+                .update(data)\
+                .eq("id", existing.data[0]["id"])\
+                .execute()
+        else:
+            response = self.client.table("subscriptions").insert(data).execute()
+
+        return response.data[0] if response.data else {}
+
+    def find_user_for_provider_customer(self, provider_customer_id: str, provider: str = "lemonsqueezy") -> Optional[str]:
+        response = self.client.table("billing_customers")\
+            .select("user_id")\
+            .eq("provider", provider)\
+            .eq("provider_customer_id", str(provider_customer_id))\
+            .limit(1)\
+            .execute()
+        return response.data[0]["user_id"] if response.data else None
+
+    def find_user_for_provider_subscription(self, provider_subscription_id: str, provider: str = "lemonsqueezy") -> Optional[str]:
+        response = self.client.table("subscriptions")\
+            .select("user_id")\
+            .eq("provider", provider)\
+            .eq("provider_subscription_id", str(provider_subscription_id))\
+            .limit(1)\
+            .execute()
+        return response.data[0]["user_id"] if response.data else None
+
+    def get_latest_subscription_for_user(self, user_id: str, provider: str = "lemonsqueezy") -> Optional[Dict[str, Any]]:
+        response = self.client.table("subscriptions")\
+            .select("*")\
+            .eq("provider", provider)\
+            .eq("user_id", user_id)\
+            .order("updated_at.desc")\
+            .limit(1)\
+            .execute()
+        return response.data[0] if response.data else None
+
+    def get_subscription_by_provider_id(self, provider_subscription_id: str, provider: str = "lemonsqueezy") -> Optional[Dict[str, Any]]:
+        response = self.client.table("subscriptions")\
+            .select("*")\
+            .eq("provider", provider)\
+            .eq("provider_subscription_id", str(provider_subscription_id))\
+            .limit(1)\
+            .execute()
+        return response.data[0] if response.data else None
+
+    def get_billing_customer_for_user(self, user_id: str, provider: str = "lemonsqueezy") -> Optional[Dict[str, Any]]:
+        response = self.client.table("billing_customers")\
+            .select("*")\
+            .eq("provider", provider)\
+            .eq("user_id", user_id)\
+            .limit(1)\
+            .execute()
+        return response.data[0] if response.data else None
+
+    def record_webhook_event(
+        self,
+        event_hash: str,
+        event_name: str,
+        payload: Dict[str, Any],
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        provider: str = "lemonsqueezy"
+    ) -> Optional[Dict[str, Any]]:
+        """Insert a webhook event. Returns None if it was already seen."""
+        existing = self.client.table("webhook_events")\
+            .select("*")\
+            .eq("provider", provider)\
+            .eq("event_hash", event_hash)\
+            .limit(1)\
+            .execute()
+        if existing.data:
+            return None if existing.data[0].get("processed") else existing.data[0]
+
+        response = self.client.table("webhook_events").insert({
+            "provider": provider,
+            "event_hash": event_hash,
+            "event_name": event_name,
+            "resource_type": resource_type,
+            "resource_id": str(resource_id) if resource_id else None,
+            "payload": payload,
+        }).execute()
+        return response.data[0] if response.data else {}
+
+    def mark_webhook_event_processed(
+        self,
+        event_hash: str,
+        processed: bool,
+        processing_error: Optional[str] = None,
+        provider: str = "lemonsqueezy"
+    ) -> None:
+        self.client.table("webhook_events")\
+            .update({
+                "processed": processed,
+                "processing_error": processing_error,
+                "processed_at": datetime.utcnow().isoformat() if processed else None,
+            })\
+            .eq("provider", provider)\
+            .eq("event_hash", event_hash)\
+            .execute()
+
+    def grant_plan_credits(
+        self,
+        user_id: str,
+        credits: int,
+        movement_type: str,
+        provider_subscription_id: Optional[str] = None,
+        provider_order_id: Optional[str] = None,
+        provider_event_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        provider: str = "lemonsqueezy"
+    ) -> Dict[str, int]:
+        """Reset the user's monthly credit allocation and record a ledger entry."""
+        credits = max(0, int(credits or 0))
+
+        existing = self.client.table("user_credits")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .limit(1)\
+            .execute()
+
+        credit_data = {
+            "user_id": user_id,
+            "total_credits": credits,
+            "used_credits": 0,
+            "reset_date": date.today().isoformat(),
+            "last_updated": datetime.utcnow().isoformat(),
+        }
+        if existing.data:
+            self.client.table("user_credits").update(credit_data).eq("user_id", user_id).execute()
+        else:
+            self.client.table("user_credits").insert(credit_data).execute()
+
+        self.client.table("credit_ledger").insert({
+            "user_id": user_id,
+            "provider": provider,
+            "provider_event_id": provider_event_id,
+            "provider_subscription_id": provider_subscription_id,
+            "provider_order_id": provider_order_id,
+            "movement_type": movement_type,
+            "credits_delta": credits,
+            "balance_after": credits,
+            "metadata": metadata or {},
+        }).execute()
+
+        return {
+            "total_credits": credits,
+            "used_credits": 0,
+            "available_credits": credits,
+        }
+
+    def get_billing_status(self, user_id: str) -> Dict[str, Any]:
+        """Return current app billing state for dashboard/API consumers."""
+        return {
+            "plan": self.get_user_plan_type(user_id),
+            "credits": self.get_user_credits(user_id),
+            "subscription": self.get_latest_subscription_for_user(user_id),
+            "customer": self.get_billing_customer_for_user(user_id),
+        }
+
     async def update_job_status(
         self,
         job_id: str,
@@ -254,9 +573,23 @@ class SupabaseService:
             if error_message:
                 update_data["error_message"] = error_message
 
-            if metadata:
-                # Merge with existing metadata
-                update_data["processing_metadata"] = metadata
+            if metadata is not None:
+                existing_metadata = {}
+                try:
+                    existing_job = await self.get_job(job_id)
+                    raw_metadata = existing_job.get("processing_metadata") if existing_job else {}
+                    if isinstance(raw_metadata, dict):
+                        existing_metadata = raw_metadata
+                    elif isinstance(raw_metadata, str) and raw_metadata:
+                        parsed_metadata = json.loads(raw_metadata)
+                        existing_metadata = parsed_metadata if isinstance(parsed_metadata, dict) else {}
+                except Exception as metadata_error:
+                    logger.debug(f"Could not load existing metadata for {job_id}: {metadata_error}")
+
+                update_data["processing_metadata"] = {
+                    **existing_metadata,
+                    **metadata
+                }
 
             response = self.client.table("processing_jobs").update(update_data).eq("id", job_id).execute()
             logger.info(f"Updated job {job_id} status to {status}")
@@ -265,6 +598,161 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Failed to update job status in Supabase: {e}")
             raise
+
+    def _job_file_record_to_metadata(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a job_files row to the metadata shape used by API responses."""
+        owner_user_id = record.get("owner_user_id")
+        owner_session_id = record.get("owner_session_id")
+        metadata = record.get("metadata") or {}
+
+        return {
+            "file_id": record.get("file_id"),
+            "job_id": record.get("job_id"),
+            "image_id": record.get("image_id"),
+            "storage_path": record.get("storage_path"),
+            "filename": record.get("filename"),
+            "original_filename": record.get("original_filename"),
+            "content_type": record.get("content_type") or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "size_bytes": record.get("size_bytes"),
+            "status": record.get("status", "completed"),
+            "user_id": str(owner_user_id) if owner_user_id else "",
+            "session_id": owner_session_id or "",
+            "owner_user_id": str(owner_user_id) if owner_user_id else None,
+            "owner_session_id": owner_session_id,
+            "created_at": record.get("created_at"),
+            "updated_at": record.get("updated_at"),
+            "completed_at": metadata.get("completed_at") or record.get("created_at"),
+            "expires_at": record.get("expires_at"),
+            "metadata": metadata,
+        }
+
+    async def upsert_job_file(self, file_metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Store durable generated-file ownership metadata.
+
+        Redis may cache this data, but this table is the authorization source
+        for downloads, share sessions, and job recovery after worker/web restarts.
+        """
+        try:
+            file_id = file_metadata.get("file_id")
+            job_id = file_metadata.get("job_id")
+            storage_path = file_metadata.get("storage_path")
+            filename = file_metadata.get("filename") or f"{file_id}.xlsx"
+
+            if not file_id or not job_id or not storage_path:
+                raise ValueError("file_id, job_id, and storage_path are required")
+
+            owner_user_id = (
+                file_metadata.get("owner_user_id")
+                or file_metadata.get("user_id")
+                or None
+            )
+            owner_session_id = (
+                file_metadata.get("owner_session_id")
+                or file_metadata.get("session_id")
+                or None
+            )
+
+            if owner_user_id in ("", "None", "null"):
+                owner_user_id = None
+            if owner_session_id in ("", "None", "null"):
+                owner_session_id = None
+
+            if not owner_user_id and not owner_session_id:
+                raise ValueError("generated file metadata must include a user or session owner")
+
+            data = {
+                "file_id": file_id,
+                "job_id": job_id,
+                "image_id": file_metadata.get("image_id"),
+                "owner_user_id": owner_user_id,
+                "owner_session_id": owner_session_id,
+                "storage_path": storage_path,
+                "filename": filename,
+                "original_filename": file_metadata.get("original_filename"),
+                "content_type": file_metadata.get("content_type") or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "size_bytes": file_metadata.get("size_bytes"),
+                "status": file_metadata.get("status") or "completed",
+                "metadata": file_metadata.get("metadata") or {
+                    "completed_at": file_metadata.get("completed_at"),
+                    "supabase_url": file_metadata.get("supabase_url"),
+                },
+                "expires_at": file_metadata.get("expires_at"),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+
+            existing = await self.get_job_file(file_id)
+            if existing:
+                response = self.client.table("job_files").update(data).eq("file_id", file_id).execute()
+            else:
+                response = self.client.table("job_files").insert(data).execute()
+
+            if not response.data:
+                raise Exception("Supabase returned no job_files row")
+
+            logger.info(f"Stored durable file metadata for {file_id}")
+            return self._job_file_record_to_metadata(response.data[0])
+        except Exception as e:
+            logger.error(f"Failed to upsert job file metadata: {e}")
+            raise
+
+    async def get_job_file(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Get durable generated-file metadata by file_id."""
+        try:
+            response = self.client.table("job_files").select("*").eq("file_id", file_id).execute()
+            if not response.data:
+                return None
+            return self._job_file_record_to_metadata(response.data[0])
+        except Exception as e:
+            logger.error(f"Failed to get job file {file_id}: {e}")
+            return None
+
+    async def get_job_file_by_storage_path(self, storage_path: str) -> Optional[Dict[str, Any]]:
+        """Get durable generated-file metadata by Supabase Storage path."""
+        try:
+            response = self.client.table("job_files").select("*").eq("storage_path", storage_path).execute()
+            if not response.data:
+                return None
+            return self._job_file_record_to_metadata(response.data[0])
+        except Exception as e:
+            logger.error(f"Failed to get job file by storage path {storage_path}: {e}")
+            return None
+
+    async def get_job_files_for_job(self, job_id: str) -> List[Dict[str, Any]]:
+        """Get all durable generated files for a job."""
+        try:
+            response = self.client.table("job_files")\
+                .select("*")\
+                .eq("job_id", job_id)\
+                .order("created_at")\
+                .execute()
+            return [self._job_file_record_to_metadata(record) for record in (response.data or [])]
+        except Exception as e:
+            logger.error(f"Failed to get files for job {job_id}: {e}")
+            return []
+
+    async def get_job_files_for_session(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get durable generated files owned by an anonymous session."""
+        try:
+            response = self.client.table("job_files")\
+                .select("*")\
+                .eq("owner_session_id", session_id)\
+                .order("created_at.desc")\
+                .limit(limit)\
+                .execute()
+            return [self._job_file_record_to_metadata(record) for record in (response.data or [])]
+        except Exception as e:
+            logger.error(f"Failed to get files for session {session_id}: {e}")
+            return []
+
+    async def get_job_files_by_ids(self, file_ids: List[str]) -> List[Dict[str, Any]]:
+        """Get durable generated files for a small list of file IDs."""
+        files = []
+        for file_id in file_ids:
+            file_metadata = await self.get_job_file(file_id)
+            if file_metadata:
+                files.append(file_metadata)
+        return files
 
     async def upload_job_file(
         self,
@@ -744,7 +1232,8 @@ class SupabaseService:
         file_ids: List[str],
         title: str,
         description: Optional[str] = None,
-        expires_at: Optional[datetime] = None
+        expires_at: Optional[datetime] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Create a new share session."""
         try:
@@ -754,6 +1243,7 @@ class SupabaseService:
                 'title': title,
                 'description': description,
                 'expires_at': expires_at.isoformat() if expires_at else None,
+                'metadata': metadata or {},
                 'is_active': True
             }
             

@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from datetime import datetime
 
-from app.api.v1 import jobs, download, websocket, sessions
+from app.api.v1 import jobs, download, websocket, sessions, config, billing
 
 api_router = APIRouter()
 
@@ -21,3 +21,5 @@ api_router.include_router(jobs.router)
 api_router.include_router(download.router)
 api_router.include_router(websocket.router)
 api_router.include_router(sessions.router)
+api_router.include_router(config.router)
+api_router.include_router(billing.router)
