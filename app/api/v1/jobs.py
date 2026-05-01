@@ -7,18 +7,19 @@ import logging
 import traceback
 import threading
 import base64
+import json
 from datetime import datetime, timedelta
 
 from app.models.requests import BatchConvertRequest
 from app.models.responses import BatchConvertResponse, JobStatusResponse, ErrorResponse
 from app.models.jobs import JobStatus, BatchProcessingContext, ImageProcessingResult
 from app.core.dependencies import (
-    get_or_create_session, get_storage_service,
-    verify_job_ownership, get_optional_user, get_current_user,
+    get_or_create_session,
+    get_optional_user, get_current_user,
     enforce_upload_rate_limits, verify_job_data_access
 )
 from app.core.config import settings
-from app.services.storage import FileStorageManager
+from app.core.limits import get_plan_limits, get_user_plan_type
 from app.services.redis_service import get_redis_service, RedisService
 from app.services.supabase_service import get_supabase_service
 from app.tasks.batch_tasks import process_batch_from_storage
@@ -31,21 +32,89 @@ logger = logging.getLogger(__name__)
 
 def simple_batch_validation(image_count: int) -> None:
     """Simple batch validation without dependencies."""
-    MAX_BATCH_SIZE = settings.max_batch_size
-
     if image_count == 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No images provided for batch processing"
+            detail={
+                "code": "NO_IMAGES",
+                "message": "No images provided for batch processing"
+            }
         )
 
-    if image_count > MAX_BATCH_SIZE:
+    if image_count > settings.max_batch_size:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Batch size ({image_count}) exceeds maximum allowed ({MAX_BATCH_SIZE})"
+            detail={
+                "code": "ABSOLUTE_BATCH_LIMIT_EXCEEDED",
+                "message": f"Batch size ({image_count}) exceeds maximum allowed ({settings.max_batch_size})",
+                "max_files_per_batch": settings.max_batch_size,
+                "received_files": image_count,
+            }
         )
 
 router = APIRouter(prefix="/jobs", tags=["Batch Jobs"])
+
+
+def resolve_upload_limits(user: Optional[dict], supabase_service) -> Dict[str, Any]:
+    plan_type = get_user_plan_type(user, supabase_service)
+    return get_plan_limits(plan_type)
+
+
+def enforce_batch_limit(image_count: int, limits: Dict[str, Any]) -> None:
+    max_files = int(limits["max_files_per_batch"])
+    if image_count > max_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "PLAN_BATCH_LIMIT_EXCEEDED",
+                "message": f"Your current plan allows up to {max_files} images per batch.",
+                "plan": limits["plan"],
+                "max_files_per_batch": max_files,
+                "received_files": image_count,
+            }
+        )
+
+
+def _parse_metadata(metadata: Any) -> Dict[str, Any]:
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str) and metadata:
+        try:
+            parsed = json.loads(metadata)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+ACTIVE_JOB_STATUSES = {"queued", "processing"}
+
+
+def _job_record_summary(record: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = _parse_metadata(record.get("processing_metadata"))
+    status_value = record.get("status", "unknown")
+    total_images = int(metadata.get("total_images") or 0)
+    processed_images = int(
+        metadata.get("processed_images")
+        or metadata.get("successful_images")
+        or 0
+    )
+    progress = metadata.get("progress")
+    if progress is None:
+        progress = 100 if status_value in {"completed", "partially_completed", "failed"} else 0
+
+    return {
+        "job_id": record.get("id"),
+        "status": status_value,
+        "session_id": metadata.get("owner_session_id") or metadata.get("session_id") or "",
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "total_images": total_images,
+        "processed_images": processed_images,
+        "percentage": progress,
+        "active": status_value in ACTIVE_JOB_STATUSES,
+    }
+
 
 @router.get("/credits")
 async def get_user_credits(
@@ -65,11 +134,38 @@ async def get_user_credits(
         }
 
 
+@router.get("/recover/latest", response_model=Dict[str, Any])
+async def get_latest_recoverable_job(
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+    limit: int = 10
+):
+    """
+    Return the latest active/recent job for reload recovery.
+
+    Authenticated users are recovered by user id. Anonymous users are recovered
+    by the same session id used for uploads and downloads.
+    """
+    supabase_service = get_supabase_service()
+    owner_id = user["user_id"] if user else f"session:{session.session_id}"
+    records = await supabase_service.get_user_jobs(owner_id, limit=max(1, min(limit, 25)))
+    summaries = [_job_record_summary(record) for record in records]
+    summaries = [job for job in summaries if job.get("job_id")]
+
+    active_job = next((job for job in summaries if job["status"] in ACTIVE_JOB_STATUSES), None)
+    latest_job = active_job or (summaries[0] if summaries else None)
+
+    return {
+        "job": latest_job,
+        "active": bool(latest_job and latest_job["status"] in ACTIVE_JOB_STATUSES),
+        "jobs": summaries,
+    }
+
+
 @router.post("/batch", response_model=BatchConvertResponse)
 async def create_batch_job(
     request: BatchConvertRequest,
     session: SessionMetadata = Depends(get_or_create_session),
-    storage: FileStorageManager = Depends(get_storage_service),
     redis_service: RedisService = Depends(get_redis_service),
     user: Optional[dict] = Depends(get_optional_user),
     http_request: Request = None
@@ -82,18 +178,23 @@ async def create_batch_job(
     """
     # Validate batch request
     simple_batch_validation(len(request.images))
+    supabase_service = get_supabase_service()
+    limits = resolve_upload_limits(user, supabase_service)
+    enforce_batch_limit(len(request.images), limits)
 
     await enforce_upload_rate_limits(
         request=http_request,
         redis_service=redis_service,
         user=user,
         session_id=session.session_id,
-        image_count=len(request.images)
+        image_count=len(request.images),
+        daily_image_limit_override=limits["daily_image_limit"]
     )
     
+    credits_reserved = False
+
     # Check credits if user is authenticated
     if user:
-        supabase_service = get_supabase_service()
         logger.info(f"[Credits] Checking credits for user {user['user_id']}, need {len(request.images)} credits")
         
         try:
@@ -108,9 +209,14 @@ async def create_batch_job(
                 logger.warning(f"[Credits] Insufficient credits for user {user['user_id']}")
                 raise HTTPException(
                     status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail=f"Insufficient credits. You need {len(request.images)} credits but don't have enough remaining."
+                    detail={
+                        "code": "INSUFFICIENT_CREDITS",
+                        "message": f"Insufficient credits. You need {len(request.images)} credits but don't have enough remaining.",
+                        "credits_required": len(request.images)
+                    }
                 )
             else:
+                credits_reserved = True
                 logger.info(f"[Credits] Successfully deducted {len(request.images)} credits for user {user['user_id']}")
                 
         except HTTPException:
@@ -128,7 +234,6 @@ async def create_batch_job(
     job_id = str(uuid.uuid4())
     
     try:
-        supabase_service = get_supabase_service()
         storage_owner_id = user['user_id'] if user else session.session_id
         stored_images = []
 
@@ -165,29 +270,34 @@ async def create_batch_job(
             'images': stored_images,
             'results': [],
             'errors': [],
+            'plan': limits["plan"],
+            'max_files_per_batch': limits["max_files_per_batch"],
+            'credits_reserved': len(request.images) if user else 0,
+            'credits_settled': False if user else True,
             'created_at': datetime.utcnow().isoformat(),
             'updated_at': datetime.utcnow().isoformat()
         }
 
-        # Create job in Supabase if user is authenticated
-        if user:
-            try:
-                supabase_service = get_supabase_service()
-                await supabase_service.create_job(
-                    job_id=job_id,
-                    user_id=user['user_id'],
-                    filename=f"batch_{len(request.images)}_images",
-                    metadata={
-                        'total_images': len(request.images),
-                        'consolidation_strategy': request.consolidation_strategy,
-                        'output_format': request.output_format,
-                        'session_id': session.session_id
-                    }
-                )
-                logger.info(f"Created Supabase job {job_id} for user {user['user_id']}")
-            except Exception as e:
-                logger.error(f"Failed to create Supabase job: {e}")
-                # Continue anyway - don't fail the request
+        durable_owner_id = user['user_id'] if user else f"session:{session.session_id}"
+        await supabase_service.create_job(
+            job_id=job_id,
+            user_id=durable_owner_id,
+            filename=f"batch_{len(request.images)}_images",
+            metadata={
+                'total_images': len(request.images),
+                'consolidation_strategy': request.consolidation_strategy,
+                'output_format': request.output_format,
+                'session_id': session.session_id,
+                'owner_user_id': user['user_id'] if user else None,
+                'owner_session_id': None if user else session.session_id,
+                'plan': limits["plan"],
+                'max_files_per_batch': limits["max_files_per_batch"],
+                'credits_reserved': len(request.images) if user else 0,
+                'credits_settled': False if user else True
+            },
+            status='queued'
+        )
+        logger.info(f"Created durable Supabase job {job_id} for owner {durable_owner_id}")
         
         # Store job in Redis
         create_success = await redis_service.create_job(job_id, job_data)
@@ -198,18 +308,34 @@ async def create_batch_job(
                 detail="Failed to store job in Redis"
             )
         
-        process_batch_from_storage.apply_async(
+        async_result = process_batch_from_storage.apply_async(
             args=[job_id, session.session_id, stored_images, user['user_id'] if user else None],
             queue='batch_processing',
             priority=6
         )
+        await redis_service.update_job(job_id, {'celery_task_id': async_result.id})
+        try:
+            await supabase_service.update_job_status(
+                job_id=job_id,
+                status='queued',
+                metadata={
+                    'total_images': len(request.images),
+                    'consolidation_strategy': request.consolidation_strategy,
+                    'output_format': request.output_format,
+                    'session_id': session.session_id,
+                    'owner_user_id': user['user_id'] if user else None,
+                    'owner_session_id': None if user else session.session_id,
+                    'celery_task_id': async_result.id,
+                    'plan': limits["plan"],
+                    'max_files_per_batch': limits["max_files_per_batch"],
+                    'credits_reserved': len(request.images) if user else 0,
+                    'credits_settled': False if user else True
+                }
+            )
+        except Exception as e:
+            logger.debug(f"Failed to store Celery task id for job {job_id}: {e}")
 
         logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} images")
-        
-        # Update session
-        session.jobs_count += 1
-        session.active_jobs.append(job_id)
-        await storage.update_session_metadata(session)
         
         # Calculate estimated completion (now much faster with concurrency)
         estimated_completion = datetime.utcnow() + timedelta(
@@ -230,6 +356,9 @@ async def create_batch_job(
             await redis_service.delete_job(job_id)
         except:
             pass
+
+        if user and credits_reserved:
+            supabase_service.refund_credits(user['user_id'], len(request.images))
         
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -243,7 +372,6 @@ async def create_batch_job_multipart(
     output_format: str = Form("xlsx"),
     consolidation_strategy: str = Form("consolidated"),
     session: SessionMetadata = Depends(get_or_create_session),
-    storage: FileStorageManager = Depends(get_storage_service),
     redis_service: RedisService = Depends(get_redis_service),
     user: Optional[dict] = Depends(get_optional_user),
     http_request: Request = None
@@ -268,14 +396,49 @@ async def create_batch_job_multipart(
 
     # Validate batch request
     simple_batch_validation(len(files))
+    supabase_service = get_supabase_service()
+    limits = resolve_upload_limits(user, supabase_service)
+    enforce_batch_limit(len(files), limits)
 
     await enforce_upload_rate_limits(
         request=http_request,
         redis_service=redis_service,
         user=user,
         session_id=session.session_id,
-        image_count=len(files)
+        image_count=len(files),
+        daily_image_limit_override=limits["daily_image_limit"]
     )
+
+    credits_reserved = False
+    if user:
+        logger.info(f"[Credits] Checking credits for user {user['user_id']}, need {len(files)} credits")
+        try:
+            credits_result = supabase_service.check_and_use_credits(
+                user['user_id'],
+                len(files)
+            )
+
+            if not credits_result:
+                logger.warning(f"[Credits] Insufficient credits for user {user['user_id']}")
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail={
+                        "code": "INSUFFICIENT_CREDITS",
+                        "message": f"Insufficient credits. You need {len(files)} credits but don't have enough remaining.",
+                        "credits_required": len(files)
+                    }
+                )
+
+            credits_reserved = True
+            logger.info(f"[Credits] Reserved {len(files)} credits for user {user['user_id']}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[Credits] Critical error checking credits: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Credit system error. Please try again or contact support."
+            )
 
     # Validate each file
     SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif"}
@@ -332,7 +495,6 @@ async def create_batch_job_multipart(
     logger.info(f"[BATCH-UPLOAD] Generated job ID: {job_id}")
 
     try:
-        supabase_service = get_supabase_service()
         storage_owner_id = user['user_id'] if user else session.session_id
         stored_images = []
 
@@ -373,29 +535,34 @@ async def create_batch_job_multipart(
             'images': stored_images,
             'results': [],
             'errors': [],
+            'plan': limits["plan"],
+            'max_files_per_batch': limits["max_files_per_batch"],
+            'credits_reserved': len(files) if user else 0,
+            'credits_settled': False if user else True,
             'created_at': datetime.utcnow().isoformat(),
             'updated_at': datetime.utcnow().isoformat()
         }
 
-        # Create job in Supabase if user is authenticated
-        if user:
-            try:
-                supabase_service = get_supabase_service()
-                await supabase_service.create_job(
-                    job_id=job_id,
-                    user_id=user['user_id'],
-                    filename=f"batch_{len(files)}_images",
-                    metadata={
-                        'total_images': len(files),
-                        'consolidation_strategy': consolidation_strategy,
-                        'output_format': output_format,
-                        'session_id': session.session_id
-                    }
-                )
-                logger.info(f"Created Supabase job {job_id} for user {user['user_id']}")
-            except Exception as e:
-                logger.error(f"Failed to create Supabase job: {e}")
-                # Continue anyway - don't fail the request
+        durable_owner_id = user['user_id'] if user else f"session:{session.session_id}"
+        await supabase_service.create_job(
+            job_id=job_id,
+            user_id=durable_owner_id,
+            filename=f"batch_{len(files)}_images",
+            metadata={
+                'total_images': len(files),
+                'consolidation_strategy': consolidation_strategy,
+                'output_format': output_format,
+                'session_id': session.session_id,
+                'owner_user_id': user['user_id'] if user else None,
+                'owner_session_id': None if user else session.session_id,
+                'plan': limits["plan"],
+                'max_files_per_batch': limits["max_files_per_batch"],
+                'credits_reserved': len(files) if user else 0,
+                'credits_settled': False if user else True
+            },
+            status='queued'
+        )
+        logger.info(f"Created durable Supabase job {job_id} for owner {durable_owner_id}")
 
         # Store job in Redis
         create_success = await redis_service.create_job(job_id, job_data)
@@ -406,18 +573,34 @@ async def create_batch_job_multipart(
                 detail="Failed to store job in Redis"
             )
 
-        process_batch_from_storage.apply_async(
+        async_result = process_batch_from_storage.apply_async(
             args=[job_id, session.session_id, stored_images, user['user_id'] if user else None],
             queue='batch_processing',
             priority=6
         )
+        await redis_service.update_job(job_id, {'celery_task_id': async_result.id})
+        try:
+            await supabase_service.update_job_status(
+                job_id=job_id,
+                status='queued',
+                metadata={
+                    'total_images': len(files),
+                    'consolidation_strategy': consolidation_strategy,
+                    'output_format': output_format,
+                    'session_id': session.session_id,
+                    'owner_user_id': user['user_id'] if user else None,
+                    'owner_session_id': None if user else session.session_id,
+                    'celery_task_id': async_result.id,
+                    'plan': limits["plan"],
+                    'max_files_per_batch': limits["max_files_per_batch"],
+                    'credits_reserved': len(files) if user else 0,
+                    'credits_settled': False if user else True
+                }
+            )
+        except Exception as e:
+            logger.debug(f"Failed to store Celery task id for job {job_id}: {e}")
 
         logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} images")
-
-        # Update session
-        session.jobs_count += 1
-        session.active_jobs.append(job_id)
-        await storage.update_session_metadata(session)
 
         # Calculate estimated completion (now much faster with concurrency)
         estimated_completion = datetime.utcnow() + timedelta(
@@ -446,6 +629,9 @@ async def create_batch_job_multipart(
         except Exception as cleanup_error:
             logger.warning(f"[BATCH-UPLOAD] Failed to cleanup job {job_id}: {cleanup_error}")
 
+        if user and credits_reserved:
+            supabase_service.refund_credits(user['user_id'], len(files))
+
         # Return detailed error information
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -457,7 +643,6 @@ async def create_batch_job_multipart(
 async def get_job_status(
     job_id: str,
     session: SessionMetadata = Depends(get_or_create_session),
-    storage: FileStorageManager = Depends(get_storage_service),
     redis_service: RedisService = Depends(get_redis_service),
     user: Optional[dict] = Depends(get_optional_user)
 ):
@@ -479,37 +664,66 @@ async def get_job_status(
             detail="Job ID cannot be empty"
         )
     
-    # Get job data from Redis first
+    # Get job data from Redis first. Redis is the fast cache, not the
+    # authorization source; if Redis misses, rebuild from Supabase metadata.
     job_data = await redis_service.get_job(job_id)
     
     if not job_data:
-        # Check if this is a job_id from single image conversion
-        # For single image conversions, we create a synthetic job status response
-        try:
-            # Check if the ID corresponds to a file in the user's session
-            if job_id in session.result_files:
-                # Create synthetic completed job data for single image conversion
-                job_data = {
-                    'status': 'completed',
-                    'total_images': 1,
-                    'processed_images': 1,
-                    'progress': 100,
-                    'download_url': f"/api/v1/download/{job_id}",
-                    'results': [{'job_id': job_id}],  # Updated to use job_id for consistency
-                    'errors': [],
-                    'session_id': session.session_id,
-                    'created_at': datetime.utcnow().isoformat(),
-                    'updated_at': datetime.utcnow().isoformat()
-                }
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Job '{job_id}' not found. Make sure you're using the same session (cookies/headers) as when you created the job."
-                )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error checking job status: {e}")
+        supabase_service = get_supabase_service()
+        durable_files = await supabase_service.get_job_files_for_job(job_id)
+        supabase_job = await supabase_service.get_job(job_id)
+
+        if supabase_job:
+            metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+            stored_user_id = str(supabase_job.get("user_id") or "")
+            owner_user_id = metadata.get("owner_user_id") or (stored_user_id if not stored_user_id.startswith("session:") else "")
+            owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
+            generated_files = durable_files or metadata.get("generated_files", [])
+            total_images = metadata.get("total_images") or max(len(generated_files), 1)
+            successful_images = metadata.get("successful_images") or len(generated_files)
+            failed_images = metadata.get("failed_images") or 0
+            processed_images = metadata.get("processed_images") or successful_images + failed_images
+            progress = metadata.get("progress")
+            if progress is None:
+                progress = 100 if supabase_job.get("status") in ("completed", "failed") else 0
+
+            job_data = {
+                "job_id": job_id,
+                "user_id": owner_user_id or "",
+                "session_id": owner_session_id or "",
+                "status": supabase_job.get("status", "unknown"),
+                "total_images": total_images,
+                "processed_images": processed_images,
+                "failed_images": failed_images,
+                "progress": progress,
+                "generated_files": generated_files,
+                "download_urls": [f"/api/v1/download/{file_info['file_id']}" for file_info in generated_files if file_info.get("file_id")],
+                "image_results": metadata.get("image_results", {}),
+                "processing_time": metadata.get("processing_time") or metadata.get("processing_time_seconds", 0),
+                "created_at": supabase_job.get("created_at") or datetime.utcnow().isoformat(),
+                "updated_at": supabase_job.get("updated_at") or datetime.utcnow().isoformat(),
+                "completed_at": metadata.get("completed_at")
+            }
+            verify_job_data_access(job_data, user, session.session_id)
+        elif durable_files:
+            first_file = durable_files[0]
+            job_data = {
+                "job_id": job_id,
+                "user_id": first_file.get("user_id", ""),
+                "session_id": first_file.get("session_id", ""),
+                "status": "completed",
+                "total_images": len(durable_files),
+                "processed_images": len(durable_files),
+                "progress": 100,
+                "generated_files": durable_files,
+                "download_urls": [f"/api/v1/download/{file_info['file_id']}" for file_info in durable_files if file_info.get("file_id")],
+                "errors": [],
+                "created_at": first_file.get("created_at") or datetime.utcnow().isoformat(),
+                "updated_at": first_file.get("updated_at") or datetime.utcnow().isoformat(),
+                "completed_at": first_file.get("completed_at") or first_file.get("created_at")
+            }
+            verify_job_data_access(job_data, user, session.session_id)
+        else:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Job not found"
@@ -541,7 +755,7 @@ async def get_job_status(
             expires_at = None
             if job_data.get('completed_at'):
                 try:
-                    completed_time = datetime.fromisoformat(job_data['completed_at'])
+                    completed_time = datetime.fromisoformat(str(job_data['completed_at']).replace('Z', '+00:00'))
                     expires_at = completed_time + timedelta(hours=24)
                 except ValueError:
                     # If datetime parsing fails, set expires_at to 24 hours from now
@@ -553,13 +767,24 @@ async def get_job_status(
             files = []
             if job_data.get('generated_files'):
                 for file_info in job_data['generated_files']:
+                    created_at_value = (
+                        file_info.get('completed_at')
+                        or file_info.get('created_at')
+                        or job_data.get('completed_at')
+                        or datetime.utcnow().isoformat()
+                    )
+                    try:
+                        file_created_at = datetime.fromisoformat(str(created_at_value).replace('Z', '+00:00'))
+                    except ValueError:
+                        file_created_at = datetime.utcnow()
+
                     files.append(ProcessedFile(
                         file_id=file_info['file_id'],
                         download_url=f"/api/v1/download/{file_info['file_id']}",
                         filename=file_info['filename'],
                         original_image=file_info.get('original_filename', file_info.get('image_id', 'unknown')),
                         size_bytes=file_info.get('size_bytes'),
-                        created_at=datetime.fromisoformat(job_data.get('completed_at', datetime.utcnow().isoformat()))
+                        created_at=file_created_at
                     ))
             
             # Get processing statistics
@@ -576,7 +801,7 @@ async def get_job_status(
             completed_at = datetime.utcnow()
             if job_data.get('completed_at'):
                 try:
-                    completed_at = datetime.fromisoformat(job_data['completed_at'])
+                    completed_at = datetime.fromisoformat(str(job_data['completed_at']).replace('Z', '+00:00'))
                 except ValueError:
                     pass
             
@@ -664,26 +889,54 @@ async def get_job_status(
 async def cancel_job(
     job_id: str,
     session: SessionMetadata = Depends(get_or_create_session),
-    storage: FileStorageManager = Depends(get_storage_service),
-    redis_service: RedisService = Depends(get_redis_service)
+    redis_service: RedisService = Depends(get_redis_service),
+    user: Optional[dict] = Depends(get_optional_user)
 ):
     """
     Cancel a running batch job.
     
     Cancels the Celery task and marks the job as cancelled.
     """
-    # Verify job ownership
-    await verify_job_ownership(job_id, session, storage)
-    
     job_data = await redis_service.get_job(job_id)
     
     if not job_data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found"
-        )
+        supabase_service = get_supabase_service()
+        supabase_job = await supabase_service.get_job(job_id)
+        durable_files = await supabase_service.get_job_files_for_job(job_id)
+
+        if supabase_job:
+            metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+            stored_user_id = str(supabase_job.get("user_id") or "")
+            owner_user_id = metadata.get("owner_user_id") or (stored_user_id if not stored_user_id.startswith("session:") else "")
+            owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
+            job_data = {
+                "job_id": job_id,
+                "user_id": owner_user_id or "",
+                "session_id": owner_session_id or "",
+                "status": supabase_job.get("status", "unknown"),
+                "celery_task_id": metadata.get("celery_task_id"),
+                "created_at": supabase_job.get("created_at") or datetime.utcnow().isoformat(),
+                "updated_at": supabase_job.get("updated_at") or datetime.utcnow().isoformat(),
+            }
+        elif durable_files:
+            first_file = durable_files[0]
+            job_data = {
+                "job_id": job_id,
+                "user_id": first_file.get("user_id", ""),
+                "session_id": first_file.get("session_id", ""),
+                "status": "completed",
+                "created_at": first_file.get("created_at") or datetime.utcnow().isoformat(),
+                "updated_at": first_file.get("updated_at") or datetime.utcnow().isoformat(),
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+
+    verify_job_data_access(job_data, user, session.session_id)
     
-    if job_data.get('status') in ["completed", "failed"]:
+    if job_data.get('status') in ["completed", "partially_completed", "failed"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot cancel completed or failed job"
@@ -700,11 +953,36 @@ async def cancel_job(
         'error': 'Job cancelled by user',
         'updated_at': datetime.utcnow().isoformat()
     })
-    
-    # Update session
-    if job_id in session.active_jobs:
-        session.active_jobs.remove(job_id)
-        await storage.update_session_metadata(session)
+
+    if user:
+        try:
+            supabase_service = get_supabase_service()
+            supabase_job = await supabase_service.get_job(job_id) or {}
+            metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+            credit_metadata = {}
+            if not metadata.get("credits_settled"):
+                reserved_credits = int(metadata.get("credits_reserved") or job_data.get("total_images") or 0)
+                completed_files = await supabase_service.get_job_files_for_job(job_id)
+                charged_credits = min(len(completed_files), reserved_credits)
+                refund_credits = max(0, reserved_credits - charged_credits)
+                if refund_credits:
+                    supabase_service.refund_credits(user["user_id"], refund_credits)
+                credit_metadata = {
+                    "credits_reserved": reserved_credits,
+                    "credits_charged": charged_credits,
+                    "credits_refunded": refund_credits,
+                    "credits_settled": True
+                }
+            metadata["cancelled_at"] = datetime.utcnow().isoformat()
+            metadata["cancelled_by"] = user["user_id"]
+            await supabase_service.update_job_status(
+                job_id=job_id,
+                status="failed",
+                error_message="Job cancelled by user",
+                metadata={**metadata, **credit_metadata}
+            )
+        except Exception as e:
+            logger.debug(f"Failed to update Supabase cancellation for job {job_id}: {e}")
     
     return {"message": "Job cancelled successfully"}
 
@@ -712,7 +990,7 @@ async def cancel_job(
 @router.get("/", response_model=Dict[str, Any])
 async def list_jobs(
     session: SessionMetadata = Depends(get_or_create_session),
-    storage: FileStorageManager = Depends(get_storage_service),
+    user: Optional[dict] = Depends(get_optional_user),
     limit: int = 50,
     offset: int = 0
 ):
@@ -721,23 +999,40 @@ async def list_jobs(
 
     Returns a paginated list of jobs with their current status.
     """
-    # Get all jobs for the session
-    jobs = []
+    supabase_service = get_supabase_service()
 
-    for job_id in session.active_jobs + [job_id for job_id in session.active_jobs]:
-        job_status = await storage.get_job_status(job_id)
-        if job_status:
-            jobs.append({
-                "job_id": job_status.job_id,
-                "status": job_status.status,
-                "created_at": job_status.created_at,
-                "total_images": job_status.total_images,
-                "processed_images": job_status.processed_images,
-                "percentage": job_status.percentage
+    if user:
+        records = await supabase_service.get_user_jobs(user["user_id"], limit=limit + offset)
+        jobs = []
+        for record in records:
+            jobs.append(_job_record_summary(record))
+    else:
+        records = await supabase_service.get_user_jobs(f"session:{session.session_id}", limit=limit + offset)
+        jobs = [_job_record_summary(record) for record in records]
+
+        files = await supabase_service.get_job_files_for_session(session.session_id, limit=limit + offset)
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for file_info in files:
+            job_id = file_info.get("job_id")
+            if not job_id:
+                continue
+            if any(job.get("job_id") == job_id for job in jobs):
+                continue
+            current = grouped.setdefault(job_id, {
+                "job_id": job_id,
+                "status": "completed",
+                "created_at": file_info.get("created_at"),
+                "total_images": 0,
+                "processed_images": 0,
+                "percentage": 100
             })
+            current["total_images"] += 1
+            current["processed_images"] += 1
+            if file_info.get("created_at") and (not current.get("created_at") or file_info["created_at"] < current["created_at"]):
+                current["created_at"] = file_info["created_at"]
+        jobs = jobs + list(grouped.values())
 
-    # Sort by creation time (newest first)
-    jobs.sort(key=lambda x: x["created_at"], reverse=True)
+    jobs.sort(key=lambda x: x.get("created_at") or "", reverse=True)
 
     # Apply pagination
     total = len(jobs)
@@ -862,50 +1157,62 @@ async def get_saved_history(
 async def save_job_to_history(
     job_id: str,
     user: dict = Depends(get_current_user),
+    session: SessionMetadata = Depends(get_or_create_session),
     redis_service: RedisService = Depends(get_redis_service),
-    storage: FileStorageManager = Depends(get_storage_service),
 ):
     """
     Save a completed job to the user's permanent history.
     
     This endpoint allows users to explicitly save their job results to their history.
     Only completed jobs can be saved, and only by the job owner.
-    Files are uploaded to Supabase Storage for permanent storage.
+    Files are saved from existing durable Supabase Storage metadata.
     """
     try:
-        # Get job from Redis
+        supabase_service = get_supabase_service()
+
+        # Get job from Redis first, then rebuild from Supabase if Redis expired.
         job_data = await redis_service.get_job(job_id)
         if not job_data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Job not found"
-            )
+            supabase_job = await supabase_service.get_job(job_id)
+            if not supabase_job:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Job not found"
+                )
+            metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+            stored_user_id = str(supabase_job.get("user_id") or "")
+            owner_user_id = metadata.get("owner_user_id") or (stored_user_id if not stored_user_id.startswith("session:") else "")
+            owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
+            job_data = {
+                "job_id": job_id,
+                "user_id": owner_user_id or "",
+                "session_id": owner_session_id or "",
+                "status": supabase_job.get("status", "unknown"),
+                "generated_files": metadata.get("generated_files", []),
+                "consolidation_strategy": metadata.get("consolidation_strategy", "separate"),
+                "output_format": metadata.get("output_format", "xlsx"),
+                "updated_at": supabase_job.get("updated_at"),
+                "processing_time_seconds": metadata.get("processing_time") or metadata.get("processing_time_seconds"),
+            }
 
-        # Verify job ownership (either by user_id or session if not authenticated)
-        if job_data.get('user_id') and job_data.get('user_id') != user['user_id']:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied - job belongs to another user"
-            )
+        verify_job_data_access(job_data, user, session.session_id)
 
         # Check if job is completed
-        if job_data.get('status') != 'completed':
+        if job_data.get('status') not in ['completed', 'partially_completed']:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Only completed jobs can be saved to history"
             )
 
-        # Check if job has results
-        results = job_data.get('generated_files', [])
+        results = await supabase_service.get_job_files_for_job(job_id)
+        if not results:
+            results = job_data.get('generated_files', [])
         if not results:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Job has no results to save"
             )
 
-        # Save to Supabase if not already saved
-        supabase_service = get_supabase_service()
-        
         # Check if already exists in user's saved history (in job_history table)
         # Check for the parent job ID in metadata to avoid duplicates
         existing_history = await supabase_service.get_user_saved_history(user['user_id'], limit=1000)
@@ -922,59 +1229,47 @@ async def save_job_to_history(
                 "job_id": job_id
             }
 
-        # Upload each generated Excel file to Supabase Storage
+        # Use existing durable Supabase Storage files; do not depend on Fly local disk.
         storage_urls = []
-        logger.info(f"Starting file upload process for job {job_id}. Found {len(results)} files to upload")
+        logger.info(f"Preparing durable history records for job {job_id}. Found {len(results)} files")
         
         for file_info in results:
             file_id = file_info.get('file_id')
             if not file_id:
                 logger.warning(f"File info missing file_id: {file_info}")
                 continue
-            
-            # Get the file from local storage
-            file_path = storage.get_download_file_path(file_id)
-            if not file_path.exists():
-                logger.warning(f"File {file_id} not found on disk at {file_path}, skipping upload")
+
+            storage_path = file_info.get('storage_path')
+            if not storage_path:
+                logger.warning(f"File {file_id} missing storage_path, skipping history save")
                 continue
-            
-            # Log file size and location
-            file_size = file_path.stat().st_size
-            logger.info(f"Reading file {file_id} from {file_path} (size: {file_size} bytes)")
-            
-            # Read file content
-            with open(file_path, 'rb') as f:
-                file_data = f.read()
-            
-            # Upload to Supabase Storage using simplified method
+
             filename = file_info.get('filename', f'{file_id}.xlsx')
-            logger.info(f"Attempting to upload file {file_id} as {filename} to Supabase Storage")
-            
+
             try:
-                # Use the new simplified upload method
-                upload_result = await supabase_service.upload_job_file(
-                    file_data=file_data,
-                    user_id=user['user_id'],
-                    job_id=job_id,
-                    filename=filename
+                signed_url = await supabase_service.create_signed_url(
+                    storage_path,
+                    expires_in=7 * 24 * 3600
                 )
-                
-                # Log successful upload response
-                logger.info(f"Upload succeeded! Response: {upload_result}")
-                
-                # Store the upload result
                 storage_urls.append({
                     'file_id': file_id,
-                    'filename': upload_result['filename'],
-                    'storage_path': upload_result['storage_path'],
-                    'url': upload_result['access_url'],  # The signed URL
-                    'url_type': 'signed_url',  # Always signed for private bucket
-                    'size_mb': upload_result['size_mb']
+                    'filename': filename,
+                    'storage_path': storage_path,
+                    'url': signed_url,
+                    'url_type': 'signed_url',
+                    'size_mb': (file_info.get('size_bytes') or 0) / (1024 * 1024),
+                    'size_bytes': file_info.get('size_bytes'),
+                    'download_url': f"/api/v1/download/{file_id}"
                 })
-                logger.info(f"Successfully uploaded file {file_id} to Supabase Storage at path: {upload_result['storage_path']} ({upload_result['size_mb']:.2f}MB)")
-            except Exception as upload_error:
-                logger.error(f"Failed to upload file {file_id} to storage: {upload_error}")
+            except Exception as url_error:
+                logger.error(f"Failed to create signed URL for file {file_id}: {url_error}")
                 # Continue with other files even if one fails
+
+        if not storage_urls:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No durable result files were available to save"
+            )
 
         # Save EACH FILE as a separate entry in job_history table
         saved_count = 0
