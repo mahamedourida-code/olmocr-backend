@@ -14,14 +14,15 @@ except ImportError:
     # pillow-heif not installed, HEIC support will be limited
     pass
 
-SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp", "heic", "heif"}
+SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp", "heic", "heif", "pdf"}
 SUPPORTED_MIME_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpg", 
     "image/jpg": "jpg",
     "image/webp": "webp",
     "image/heic": "heic",
-    "image/heif": "heif"
+    "image/heif": "heif",
+    "application/pdf": "pdf"
 }
 
 
@@ -52,6 +53,9 @@ def validate_base64_image(base64_data: str, filename: Optional[str] = None) -> T
             f"File size ({len(image_bytes)} bytes) exceeds maximum allowed "
             f"size ({settings.max_file_size_bytes} bytes)"
         )
+
+    if image_bytes.startswith(b"%PDF"):
+        return image_bytes, "pdf"
     
     # Detect image format
     image_format = imghdr.what(None, h=image_bytes)

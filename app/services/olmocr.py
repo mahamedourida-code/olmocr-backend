@@ -43,6 +43,48 @@ class OlmOCRService:
         self.max_tokens = 2000
         self._last_request_time = 0.0
         self._request_count = 0
+
+    def _is_pdf_bytes(self, file_data: bytes) -> bool:
+        return file_data[:5] == b"%PDF-"
+
+    def _render_pdf_pages_to_png(self, pdf_data: bytes) -> List[bytes]:
+        try:
+            import pymupdf
+        except ImportError as exc:
+            raise OlmOCRError("PDF support is not installed on this worker") from exc
+
+        page_images: List[bytes] = []
+        try:
+            with pymupdf.open(stream=pdf_data, filetype="pdf") as document:
+                if document.page_count == 0:
+                    raise OlmOCRError("PDF has no pages to process")
+
+                for page_number in range(document.page_count):
+                    page = document.load_page(page_number)
+                    pixmap = page.get_pixmap(dpi=180, alpha=False)
+                    page_images.append(pixmap.tobytes(output="png"))
+
+            logger.info(f"Rendered PDF into {len(page_images)} page image(s)")
+            return page_images
+        except OlmOCRError:
+            raise
+        except Exception as exc:
+            raise OlmOCRError(f"Failed to render PDF for OCR: {exc}") from exc
+
+    async def _extract_table_from_pdf(self, pdf_data: bytes) -> str:
+        page_images = self._render_pdf_pages_to_png(pdf_data)
+        page_outputs: List[str] = []
+
+        for index, page_image in enumerate(page_images):
+            logger.info(f"Processing PDF page {index + 1}/{len(page_images)}")
+            page_csv = await self.extract_table_from_image(page_image)
+            if page_csv and page_csv.strip():
+                page_outputs.append(page_csv.strip())
+
+        if not page_outputs:
+            raise OlmOCRError("No table data extracted from PDF")
+
+        return "\n".join(page_outputs)
     
     async def _apply_rate_limiting(self):
         """
@@ -96,9 +138,6 @@ class OlmOCRService:
             OlmOCRError: If API call fails or returns invalid response
         """
         try:
-            # Apply rate limiting before making the API call
-            await self._apply_rate_limiting()
-
             # Handle both bytes and base64 string input
             if isinstance(image_data, bytes):
                 image_bytes = image_data
@@ -109,6 +148,12 @@ class OlmOCRService:
                 else:
                     img_b64_str = image_data
                 image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                return await self._extract_table_from_pdf(image_bytes)
+
+            # Apply rate limiting before making the image OCR API call
+            await self._apply_rate_limiting()
             
             # Check if this is a HEIC/HEIF image and convert to JPEG if needed
             try:
@@ -214,6 +259,7 @@ class OlmOCRService:
             logger.error(f"OlmOCR API error: {str(e)}")
             raise OlmOCRError(f"Failed to process image: {str(e)}")
     
+
     async def _make_api_call(self, messages: List[Dict[str, Any]]) -> ChatCompletion:
         """
         Make the actual API call to OlmOCR.

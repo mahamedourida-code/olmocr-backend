@@ -368,7 +368,7 @@ async def create_batch_job(
 
 @router.post("/batch-upload", response_model=BatchConvertResponse)
 async def create_batch_job_multipart(
-    files: List[UploadFile] = File(..., description="Image files to process (PNG, JPEG, WebP)"),
+    files: List[UploadFile] = File(..., description="Image or PDF files to process (PNG, JPEG, WebP, HEIC, PDF)"),
     output_format: str = Form("xlsx"),
     consolidation_strategy: str = Form("consolidated"),
     session: SessionMetadata = Depends(get_or_create_session),
@@ -379,7 +379,7 @@ async def create_batch_job_multipart(
     """
     Create a new batch processing job using multipart/form-data file uploads.
 
-    This endpoint accepts multiple binary image files directly (no base64 encoding needed),
+    This endpoint accepts multiple binary image or PDF files directly (no base64 encoding needed),
     making uploads faster and more memory-efficient than the base64 endpoint.
 
     This is the recommended endpoint for file uploads.
@@ -441,20 +441,20 @@ async def create_batch_job_multipart(
             )
 
     # Validate each file
-    SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif"}
+    SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif", "application/pdf"}
     MAX_FILE_SIZE = settings.max_file_size_bytes
 
     for i, file in enumerate(files):
         logger.info(f"[BATCH-UPLOAD] Validating file {i+1}: {file.filename}")
 
         # Check content type or file extension
-        # HEIC files might not have proper MIME type, so check extension too
+        # HEIC and PDF files might not have proper MIME type, so check extension too
         file_ext = file.filename.lower().split('.')[-1] if file.filename else ""
-        is_heic_by_extension = file_ext in ['heic', 'heif']
+        is_supported_by_extension = file_ext in ['heic', 'heif', 'pdf']
         
-        # Accept if content type is valid OR if it's a HEIC/HEIF by extension
-        if file.content_type not in SUPPORTED_TYPES and not is_heic_by_extension:
-            error_msg = f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'. Supported types: PNG, JPEG, WebP, HEIC, HEIF"
+        # Accept if content type is valid OR if it's supported by extension
+        if file.content_type not in SUPPORTED_TYPES and not is_supported_by_extension:
+            error_msg = f"File {i+1} '{file.filename}': Unsupported file type '{file.content_type}'. Supported types: PNG, JPEG, WebP, HEIC, HEIF, PDF"
             logger.error(f"[BATCH-UPLOAD] Validation failed - {error_msg}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -462,8 +462,8 @@ async def create_batch_job_multipart(
             )
         
         # Log if we're accepting based on extension
-        if is_heic_by_extension and file.content_type not in SUPPORTED_TYPES:
-            logger.info(f"[BATCH-UPLOAD] File {i+1} accepted as HEIC/HEIF based on extension (content_type={file.content_type})")
+        if is_supported_by_extension and file.content_type not in SUPPORTED_TYPES:
+            logger.info(f"[BATCH-UPLOAD] File {i+1} accepted based on extension .{file_ext} (content_type={file.content_type})")
 
         # Check file size (read first to get size, then seek back)
         file_content = await file.read()
@@ -507,7 +507,11 @@ async def create_batch_job_multipart(
                 owner_id=storage_owner_id,
                 job_id=job_id,
                 filename=f"{i}_{file.filename or f'image_{i}.png'}",
-                content_type=file.content_type or "application/octet-stream"
+                content_type=(
+                    "application/pdf"
+                    if (file.filename or "").lower().endswith(".pdf")
+                    else file.content_type or "application/octet-stream"
+                )
             )
 
             stored_images.append({

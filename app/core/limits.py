@@ -41,7 +41,7 @@ def get_plan_limits(plan_type: Optional[str], settings: Settings = get_settings(
             "max_queued_jobs": settings.queue_admission_max_queued_jobs,
             "max_active_jobs": settings.queue_admission_max_active_jobs,
         },
-        "accepted_file_types": ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"],
+        "accepted_file_types": ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif", "application/pdf"],
     }
 
 

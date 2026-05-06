@@ -100,7 +100,7 @@ def validate_file_upload(
     # Check content type
     allowed_types = [
         "image/jpeg", "image/jpg", "image/png", "image/gif", 
-        "image/bmp", "image/tiff", "image/webp"
+        "image/bmp", "image/tiff", "image/webp", "application/pdf"
     ]
     
     if content_type not in allowed_types:

@@ -5,6 +5,7 @@ openpyxl
 openai
 pillow
 pillow-heif  # HEIC/HEIF image support
+pymupdf  # PDF page rendering for OCR
 uvicorn[standard]
 python-dotenv
 aiofiles
