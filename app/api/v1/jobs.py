@@ -399,6 +399,11 @@ async def create_batch_job_multipart(
     simple_batch_validation(len(files))
     supabase_service = get_supabase_service()
     limits = resolve_upload_limits(user, supabase_service)
+    normalized_output_format = (
+        "txt"
+        if str(output_format).lower() in {"txt", "text", "plain_text"}
+        else "xlsx"
+    )
 
     # Validate each file
     SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif", "application/pdf"}
@@ -481,6 +486,7 @@ async def create_batch_job_multipart(
                     "content": page_bytes,
                     "filename": f"{file_info['index']}_{base_name}_page_{page_index}.png",
                     "content_type": "image/png",
+                    "output_format": normalized_output_format,
                     "source_filename": filename,
                     "source_content_type": "application/pdf",
                     "source_page": page_index,
@@ -493,6 +499,7 @@ async def create_batch_job_multipart(
             "content": content,
             "filename": f"{file_info['index']}_{filename}",
             "content_type": file_info["content_type"],
+            "output_format": normalized_output_format,
             "source_filename": filename,
             "source_content_type": file_info["content_type"],
             "source_page": None,
@@ -567,6 +574,7 @@ async def create_batch_job_multipart(
                 'storage_path': source_file['storage_path'],
                 'filename': unit["filename"],
                 'content_type': source_file['content_type'],
+                'output_format': unit["output_format"],
                 'size_bytes': source_file['size_bytes'],
                 'original_filename': unit["source_filename"],
                 'source_content_type': unit["source_content_type"],
@@ -583,7 +591,7 @@ async def create_batch_job_multipart(
             'total_images': processing_count,
             'processed_images': 0,
             'progress': 0,
-            'output_format': output_format,
+            'output_format': normalized_output_format,
             'consolidation_strategy': consolidation_strategy,
             'images': stored_images,
             'results': [],
@@ -605,7 +613,7 @@ async def create_batch_job_multipart(
                 'total_images': processing_count,
                 'uploaded_files': len(files),
                 'consolidation_strategy': consolidation_strategy,
-                'output_format': output_format,
+                'output_format': normalized_output_format,
                 'session_id': session.session_id,
                 'owner_user_id': user['user_id'] if user else None,
                 'owner_session_id': None if user else session.session_id,
@@ -641,7 +649,7 @@ async def create_batch_job_multipart(
                     'total_images': processing_count,
                     'uploaded_files': len(files),
                     'consolidation_strategy': consolidation_strategy,
-                    'output_format': output_format,
+                    'output_format': normalized_output_format,
                     'session_id': session.session_id,
                     'owner_user_id': user['user_id'] if user else None,
                     'owner_session_id': None if user else session.session_id,

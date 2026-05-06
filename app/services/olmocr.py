@@ -85,6 +85,21 @@ class OlmOCRService:
             raise OlmOCRError("No table data extracted from PDF")
 
         return "\n".join(page_outputs)
+
+    async def _extract_text_from_pdf(self, pdf_data: bytes) -> str:
+        page_images = self._render_pdf_pages_to_png(pdf_data)
+        page_outputs: List[str] = []
+
+        for index, page_image in enumerate(page_images):
+            logger.info(f"Processing PDF page {index + 1}/{len(page_images)} as text")
+            page_text = await self.extract_text_from_image(page_image)
+            if page_text and page_text.strip():
+                page_outputs.append(page_text.strip())
+
+        if not page_outputs:
+            raise OlmOCRError("No text extracted from PDF")
+
+        return "\n\n".join(page_outputs)
     
     async def _apply_rate_limiting(self):
         """
@@ -258,6 +273,84 @@ class OlmOCRService:
         except Exception as e:
             logger.error(f"OlmOCR API error: {str(e)}")
             raise OlmOCRError(f"Failed to process image: {str(e)}")
+
+    @backoff.on_exception(
+        backoff.expo,
+        (Exception,),
+        max_tries=3,
+        max_time=30
+    )
+    async def extract_text_from_image(self, image_data: Union[bytes, str]) -> str:
+        """Extract plain text from an image or rendered PDF page."""
+        try:
+            if isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                img_b64_str = image_data.split(',', 1)[1] if image_data.startswith('data:') else image_data
+                image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                return await self._extract_text_from_pdf(image_bytes)
+
+            await self._apply_rate_limiting()
+
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    logger.info(f"Detected HEIC/HEIF image (format: {img.format}), converting to JPEG...")
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'RGBA':
+                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                        rgb_img.paste(img, mask=img.split()[3] if len(img.split()) > 3 else None)
+                        img = rgb_img
+
+                    output_buffer = io.BytesIO()
+                    img.save(output_buffer, format='JPEG', quality=95)
+                    output_buffer.seek(0)
+                    image_bytes = output_buffer.read()
+
+                img.close()
+            except Exception as e:
+                logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
+
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_b64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract all readable text from this document image. "
+                                "Return plain text only. Preserve line breaks, labels, and reading order. "
+                                "Do not summarize. Do not convert the result into CSV, JSON, or an Excel table."
+                            )
+                        }
+                    ]
+                }
+            ]
+
+            logger.info("Making OlmOCR text extraction request")
+            response: ChatCompletion = await self._make_api_call(messages)
+
+            if not response.choices or not response.choices[0].message.content:
+                raise OlmOCRError("Empty response from OlmOCR API")
+
+            raw_content = response.choices[0].message.content.strip()
+            return self._clean_ocr_response(raw_content)
+
+        except OlmOCRError:
+            raise
+        except Exception as e:
+            logger.error(f"OlmOCR text extraction error: {str(e)}")
+            raise OlmOCRError(f"Failed to extract text: {str(e)}")
     
 
     async def _make_api_call(self, messages: List[Dict[str, Any]]) -> ChatCompletion:

@@ -109,9 +109,27 @@ def process_single_image(self, image_data: str, image_id: str, job_id: str) -> D
         # Run async OCR processing - pass base64 string directly (optimization!)
         # No need to decode→encode, olmocr service handles both formats
         try:
-            ocr_result = main_loop.run_until_complete(
-                olmocr_service.extract_table_from_image(image_data)
+            holder_id = f"{job_id}:{image_id}:{self.request.id}"
+            acquired = main_loop.run_until_complete(
+                redis_service.acquire_distributed_semaphore(
+                    name="deepinfra_ocr",
+                    holder_id=holder_id,
+                    limit=settings.max_concurrent_ocr_calls,
+                    lease_seconds=300,
+                    wait_timeout_seconds=300
+                )
             )
+            if not acquired:
+                raise RuntimeError("OCR capacity is busy. Please retry shortly.")
+
+            try:
+                ocr_result = main_loop.run_until_complete(
+                    olmocr_service.extract_table_from_image(image_data)
+                )
+            finally:
+                main_loop.run_until_complete(
+                    redis_service.release_distributed_semaphore("deepinfra_ocr", holder_id)
+                )
         except Exception as ocr_error:
             logger.error(f"OlmOCR processing failed for image {image_id}: {ocr_error}")
             raise ocr_error
@@ -288,7 +306,8 @@ async def _process_batch_from_storage_async(
         images.append({
             'id': image_info.get('id', f"img_{i}"),
             'data': base64.b64encode(image_bytes).decode('utf-8'),
-            'filename': image_info.get('filename', f"image_{i}.png")
+            'filename': image_info.get('filename', f"image_{i}.png"),
+            'output_format': image_info.get('output_format', 'xlsx')
         })
 
     from app.tasks.simple_batch import process_batch_simple
@@ -575,7 +594,21 @@ async def _process_single_image_concurrent(
 
             # Extract table data using OlmOCR - pass base64 string directly (optimization!)
             # No need to decode→encode, olmocr service handles both formats
-            csv_data = await olmocr_service.extract_table_from_image(image_data)
+            holder_id = f"{job_id}:{img.get('id', img_index)}:{id(asyncio.current_task())}"
+            acquired = await redis_service.acquire_distributed_semaphore(
+                name="deepinfra_ocr",
+                holder_id=holder_id,
+                limit=settings.max_concurrent_ocr_calls,
+                lease_seconds=300,
+                wait_timeout_seconds=300
+            )
+            if not acquired:
+                raise RuntimeError("OCR capacity is busy. Please retry shortly.")
+
+            try:
+                csv_data = await olmocr_service.extract_table_from_image(image_data)
+            finally:
+                await redis_service.release_distributed_semaphore("deepinfra_ocr", holder_id)
 
             # Create Excel file
             excel_data = excel_service.csv_to_xlsx(csv_data, f"Table_{img['id']}")
@@ -708,7 +741,7 @@ async def _process_single_image_concurrent(
             }
 
 
-async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str, str]], max_concurrent: int = 5):
+async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str, str]], max_concurrent: Optional[int] = None):
     """
     Direct async implementation of batch processing with PARALLEL PROCESSING.
 
@@ -718,14 +751,15 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
     Args:
         job_id: Job identifier
         images: List of image data dictionaries
-        max_concurrent: Maximum number of concurrent image processing tasks (default: 5)
+        max_concurrent: Maximum local OCR tasks. Defaults to MAX_CONCURRENT_OCR_CALLS.
     """
     from app.services.redis_service import RedisService
     from app.services.olmocr import OlmOCRService
     from app.services.excel import ExcelService
     from app.services.storage import FileStorageManager
 
-    logger.info(f"[Concurrent] Starting parallel batch processing for job {job_id} with {len(images)} images (max {max_concurrent} concurrent)")
+    effective_max_concurrent = max(1, max_concurrent or settings.max_concurrent_ocr_calls)
+    logger.info(f"[Concurrent] Starting parallel batch processing for job {job_id} with {len(images)} images (max {effective_max_concurrent} concurrent)")
 
     # Initialize services
     redis_service = RedisService()
@@ -762,13 +796,13 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
 
     try:
         # PARALLEL PROCESSING: Create semaphore to limit concurrent API requests
-        semaphore = asyncio.Semaphore(max_concurrent)
+        semaphore = asyncio.Semaphore(effective_max_concurrent)
 
         # Track processed count with a shared list (mutable)
         processed_count = [0]
 
         # Create concurrent tasks for all images
-        logger.info(f"[Concurrent] Creating {len(images)} parallel processing tasks (max {max_concurrent} concurrent)")
+        logger.info(f"[Concurrent] Creating {len(images)} parallel processing tasks (max {effective_max_concurrent} concurrent)")
 
         tasks = [
             _process_single_image_concurrent(

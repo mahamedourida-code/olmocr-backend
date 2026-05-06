@@ -56,30 +56,88 @@ def _image_id_for(img: Dict[str, Any], img_index: int) -> str:
     return str(img.get('id') or f"img_{img_index}")
 
 
-async def _restore_image_results_from_supabase(redis, job_id: str, user_id: str = None) -> None:
-    if not user_id:
-        return
+def _parse_job_metadata(job_record: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = job_record.get('processing_metadata') if job_record else {}
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str) and metadata:
+        try:
+            parsed = json.loads(metadata)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
+
+async def _settle_reserved_credits(
+    supabase,
+    job_id: str,
+    user_id: str,
+    total_images: int,
+    successful_images: int
+) -> Dict[str, Any]:
+    if not user_id:
+        return {
+            'credits_reserved': 0,
+            'credits_charged': 0,
+            'credits_refunded': 0,
+            'credits_settled': True
+        }
+
+    job_record = await supabase.get_job(job_id)
+    metadata = _parse_job_metadata(job_record)
+    if metadata.get('credits_settled'):
+        return {
+            'credits_reserved': metadata.get('credits_reserved', total_images),
+            'credits_charged': metadata.get('credits_charged', successful_images),
+            'credits_refunded': metadata.get('credits_refunded', 0),
+            'credits_settled': True
+        }
+
+    reserved_credits = int(metadata.get('credits_reserved') or total_images)
+    charged_credits = min(successful_images, reserved_credits)
+    refund_credits = max(0, reserved_credits - charged_credits)
+
+    if refund_credits:
+        supabase.refund_credits(user_id, refund_credits)
+
+    return {
+        'credits_reserved': reserved_credits,
+        'credits_charged': charged_credits,
+        'credits_refunded': refund_credits,
+        'credits_settled': True
+    }
+
+
+async def _restore_image_results_from_supabase(
+    redis,
+    job_id: str,
+    user_id: str = None,
+    session_id: str = None
+) -> None:
     try:
         supabase = get_supabase_service()
-        job_record = await supabase.get_job(job_id)
-        metadata = job_record.get('processing_metadata') if job_record else {}
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata) if metadata else {}
+        durable_files = await supabase.get_job_files_for_job(job_id)
 
-        image_results = metadata.get('image_results') if isinstance(metadata, dict) else {}
-        if not isinstance(image_results, dict):
-            return
-
-        for image_id, result_data in image_results.items():
-            if not isinstance(result_data, dict) or result_data.get('status') != 'success':
+        for file_info in durable_files:
+            if user_id and file_info.get('user_id') and file_info.get('user_id') != user_id:
+                continue
+            if not user_id and session_id and file_info.get('session_id') != session_id:
                 continue
 
-            file_info = result_data.get('file_info') or {}
+            image_id = file_info.get('image_id')
             file_id = file_info.get('file_id')
             storage_path = file_info.get('storage_path')
-            if not file_id or not storage_path:
+            if not image_id or not file_id or not storage_path:
                 continue
+
+            result_data = {
+                'status': 'success',
+                'image_id': image_id,
+                'file_info': file_info,
+                'download_url': f"/api/v1/download/{file_id}",
+                'skipped': True
+            }
 
             await redis.set_job_image_result(job_id, image_id, result_data, settings.job_expiry_seconds)
             await redis.set_cache(
@@ -87,7 +145,7 @@ async def _restore_image_results_from_supabase(redis, job_id: str, user_id: str 
                 {
                     "storage_path": storage_path,
                     "filename": file_info.get('filename', f"{file_id}.xlsx"),
-                    "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "content_type": file_info.get("content_type") or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     "job_id": job_id,
                     "session_id": file_info.get('session_id', ''),
                     "user_id": file_info.get('user_id', user_id),
@@ -136,21 +194,50 @@ async def process_single_image_simple(
         # Remove data URL prefix if present
         if image_data.startswith('data:'):
             image_data = image_data.split(',', 1)[1]
+        output_format = str(img.get('output_format') or 'xlsx').lower()
+        wants_text_output = output_format in {'txt', 'text', 'plain_text'}
 
-        # Extract table with OlmOCR - pass base64 string directly (optimization!)
+        # Extract with OlmOCR - pass base64 string directly.
         # No need to decode→encode, olmocr service handles both formats
-        csv_data = await olmocr.extract_table_from_image(image_data)
+        holder_id = f"{job_id}:{image_id}:{uuid.uuid4().hex}"
+        acquired = await redis.acquire_distributed_semaphore(
+            name="deepinfra_ocr",
+            holder_id=holder_id,
+            limit=settings.max_concurrent_ocr_calls,
+            lease_seconds=300,
+            wait_timeout_seconds=300
+        )
+        if not acquired:
+            raise RuntimeError("OCR capacity is busy. Please retry shortly.")
 
-        # Create Excel
-        excel_data = excel.csv_to_xlsx(csv_data, f"Table_{image_id}")
+        try:
+            if wants_text_output:
+                text_data = await olmocr.extract_text_from_image(image_data)
+            else:
+                csv_data = await olmocr.extract_table_from_image(image_data)
+        finally:
+            await redis.release_distributed_semaphore("deepinfra_ocr", holder_id)
 
         # Generate filename
         original_filename = img.get('filename', f"image_{image_id}")
         base_name = original_filename.split('.')[0] if '.' in original_filename else original_filename
-        excel_filename = f"{base_name}_{_safe_filename_part(image_id)}_processed.xlsx"
+        if wants_text_output:
+            output_data = text_data.encode('utf-8')
+            output_filename = f"{base_name}_{_safe_filename_part(image_id)}_text.txt"
+            output_content_type = "text/plain; charset=utf-8"
+        else:
+            output_data = excel.csv_to_xlsx(csv_data, f"Table_{image_id}")
+            output_filename = f"{base_name}_{_safe_filename_part(image_id)}_processed.xlsx"
+            output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
         # Save file with a deterministic file_id so retries overwrite, not duplicate.
-        file_id = storage.save_result_file_sync(session_id, excel_filename, excel_data, file_id=file_id)
+        file_id = storage.save_result_file_sync(
+            session_id,
+            output_filename,
+            output_data,
+            file_id=file_id,
+            update_session_metadata=False
+        )
 
         # Upload result to durable storage so downloads work from separate workers.
         supabase_url = None
@@ -159,25 +246,26 @@ async def process_single_image_simple(
             supabase = get_supabase_service()
             storage_owner_id = user_id or session_id
             upload_result = await supabase.upload_file_to_storage(
-                file_data=excel_data,
-                file_path=f"users/{storage_owner_id}/jobs/{job_id}/{excel_filename}",
+                file_data=output_data,
+                file_path=f"users/{storage_owner_id}/jobs/{job_id}/{output_filename}",
                 user_id=storage_owner_id,
                 job_id=job_id,
-                filename=excel_filename
+                filename=output_filename,
+                content_type=output_content_type
             )
             supabase_url = upload_result.get('signed_url')
             supabase_storage_path = upload_result.get('storage_path')
             if supabase_storage_path:
                 file_metadata = {
                     "storage_path": supabase_storage_path,
-                    "filename": excel_filename,
-                    "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "filename": output_filename,
+                    "content_type": output_content_type,
                     "job_id": job_id,
                     "session_id": session_id,
                     "user_id": user_id or "",
                     "image_id": image_id,
                     "file_id": file_id,
-                    "size_bytes": len(excel_data),
+                    "size_bytes": len(output_data),
                     "completed_at": datetime.utcnow().isoformat()
                 }
                 await redis.set_cache(f"file:{file_id}", file_metadata, settings.file_retention_seconds)
@@ -187,17 +275,28 @@ async def process_single_image_simple(
 
         file_record = {
             'file_id': file_id,
-            'filename': excel_filename,
+            'filename': output_filename,
+            'original_filename': original_filename,
             'image_id': image_id,
-            'size_bytes': len(excel_data),
+            'size_bytes': len(output_data),
             'supabase_url': supabase_url,
             'storage_path': supabase_storage_path,
             'session_id': session_id,
             'user_id': user_id or "",
+            'content_type': output_content_type,
+            'status': "completed",
+            'expires_at': (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
             'completed_at': datetime.utcnow().isoformat()
         }
 
         if supabase_storage_path:
+            try:
+                durable_file = await supabase.upsert_job_file(file_record)
+                file_record.update(durable_file)
+            except Exception as metadata_error:
+                logger.error(f"[Job {job_id}] Failed to store durable file metadata for {file_id}: {metadata_error}")
+                raise
+
             await redis.set_job_image_result(
                 job_id,
                 image_id,
@@ -229,22 +328,24 @@ async def process_single_image_simple(
             'updated_at': datetime.utcnow().isoformat()
         })
 
-        if user_id:
-            try:
-                supabase = get_supabase_service()
-                await supabase.update_job_status(
-                    job_id=job_id,
-                    status='processing',
-                    metadata={
-                        'progress': current_progress,
-                        'processed_images': processed_count,
-                        'total_images': total_images,
-                        'generated_files': completed_file_records,
-                        'image_results': completed_results
-                    }
-                )
-            except Exception as e:
-                logger.debug(f"Failed to update Supabase progress: {e}")
+        try:
+            supabase = get_supabase_service()
+            await supabase.update_job_status(
+                job_id=job_id,
+                status='processing',
+                metadata={
+                    'progress': current_progress,
+                    'processed_images': processed_count,
+                    'total_images': total_images,
+                    'generated_files': completed_file_records,
+                    'image_results': completed_results,
+                    'session_id': session_id,
+                    'owner_user_id': user_id,
+                    'owner_session_id': None if user_id else session_id
+                }
+            )
+        except Exception as e:
+            logger.debug(f"Failed to update Supabase progress: {e}")
 
         # Publish progress (will fail silently if Redis unavailable)
         try:
@@ -268,9 +369,9 @@ async def process_single_image_simple(
         ready_file_info = ProcessedFileInfo(
             file_id=file_id,
             download_url=f"/api/v1/download/{file_id}",
-            filename=excel_filename,
+            filename=output_filename,
             image_id=image_id,
-            size_bytes=len(excel_data)
+            size_bytes=len(output_data)
         )
 
         # Publish file_ready (will fail silently if Redis unavailable)
@@ -294,7 +395,7 @@ async def process_single_image_simple(
         return {
             'status': 'success',
             'image_id': image_id,
-            'filename': excel_filename,
+            'filename': output_filename,
             'file_id': file_id,
             'file_info': file_record,
             'download_url': f"/api/v1/download/{file_id}"
@@ -341,7 +442,7 @@ async def process_batch_simple(
     Process a batch of images with simple asyncio.gather().
 
     This is the main entry point. It:
-    1. Processes all images concurrently (up to 5 at a time)
+    1. Processes all images concurrently using the configured OCR cap
     2. Updates the SAME job_id in Redis
     3. Sends completion message when done
 
@@ -352,31 +453,33 @@ async def process_batch_simple(
     start_time = datetime.utcnow()
 
     logger.info(f"[Job {job_id}] Starting batch processing: {len(images)} images")
-    await _restore_image_results_from_supabase(redis, job_id, user_id)
+    await _restore_image_results_from_supabase(redis, job_id, user_id, session_id)
     
-    # Update job status to "processing" in Supabase at start
-    if user_id:
-        try:
-            supabase = get_supabase_service()
-            existing_results = await redis.get_job_image_results(job_id)
-            existing_files = [
-                result.get('file_info')
-                for result in existing_results.values()
-                if isinstance(result, dict) and result.get('status') == 'success' and result.get('file_info')
-            ]
-            await supabase.update_job_status(
-                job_id=job_id,
-                status='processing',
-                metadata={
-                    'started_at': datetime.utcnow().isoformat(),
-                    'total_images': len(images),
-                    'generated_files': existing_files,
-                    'image_results': existing_results
-                }
-            )
-            logger.info(f"[Job {job_id}] Updated Supabase status to processing")
-        except Exception as e:
-            logger.warning(f"[Job {job_id}] Failed to update initial status in Supabase: {e}")
+    # Update job status to "processing" in Supabase at start.
+    try:
+        supabase = get_supabase_service()
+        existing_results = await redis.get_job_image_results(job_id)
+        existing_files = [
+            result.get('file_info')
+            for result in existing_results.values()
+            if isinstance(result, dict) and result.get('status') == 'success' and result.get('file_info')
+        ]
+        await supabase.update_job_status(
+            job_id=job_id,
+            status='processing',
+            metadata={
+                'started_at': datetime.utcnow().isoformat(),
+                'total_images': len(images),
+                'generated_files': existing_files,
+                'image_results': existing_results,
+                'session_id': session_id,
+                'owner_user_id': user_id,
+                'owner_session_id': None if user_id else session_id
+            }
+        )
+        logger.info(f"[Job {job_id}] Updated Supabase status to processing")
+    except Exception as e:
+        logger.warning(f"[Job {job_id}] Failed to update initial status in Supabase: {e}")
 
     try:
         # Update job to processing (gracefully handle Redis unavailability)
@@ -388,8 +491,11 @@ async def process_batch_simple(
         except Exception as redis_error:
             logger.warning(f"[Job {job_id}] Failed to update job status in Redis: {redis_error}")
 
-        # Process images with semaphore to limit concurrency
-        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent
+        # Local cap prevents one Celery task from creating excessive waiters.
+        # Redis enforces the same cap globally across all worker machines.
+        local_ocr_limit = max(1, settings.max_concurrent_ocr_calls)
+        semaphore = asyncio.Semaphore(local_ocr_limit)
+        logger.info(f"[Job {job_id}] Using OCR concurrency cap: {local_ocr_limit}")
 
         async def process_with_semaphore(img, idx):
             async with semaphore:
@@ -469,28 +575,38 @@ async def process_batch_simple(
         except Exception as redis_error:
             logger.warning(f"[Job {job_id}] Failed to update final status in Redis: {redis_error}")
 
-        # Update job status in Supabase database (CRITICAL for dashboard)
-        if user_id:
-            try:
-                supabase = get_supabase_service()
-                await supabase.update_job_status(
-                    job_id=job_id,
-                    status='completed' if final_status in ['completed', 'partially_completed'] else 'failed',
-                    result_url=download_urls[0] if download_urls else None,
-                    metadata={
-                        'processing_time': processing_time,
-                        'successful_images': len(successful_results),
-                        'failed_images': len(failed_results),
-                        'total_images': len(images),
-                        'completed_at': datetime.utcnow().isoformat(),
-                        'generated_files': generated_files,
-                        'download_urls': download_urls,
-                        'image_results': completed_image_results
-                    }
-                )
-                logger.info(f"[Job {job_id}] Updated status in Supabase: {final_status}")
-            except Exception as supabase_error:
-                logger.error(f"[Job {job_id}] Failed to update Supabase status: {supabase_error}")
+        # Update job status in Supabase database (CRITICAL for dashboard and recovery)
+        try:
+            supabase = get_supabase_service()
+            credit_metadata = await _settle_reserved_credits(
+                supabase=supabase,
+                job_id=job_id,
+                user_id=user_id,
+                total_images=len(images),
+                successful_images=len(successful_results)
+            )
+            await supabase.update_job_status(
+                job_id=job_id,
+                status='completed' if final_status in ['completed', 'partially_completed'] else 'failed',
+                result_url=download_urls[0] if download_urls else None,
+                metadata={
+                    'processing_time': processing_time,
+                    'successful_images': len(successful_results),
+                    'failed_images': len(failed_results),
+                    'total_images': len(images),
+                    'completed_at': datetime.utcnow().isoformat(),
+                    'generated_files': generated_files,
+                    'download_urls': download_urls,
+                    'image_results': completed_image_results,
+                    'session_id': session_id,
+                    'owner_user_id': user_id,
+                    'owner_session_id': None if user_id else session_id,
+                    **credit_metadata
+                }
+            )
+            logger.info(f"[Job {job_id}] Updated status in Supabase: {final_status}")
+        except Exception as supabase_error:
+            logger.error(f"[Job {job_id}] Failed to update Supabase status: {supabase_error}")
 
         # Build files list for completion message
         files_info = []
@@ -542,14 +658,27 @@ async def process_batch_simple(
             logger.warning(f"[Job {job_id}] Failed to update failed status in Redis: {redis_error}")
         
         # Update failed status in Supabase
-        if user_id:
-            try:
-                supabase = get_supabase_service()
-                await supabase.update_job_status(
-                    job_id=job_id,
-                    status='failed',
-                    error_message=str(e)
-                )
-                logger.info(f"[Job {job_id}] Updated failed status in Supabase")
-            except Exception as supabase_error:
-                logger.error(f"[Job {job_id}] Failed to update Supabase status: {supabase_error}")
+        try:
+            supabase = get_supabase_service()
+            credit_metadata = await _settle_reserved_credits(
+                supabase=supabase,
+                job_id=job_id,
+                user_id=user_id,
+                total_images=len(images),
+                successful_images=0
+            )
+            await supabase.update_job_status(
+                job_id=job_id,
+                status='failed',
+                error_message=str(e),
+                metadata={
+                    'session_id': session_id,
+                    'owner_user_id': user_id,
+                    'owner_session_id': None if user_id else session_id,
+                    'failed_at': datetime.utcnow().isoformat(),
+                    **credit_metadata
+                }
+            )
+            logger.info(f"[Job {job_id}] Updated failed status in Supabase")
+        except Exception as supabase_error:
+            logger.error(f"[Job {job_id}] Failed to update Supabase status: {supabase_error}")
