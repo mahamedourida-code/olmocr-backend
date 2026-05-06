@@ -24,6 +24,7 @@ from app.services.redis_service import get_redis_service, RedisService
 from app.services.supabase_service import get_supabase_service
 from app.tasks.batch_tasks import process_batch_from_storage
 from app.utils.exceptions import ProcessingError, ValidationError
+from app.utils.pdf_pages import is_pdf_bytes, render_pdf_pages_to_png
 from app.models.jobs import SessionMetadata
 from typing import Optional
 
@@ -398,51 +399,11 @@ async def create_batch_job_multipart(
     simple_batch_validation(len(files))
     supabase_service = get_supabase_service()
     limits = resolve_upload_limits(user, supabase_service)
-    enforce_batch_limit(len(files), limits)
-
-    await enforce_upload_rate_limits(
-        request=http_request,
-        redis_service=redis_service,
-        user=user,
-        session_id=session.session_id,
-        image_count=len(files),
-        daily_image_limit_override=limits["daily_image_limit"]
-    )
-
-    credits_reserved = False
-    if user:
-        logger.info(f"[Credits] Checking credits for user {user['user_id']}, need {len(files)} credits")
-        try:
-            credits_result = supabase_service.check_and_use_credits(
-                user['user_id'],
-                len(files)
-            )
-
-            if not credits_result:
-                logger.warning(f"[Credits] Insufficient credits for user {user['user_id']}")
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail={
-                        "code": "INSUFFICIENT_CREDITS",
-                        "message": f"Insufficient credits. You need {len(files)} credits but don't have enough remaining.",
-                        "credits_required": len(files)
-                    }
-                )
-
-            credits_reserved = True
-            logger.info(f"[Credits] Reserved {len(files)} credits for user {user['user_id']}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"[Credits] Critical error checking credits: {e}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Credit system error. Please try again or contact support."
-            )
 
     # Validate each file
     SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif", "application/pdf"}
     MAX_FILE_SIZE = settings.max_file_size_bytes
+    validated_files = []
 
     for i, file in enumerate(files):
         logger.info(f"[BATCH-UPLOAD] Validating file {i+1}: {file.filename}")
@@ -486,9 +447,103 @@ async def create_batch_job_multipart(
                 detail=error_msg
             )
 
-        # Reset file pointer for later processing
-        await file.seek(0)
+        normalized_content_type = (
+            "application/pdf"
+            if file_ext == "pdf" or file.content_type == "application/pdf" or is_pdf_bytes(file_content)
+            else file.content_type or "application/octet-stream"
+        )
+        validated_files.append({
+            "index": i,
+            "filename": file.filename or f"image_{i}.png",
+            "content_type": normalized_content_type,
+            "content": file_content
+        })
         logger.info(f"[BATCH-UPLOAD] File {i+1} validation passed")
+
+    processing_units = []
+    for file_info in validated_files:
+        filename = file_info["filename"]
+        content = file_info["content"]
+
+        if file_info["content_type"] == "application/pdf" or is_pdf_bytes(content):
+            try:
+                page_images = render_pdf_pages_to_png(content)
+            except ProcessingError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"File '{filename}': {str(exc)}"
+                )
+
+            base_name = os.path.splitext(os.path.basename(filename))[0] or "document"
+            for page_index, page_bytes in enumerate(page_images, start=1):
+                processing_units.append({
+                    "id": f"img_{file_info['index']}_page_{page_index}",
+                    "content": page_bytes,
+                    "filename": f"{file_info['index']}_{base_name}_page_{page_index}.png",
+                    "content_type": "image/png",
+                    "source_filename": filename,
+                    "source_content_type": "application/pdf",
+                    "source_page": page_index,
+                    "source_page_count": len(page_images)
+                })
+            continue
+
+        processing_units.append({
+            "id": f"img_{file_info['index']}",
+            "content": content,
+            "filename": f"{file_info['index']}_{filename}",
+            "content_type": file_info["content_type"],
+            "source_filename": filename,
+            "source_content_type": file_info["content_type"],
+            "source_page": None,
+            "source_page_count": None
+        })
+
+    processing_count = len(processing_units)
+    simple_batch_validation(processing_count)
+    enforce_batch_limit(processing_count, limits)
+
+    await enforce_upload_rate_limits(
+        request=http_request,
+        redis_service=redis_service,
+        user=user,
+        session_id=session.session_id,
+        image_count=processing_count,
+        daily_image_limit_override=limits["daily_image_limit"]
+    )
+
+    credits_reserved = False
+    credits_reserved_count = 0
+    if user:
+        logger.info(f"[Credits] Checking credits for user {user['user_id']}, need {processing_count} credits")
+        try:
+            credits_result = supabase_service.check_and_use_credits(
+                user['user_id'],
+                processing_count
+            )
+
+            if not credits_result:
+                logger.warning(f"[Credits] Insufficient credits for user {user['user_id']}")
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail={
+                        "code": "INSUFFICIENT_CREDITS",
+                        "message": f"Insufficient credits. You need {processing_count} credits but don't have enough remaining.",
+                        "credits_required": processing_count
+                    }
+                )
+
+            credits_reserved = True
+            credits_reserved_count = processing_count
+            logger.info(f"[Credits] Reserved {processing_count} credits for user {user['user_id']}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[Credits] Critical error checking credits: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Credit system error. Please try again or contact support."
+            )
 
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -498,32 +553,26 @@ async def create_batch_job_multipart(
         storage_owner_id = user['user_id'] if user else session.session_id
         stored_images = []
 
-        for i, file in enumerate(files):
-            # Read binary data (we already validated it above)
-            file_content = await file.read()
-
+        for unit in processing_units:
             source_file = await supabase_service.upload_source_file(
-                file_data=file_content,
+                file_data=unit["content"],
                 owner_id=storage_owner_id,
                 job_id=job_id,
-                filename=f"{i}_{file.filename or f'image_{i}.png'}",
-                content_type=(
-                    "application/pdf"
-                    if (file.filename or "").lower().endswith(".pdf")
-                    else file.content_type or "application/octet-stream"
-                )
+                filename=unit["filename"],
+                content_type=unit["content_type"]
             )
 
             stored_images.append({
-                'id': f"img_{i}",
+                'id': unit["id"],
                 'storage_path': source_file['storage_path'],
-                'filename': file.filename or f"image_{i}.png",
+                'filename': unit["filename"],
                 'content_type': source_file['content_type'],
-                'size_bytes': source_file['size_bytes']
+                'size_bytes': source_file['size_bytes'],
+                'original_filename': unit["source_filename"],
+                'source_content_type': unit["source_content_type"],
+                'source_page': unit["source_page"],
+                'source_page_count': unit["source_page_count"]
             })
-
-            # Reset file pointer (in case we need to read again)
-            await file.seek(0)
 
         # Create job metadata for Redis with storage paths, not raw image payloads.
         job_data = {
@@ -531,7 +580,7 @@ async def create_batch_job_multipart(
             'session_id': session.session_id,
             'user_id': user['user_id'] if user else '',  # Convert None to empty string for Redis
             'status': 'queued',
-            'total_images': len(files),
+            'total_images': processing_count,
             'processed_images': 0,
             'progress': 0,
             'output_format': output_format,
@@ -541,7 +590,7 @@ async def create_batch_job_multipart(
             'errors': [],
             'plan': limits["plan"],
             'max_files_per_batch': limits["max_files_per_batch"],
-            'credits_reserved': len(files) if user else 0,
+            'credits_reserved': credits_reserved_count,
             'credits_settled': False if user else True,
             'created_at': datetime.utcnow().isoformat(),
             'updated_at': datetime.utcnow().isoformat()
@@ -551,9 +600,10 @@ async def create_batch_job_multipart(
         await supabase_service.create_job(
             job_id=job_id,
             user_id=durable_owner_id,
-            filename=f"batch_{len(files)}_images",
+            filename=f"batch_{processing_count}_pages",
             metadata={
-                'total_images': len(files),
+                'total_images': processing_count,
+                'uploaded_files': len(files),
                 'consolidation_strategy': consolidation_strategy,
                 'output_format': output_format,
                 'session_id': session.session_id,
@@ -561,7 +611,7 @@ async def create_batch_job_multipart(
                 'owner_session_id': None if user else session.session_id,
                 'plan': limits["plan"],
                 'max_files_per_batch': limits["max_files_per_batch"],
-                'credits_reserved': len(files) if user else 0,
+                'credits_reserved': credits_reserved_count,
                 'credits_settled': False if user else True
             },
             status='queued'
@@ -588,7 +638,8 @@ async def create_batch_job_multipart(
                 job_id=job_id,
                 status='queued',
                 metadata={
-                    'total_images': len(files),
+                    'total_images': processing_count,
+                    'uploaded_files': len(files),
                     'consolidation_strategy': consolidation_strategy,
                     'output_format': output_format,
                     'session_id': session.session_id,
@@ -597,18 +648,18 @@ async def create_batch_job_multipart(
                     'celery_task_id': async_result.id,
                     'plan': limits["plan"],
                     'max_files_per_batch': limits["max_files_per_batch"],
-                    'credits_reserved': len(files) if user else 0,
+                    'credits_reserved': credits_reserved_count,
                     'credits_settled': False if user else True
                 }
             )
         except Exception as e:
             logger.debug(f"Failed to store Celery task id for job {job_id}: {e}")
 
-        logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} images")
+        logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} page image(s)")
 
         # Calculate estimated completion (now much faster with concurrency)
         estimated_completion = datetime.utcnow() + timedelta(
-            seconds=max(30, len(files) * 2)  # Much faster with parallel processing
+            seconds=max(30, processing_count * 2)  # Much faster with parallel processing
         )
 
         return BatchConvertResponse(
@@ -634,7 +685,7 @@ async def create_batch_job_multipart(
             logger.warning(f"[BATCH-UPLOAD] Failed to cleanup job {job_id}: {cleanup_error}")
 
         if user and credits_reserved:
-            supabase_service.refund_credits(user['user_id'], len(files))
+            supabase_service.refund_credits(user['user_id'], credits_reserved_count)
 
         # Return detailed error information
         raise HTTPException(

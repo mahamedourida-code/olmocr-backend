@@ -34,6 +34,21 @@ class RedisService:
         self._is_connected = False
         self._connection_attempts = 0
         self._max_connection_attempts = 3
+
+    def _prepare_hash_mapping(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        mapping: Dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(value, (list, dict)):
+                mapping[key] = json.dumps(value)
+            elif isinstance(value, bool):
+                mapping[key] = int(value)
+            elif value is None:
+                mapping[key] = ""
+            elif isinstance(value, datetime):
+                mapping[key] = value.isoformat()
+            else:
+                mapping[key] = value
+        return mapping
     
     async def _try_connection_with_host(self, host: str, port: int = 6379) -> redis.Redis:
         """Try to connect to Redis with a specific host."""
@@ -266,10 +281,7 @@ class RedisService:
             job_data_copy['created_at'] = datetime.utcnow().isoformat()
             job_data_copy['updated_at'] = datetime.utcnow().isoformat()
             
-            # Convert complex objects to JSON (same as update_job method)
-            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files', 'image_results']:
-                if field in job_data_copy and isinstance(job_data_copy[field], (list, dict)):
-                    job_data_copy[field] = json.dumps(job_data_copy[field])
+            job_data_copy = self._prepare_hash_mapping(job_data_copy)
             
             # Store job data
             job_key = f"job:{job_id}"
@@ -368,10 +380,7 @@ class RedisService:
             # Add update timestamp
             updates_copy['updated_at'] = datetime.utcnow().isoformat()
             
-            # Convert complex objects to JSON
-            for field in ['images', 'results', 'errors', 'download_urls', 'generated_files', 'image_results']:
-                if field in updates_copy and isinstance(updates_copy[field], (list, dict)):
-                    updates_copy[field] = json.dumps(updates_copy[field])
+            updates_copy = self._prepare_hash_mapping(updates_copy)
             
             job_key = f"job:{job_id}"
             
