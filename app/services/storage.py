@@ -153,7 +153,14 @@ class FileStorageManager:
         logger.info(f"Saved result file: {file_path}")
         return file_id
 
-    def save_result_file_sync(self, session_id: str, filename: str, file_data: bytes, file_id: str = None) -> str:
+    def save_result_file_sync(
+        self,
+        session_id: str,
+        filename: str,
+        file_data: bytes,
+        file_id: str = None,
+        update_session_metadata: bool = True
+    ) -> str:
         """
         Save result file (XLSX) to session storage - synchronous version.
         
@@ -162,6 +169,7 @@ class FileStorageManager:
             filename: Result filename  
             file_data: File binary data
             file_id: Optional custom file ID (if not provided, generates one)
+            update_session_metadata: Keep legacy local session metadata in sync.
             
         Returns:
             File ID for download access
@@ -200,16 +208,16 @@ class FileStorageManager:
             # Don't fail the whole operation if copy fails
             pass
         
-        # Update session metadata to include this file
-        try:
-            import asyncio
-            session = asyncio.run(self.get_session_metadata(session_id))
-            if session and file_id not in session.result_files:
-                session.result_files.append(file_id)
-                asyncio.run(self.update_session_metadata(session))
-                logger.info(f"Added file {file_id} to session {session_id} result_files")
-        except Exception as e:
-            logger.error(f"Failed to update session metadata after saving file {file_id}: {e}")
+        if update_session_metadata:
+            try:
+                import asyncio
+                session = asyncio.run(self.get_session_metadata(session_id))
+                if session and file_id not in session.result_files:
+                    session.result_files.append(file_id)
+                    asyncio.run(self.update_session_metadata(session))
+                    logger.info(f"Added file {file_id} to session {session_id} result_files")
+            except Exception as e:
+                logger.error(f"Failed to update session metadata after saving file {file_id}: {e}")
         
         logger.info(f"Saved result file: {file_path}")
         return file_id

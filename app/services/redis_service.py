@@ -813,9 +813,30 @@ class RedisService:
         """
         try:
             from app.models.websocket import JobProgressUpdate, JobCompletedMessage, JobErrorMessage
+
+            def _as_int(value: Any, default: int = 0) -> int:
+                try:
+                    if value in (None, ""):
+                        return default
+                    return int(value)
+                except (TypeError, ValueError):
+                    return default
+
+            def _as_float(value: Any, default: float = 0.0) -> float:
+                try:
+                    if value in (None, ""):
+                        return default
+                    return float(value)
+                except (TypeError, ValueError):
+                    return default
             
             status = job_data.get('status', 'unknown')
             session_id = job_data.get('session_id')
+            total_images = _as_int(job_data.get('total_images'))
+            processed_images = _as_int(job_data.get('processed_images'))
+            failed_images = _as_int(job_data.get('failed_images'), max(0, total_images - processed_images))
+            progress = _as_int(job_data.get('progress'))
+            processing_time = _as_float(job_data.get('processing_time'))
             
             # Create appropriate WebSocket message based on job status
             if status in ['completed', 'failed', 'partially_completed']:
@@ -823,11 +844,11 @@ class RedisService:
                 message = JobCompletedMessage(
                     job_id=job_id,
                     status=status,
-                    successful_images=job_data.get('processed_images', 0),
-                    failed_images=max(0, job_data.get('total_images', 0) - job_data.get('processed_images', 0)),
+                    successful_images=processed_images,
+                    failed_images=failed_images,
                     download_urls=job_data.get('download_urls', []),
                     primary_download_url=job_data.get('download_url'),
-                    processing_time=job_data.get('processing_time', 0.0),
+                    processing_time=processing_time,
                     expires_at=datetime.utcnow() + timedelta(hours=24),  # Default expiration
                     errors=job_data.get('errors', []),
                     session_id=session_id
@@ -844,11 +865,11 @@ class RedisService:
                 message = JobProgressUpdate(
                     job_id=job_id,
                     status=status,
-                    progress=int(job_data.get('progress', 0)),
-                    total_images=job_data.get('total_images', 0),
-                    processed_images=job_data.get('processed_images', 0),
+                    progress=progress,
+                    total_images=total_images,
+                    processed_images=processed_images,
                     current_image=job_data.get('current_image'),
-                    processing_time=job_data.get('processing_time'),
+                    processing_time=processing_time,
                     session_id=session_id
                 )
             
