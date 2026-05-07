@@ -275,6 +275,7 @@ async def process_single_image_simple(
 
         file_record = {
             'file_id': file_id,
+            'job_id': job_id,
             'filename': output_filename,
             'original_filename': original_filename,
             'image_id': image_id,
