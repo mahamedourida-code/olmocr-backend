@@ -54,9 +54,9 @@ class LemonSqueezyService:
                 "attributes": {
                     "product_options": {
                         "enabled_variants": [int(plan["variant_id"])],
-                        "redirect_url": f"{frontend_url}/pricing?checkout_status=success&plan={plan_key}",
+                        "redirect_url": f"{frontend_url}/dashboard/settings?section=billing&checkout_status=success&plan={plan_key}",
                         "receipt_button_text": "Open AxLiner",
-                        "receipt_link_url": f"{frontend_url}/dashboard/client?billing=pending",
+                        "receipt_link_url": f"{frontend_url}/dashboard/settings?section=billing&checkout_status=pending",
                     },
                     "checkout_options": {
                         "button_color": "#7047EB",

@@ -57,7 +57,7 @@ def _public_plan(
         "price_formatted": _format_usd(price_cents),
         "currency": "USD",
         "credits": credits,
-        "included_volume": f"{credits:,} pages",
+        "included_volume": plan_data.get("volume_label") or f"{credits:,} images",
         "max_files_per_batch": limits["max_files_per_batch"],
         "daily_image_limit": limits["daily_image_limit"],
         "max_file_size_mb": limits["max_file_size_mb"],
@@ -78,13 +78,16 @@ def _billing_plan_catalog() -> Dict[str, Any]:
     variants = settings.lemonsqueezy_plan_variants
     free_limits = get_plan_limits("anonymous")
     pro_monthly = variants["pro_monthly"]["price_cents"]
-    business_monthly = variants["business_monthly"]["price_cents"]
+    max_monthly = variants["max_monthly"]["price_cents"]
+    mega_monthly = variants["mega_monthly"]["price_cents"]
 
     paid_plans = [
         _public_plan("pro_monthly", variants["pro_monthly"]),
         _public_plan("pro_yearly", variants["pro_yearly"], pro_monthly),
-        _public_plan("business_monthly", variants["business_monthly"]),
-        _public_plan("business_yearly", variants["business_yearly"], business_monthly),
+        _public_plan("max_monthly", variants["max_monthly"]),
+        _public_plan("max_yearly", variants["max_yearly"], max_monthly),
+        _public_plan("mega_monthly", variants["mega_monthly"]),
+        _public_plan("mega_yearly", variants["mega_yearly"], mega_monthly),
     ]
 
     return {

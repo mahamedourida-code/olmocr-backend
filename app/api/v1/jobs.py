@@ -129,9 +129,9 @@ async def get_user_credits(
     except Exception as e:
         logger.error(f"Failed to get user credits: {e}")
         return {
-            'total_credits': 80,
+            'total_credits': 5,
             'used_credits': 0,
-            'available_credits': 80
+            'available_credits': 5
         }
 
 

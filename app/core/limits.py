@@ -7,8 +7,10 @@ def normalize_plan_type(plan_type: Optional[str]) -> str:
     plan = (plan_type or "free").strip().lower()
     if plan in {"pro", "paid"}:
         return "pro"
-    if plan in {"enterprise", "business"}:
-        return "enterprise"
+    if plan in {"max", "business"}:
+        return "max"
+    if plan in {"mega", "enterprise"}:
+        return "mega"
     if plan == "anonymous":
         return "anonymous"
     return "free"
@@ -21,13 +23,15 @@ def get_plan_limits(plan_type: Optional[str], settings: Settings = get_settings(
         "anonymous": settings.anonymous_max_files_per_batch,
         "free": settings.free_max_files_per_batch,
         "pro": settings.pro_max_files_per_batch,
-        "enterprise": settings.enterprise_max_files_per_batch,
+        "max": settings.max_max_files_per_batch,
+        "mega": settings.mega_max_files_per_batch,
     }
     daily_limits = {
         "anonymous": settings.rate_limit_anonymous_images_per_day,
         "free": settings.rate_limit_authenticated_images_per_day,
         "pro": settings.rate_limit_pro_images_per_day,
-        "enterprise": settings.rate_limit_enterprise_images_per_day,
+        "max": settings.rate_limit_max_images_per_day,
+        "mega": settings.rate_limit_mega_images_per_day,
     }
 
     return {

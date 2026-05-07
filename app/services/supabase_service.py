@@ -165,9 +165,9 @@ class SupabaseService:
                 if isinstance(result, dict):
                     # Already a dictionary, just ensure all required keys exist
                     return {
-                        'total_credits': result.get('total_credits', 80),
+                        'total_credits': result.get('total_credits', 5),
                         'used_credits': result.get('used_credits', 0),
-                        'available_credits': result.get('available_credits', 80)
+                        'available_credits': result.get('available_credits', 5)
                     }
                 else:
                     # Result might be a tuple or string, try to extract values
@@ -198,7 +198,7 @@ class SupabaseService:
                 try:
                     insert_response = self.client.table('user_credits').insert({
                         'user_id': user_id,
-                        'total_credits': 80,
+                        'total_credits': 5,
                         'used_credits': 0,
                         'reset_date': 'CURRENT_DATE'
                     }).execute()
@@ -209,17 +209,17 @@ class SupabaseService:
                 
                 # Return default values
                 return {
-                    'total_credits': 80,
+                    'total_credits': 5,
                     'used_credits': 0,
-                    'available_credits': 80
+                    'available_credits': 5
                 }
 
         except Exception as e:
             logger.error(f"[Credits] Failed to get credits for user {user_id}: {e}", exc_info=True)
             return {
-                'total_credits': 80,
+                'total_credits': 5,
                 'used_credits': 0,
-                'available_credits': 80
+                'available_credits': 5
             }
 
     def get_user_plan_type(self, user_id: str) -> str:
