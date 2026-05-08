@@ -431,7 +431,7 @@ async def enforce_upload_rate_limits(
         daily_image_limit,
         172800,
         (
-            "Your free trial includes 5 images. Create an account or upgrade to keep converting."
+            "Your free trial includes 10 images. Create a free account to get 10 credits, or upgrade to keep converting."
             if not is_authenticated
             else "Daily image limit reached. Please try again tomorrow or upgrade your plan."
         ),
@@ -446,7 +446,7 @@ async def enforce_upload_rate_limits(
             image_count,
             daily_image_limit,
             172800,
-            "Your free trial includes 5 images. Create an account or upgrade to keep converting.",
+            "Your free trial includes 10 images. Create a free account to get 10 credits, or upgrade to keep converting.",
             "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED",
             status.HTTP_402_PAYMENT_REQUIRED
         )
