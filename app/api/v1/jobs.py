@@ -129,9 +129,9 @@ async def get_user_credits(
     except Exception as e:
         logger.error(f"Failed to get user credits: {e}")
         return {
-            'total_credits': 10,
+            'total_credits': settings.rate_limit_authenticated_images_per_day,
             'used_credits': 0,
-            'available_credits': 10
+            'available_credits': settings.rate_limit_authenticated_images_per_day
         }
 
 

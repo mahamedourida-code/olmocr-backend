@@ -76,7 +76,7 @@ def _public_plan(
 
 def _billing_plan_catalog() -> Dict[str, Any]:
     variants = settings.lemonsqueezy_plan_variants
-    free_limits = get_plan_limits("anonymous")
+    free_limits = get_plan_limits("free")
     pro_monthly = variants["pro_monthly"]["price_cents"]
     max_monthly = variants["max_monthly"]["price_cents"]
     mega_monthly = variants["mega_monthly"]["price_cents"]
@@ -98,13 +98,13 @@ def _billing_plan_catalog() -> Dict[str, Any]:
                 "key": "free",
                 "checkout_key": None,
                 "name": "Free",
-                "plan": "anonymous",
+                "plan": "free",
                 "interval": "forever",
                 "price_cents": 0,
                 "price_formatted": "$0",
                 "currency": "USD",
                 "credits": free_limits["daily_image_limit"],
-                "included_volume": f"{free_limits['daily_image_limit']:,} trial images",
+                "included_volume": f"{free_limits['daily_image_limit']:,} account credits",
                 "max_files_per_batch": free_limits["max_files_per_batch"],
                 "daily_image_limit": free_limits["daily_image_limit"],
                 "max_file_size_mb": free_limits["max_file_size_mb"],

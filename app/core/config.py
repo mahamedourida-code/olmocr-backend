@@ -68,8 +68,8 @@ class Settings(BaseSettings):
     rate_limit_anonymous_jobs_per_minute: int = Field(3, env="RATE_LIMIT_ANONYMOUS_JOBS_PER_MINUTE")
     rate_limit_authenticated_jobs_per_minute: int = Field(12, env="RATE_LIMIT_AUTHENTICATED_JOBS_PER_MINUTE")
     rate_limit_anonymous_images_per_day: int = Field(10, env="RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY")
-    rate_limit_authenticated_images_per_day: int = Field(10, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
-    rate_limit_pro_images_per_day: int = Field(1000, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
+    rate_limit_authenticated_images_per_day: int = Field(30, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
+    rate_limit_pro_images_per_day: int = Field(500, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
     rate_limit_max_images_per_day: int = Field(2000, env="RATE_LIMIT_MAX_IMAGES_PER_DAY")
     rate_limit_mega_images_per_day: int = Field(7000, env="RATE_LIMIT_MEGA_IMAGES_PER_DAY")
     rate_limit_enterprise_images_per_day: int = Field(5000, env="RATE_LIMIT_ENTERPRISE_IMAGES_PER_DAY")
@@ -183,7 +183,7 @@ class Settings(BaseSettings):
             "pro_monthly": {
                 "variant_id": self.lemonsqueezy_pro_monthly_variant_id,
                 "plan": "pro",
-                "display_name": "Pro",
+                "display_name": "Pro Plan",
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_pro_monthly_price_cents,
                 "credits": self.lemonsqueezy_pro_monthly_credits,
@@ -192,7 +192,7 @@ class Settings(BaseSettings):
             "pro_yearly": {
                 "variant_id": self.lemonsqueezy_pro_yearly_variant_id,
                 "plan": "pro",
-                "display_name": "Pro",
+                "display_name": "Pro Plan",
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_pro_yearly_price_cents,
                 "credits": self.lemonsqueezy_pro_yearly_credits,
@@ -201,7 +201,7 @@ class Settings(BaseSettings):
             "max_monthly": {
                 "variant_id": self.lemonsqueezy_max_monthly_variant_id or self.lemonsqueezy_business_monthly_variant_id,
                 "plan": "max",
-                "display_name": "Max",
+                "display_name": "Max Plan",
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_max_monthly_price_cents,
                 "credits": self.lemonsqueezy_max_monthly_credits,
@@ -210,7 +210,7 @@ class Settings(BaseSettings):
             "max_yearly": {
                 "variant_id": self.lemonsqueezy_max_yearly_variant_id or self.lemonsqueezy_business_yearly_variant_id,
                 "plan": "max",
-                "display_name": "Max",
+                "display_name": "Max Plan",
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_max_yearly_price_cents,
                 "credits": self.lemonsqueezy_max_yearly_credits,
@@ -219,7 +219,7 @@ class Settings(BaseSettings):
             "mega_monthly": {
                 "variant_id": self.lemonsqueezy_mega_monthly_variant_id,
                 "plan": "mega",
-                "display_name": "Mega",
+                "display_name": "Mega Plan",
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_mega_monthly_price_cents,
                 "credits": self.lemonsqueezy_mega_monthly_credits,
@@ -228,7 +228,7 @@ class Settings(BaseSettings):
             "mega_yearly": {
                 "variant_id": self.lemonsqueezy_mega_yearly_variant_id,
                 "plan": "mega",
-                "display_name": "Mega",
+                "display_name": "Mega Plan",
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_mega_yearly_price_cents,
                 "credits": self.lemonsqueezy_mega_yearly_credits,
