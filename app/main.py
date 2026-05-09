@@ -178,15 +178,22 @@ if not settings.debug:
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Handle HTTP exceptions with consistent error format."""
+    detail = exc.detail
+    message = detail.get("message", "Request failed") if isinstance(detail, dict) else detail
+    content = {
+        "error": detail.get("code", "HTTP_ERROR") if isinstance(detail, dict) else "HTTP_ERROR",
+        "message": message,
+        "detail": detail,
+        "status_code": exc.status_code,
+        "timestamp": datetime.utcnow().isoformat(),
+        "path": request.url.path
+    }
+    if isinstance(detail, dict):
+        content.update({k: v for k, v in detail.items() if k not in content})
+
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": "HTTP_ERROR",
-            "message": exc.detail,
-            "status_code": exc.status_code,
-            "timestamp": datetime.utcnow().isoformat(),
-            "path": request.url.path
-        }
+        content=content
     )
 
 

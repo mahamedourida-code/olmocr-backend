@@ -30,7 +30,7 @@ def main():
         ]
     elif service_type == "worker":
         # Start Celery worker
-        concurrency = os.getenv("WORKER_CONCURRENCY", "4")
+        concurrency = os.getenv("WORKER_CONCURRENCY", "2")
         queues = os.getenv("WORKER_QUEUES", "image_processing,batch_processing,default")
         cmd = [
             "celery",

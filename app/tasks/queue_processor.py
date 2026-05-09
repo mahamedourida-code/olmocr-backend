@@ -9,7 +9,7 @@ import asyncio
 import base64
 import logging
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 
 from app.services.redis_service import get_redis_service
@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 class ImageQueueProcessor:
     """Processes images from Redis queue with controlled concurrency."""
 
-    def __init__(self, max_concurrent: int = 5):
-        self.max_concurrent = max_concurrent
+    def __init__(self, max_concurrent: Optional[int] = None):
+        self.max_concurrent = max(1, max_concurrent or settings.max_concurrent_ocr_calls)
         self.running = False
         self.workers: list[asyncio.Task] = []
 
@@ -126,8 +126,21 @@ class ImageQueueProcessor:
                 image_data = image_data.split(',', 1)[1]
             image_bytes = base64.b64decode(image_data)
 
-            # Extract table data using OlmOCR
-            csv_data = await olmocr.extract_table_from_image(image_bytes)
+            holder_id = f"{job_id}:{img.get('id', img_index)}:queue:{worker_id}"
+            acquired = await redis.acquire_distributed_semaphore(
+                name="deepinfra_ocr",
+                holder_id=holder_id,
+                limit=settings.max_concurrent_ocr_calls,
+                lease_seconds=300,
+                wait_timeout_seconds=300
+            )
+            if not acquired:
+                raise RuntimeError("OCR capacity is busy. Please retry shortly.")
+
+            try:
+                csv_data = await olmocr.extract_table_from_image(image_bytes)
+            finally:
+                await redis.release_distributed_semaphore("deepinfra_ocr", holder_id)
 
             # Create Excel file
             excel_data = excel.csv_to_xlsx(csv_data, f"Table_{img['id']}")

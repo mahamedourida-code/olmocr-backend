@@ -25,6 +25,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/convert", tags=["Image Conversion"])
 
 
+async def extract_table_with_ocr_limit(
+    redis_service: Optional[RedisService],
+    olmocr_service,
+    image_data,
+    job_id: str,
+    image_id: str
+) -> str:
+    """Run a DeepInfra OCR call through the global Redis semaphore."""
+    if not redis_service or not redis_service._is_connected:
+        raise RuntimeError("OCR capacity controls are unavailable. Please retry shortly.")
+
+    holder_id = f"{job_id}:{image_id}:{uuid.uuid4().hex}"
+    acquired = await redis_service.acquire_distributed_semaphore(
+        name="deepinfra_ocr",
+        holder_id=holder_id,
+        limit=settings.max_concurrent_ocr_calls,
+        lease_seconds=300,
+        wait_timeout_seconds=300
+    )
+    if not acquired:
+        raise RuntimeError("OCR capacity is busy. Please retry shortly.")
+
+    try:
+        return await olmocr_service.extract_table_from_image(image_data)
+    finally:
+        await redis_service.release_distributed_semaphore("deepinfra_ocr", holder_id)
+
+
 def validate_image_upload(file_size: int, content_type: str) -> None:
     """Validate uploaded image parameters."""
     # Check file size
@@ -254,6 +282,7 @@ async def process_batch_images_background(
     
     olmocr_service = OlmOCRService()
     excel_service = ExcelService()
+    redis_service = await get_redis_service()
     
     job_id = batch_context['job_id']
     session_id = batch_context['session_id']
@@ -270,7 +299,13 @@ async def process_batch_images_background(
                 image_bytes = base64.b64decode(img['image'])
                 
                 # Extract table data using OlmOCR
-                csv_data = await olmocr_service.extract_table_from_image(image_bytes)
+                csv_data = await extract_table_with_ocr_limit(
+                    redis_service,
+                    olmocr_service,
+                    image_bytes,
+                    job_id,
+                    img.get('filename', str(uuid.uuid4()))
+                )
                 
                 # Store result with sheet name
                 sheet_name = img['filename']
@@ -448,7 +483,13 @@ async def process_batch_images_background_async(
                 logger.info(f"Decoded image {i+1}: {len(image_bytes)} bytes")
 
                 # Extract table data using OlmOCR
-                csv_data = await olmocr_service.extract_table_from_image(image_bytes)
+                csv_data = await extract_table_with_ocr_limit(
+                    redis_service,
+                    olmocr_service,
+                    image_bytes,
+                    job_id,
+                    img.get('filename', str(i))
+                )
                 logger.info(f"OCR completed for image {i+1}: got {len(csv_data)} characters of CSV data")
 
                 # Store result with sheet name
