@@ -1144,8 +1144,11 @@ class RedisService:
             return 0
 
 
-# Global Redis service instance
-redis_service = RedisService()
+# Global Redis service instance. Async Redis connections are bound to the
+# event loop that created them, so Celery tasks that create short-lived loops
+# must not reuse a client from a previous closed loop.
+redis_service: Optional[RedisService] = None
+redis_service_loop_id: Optional[int] = None
 
 
 async def get_redis_service() -> RedisService:
@@ -1156,6 +1159,13 @@ async def get_redis_service() -> RedisService:
     Returns:
         RedisService instance (may be in degraded mode if Redis unavailable)
     """
+    global redis_service, redis_service_loop_id
+
+    current_loop_id = id(asyncio.get_running_loop())
+    if redis_service is None or redis_service_loop_id != current_loop_id:
+        redis_service = RedisService()
+        redis_service_loop_id = current_loop_id
+
     if not redis_service._is_connected:
         try:
             await redis_service.initialize()

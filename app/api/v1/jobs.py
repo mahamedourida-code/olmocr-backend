@@ -202,7 +202,8 @@ async def create_batch_job(
         user=user,
         session_id=session.session_id,
         image_count=len(request.images),
-        daily_image_limit_override=limits["daily_image_limit"]
+        daily_image_limit_override=limits["daily_image_limit"],
+        daily_run_limit_override=limits.get("daily_run_limit")
     )
     
     credits_reserved = False
@@ -526,7 +527,8 @@ async def create_batch_job_multipart(
         user=user,
         session_id=session.session_id,
         image_count=processing_count,
-        daily_image_limit_override=limits["daily_image_limit"]
+        daily_image_limit_override=limits["daily_image_limit"],
+        daily_run_limit_override=limits.get("daily_run_limit")
     )
 
     credits_reserved = False

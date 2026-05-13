@@ -60,6 +60,7 @@ def _public_plan(
         "included_volume": plan_data.get("volume_label") or f"{credits:,} images",
         "max_files_per_batch": limits["max_files_per_batch"],
         "daily_image_limit": limits["daily_image_limit"],
+        "daily_run_limit": limits.get("daily_run_limit"),
         "max_file_size_mb": limits["max_file_size_mb"],
         "annual_discount_percent": (
             _annual_discount_percent(monthly_reference_cents, price_cents)
@@ -104,9 +105,10 @@ def _billing_plan_catalog() -> Dict[str, Any]:
                 "price_formatted": "$0",
                 "currency": "USD",
                 "credits": free_limits["daily_image_limit"],
-                "included_volume": f"{free_limits['daily_image_limit']:,} account credits",
+                "included_volume": "5 runs with up to 5 images each",
                 "max_files_per_batch": free_limits["max_files_per_batch"],
                 "daily_image_limit": free_limits["daily_image_limit"],
+                "daily_run_limit": free_limits.get("daily_run_limit"),
                 "max_file_size_mb": free_limits["max_file_size_mb"],
                 "annual_discount_percent": 0,
                 "checkout_available": False,

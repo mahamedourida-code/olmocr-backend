@@ -331,6 +331,7 @@ async def enforce_upload_rate_limits(
     image_count: int,
     queue_name: str = "batch_processing",
     daily_image_limit_override: Optional[int] = None,
+    daily_run_limit_override: Optional[int] = None,
     settings: Settings = get_settings()
 ) -> None:
     """
@@ -405,6 +406,13 @@ async def enforce_upload_rate_limits(
         if is_authenticated
         else settings.rate_limit_anonymous_images_per_day
     )
+    daily_run_limit = (
+        daily_run_limit_override
+        if daily_run_limit_override is not None
+        else settings.rate_limit_authenticated_runs_per_day
+        if is_authenticated
+        else settings.rate_limit_anonymous_runs_per_day
+    )
 
     await _enforce_redis_limit(
         redis_service,
@@ -424,6 +432,21 @@ async def enforce_upload_rate_limits(
         "Too many upload jobs. Please wait before starting another conversion.",
         "ACTOR_RATE_LIMIT_EXCEEDED"
     )
+    if daily_run_limit:
+        await _enforce_redis_limit(
+            redis_service,
+            f"rate:v1:{actor_type}:{safe_actor}:runs:{day_bucket}",
+            1,
+            daily_run_limit,
+            172800,
+            (
+                "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting."
+                if not is_authenticated
+                else "Your free account includes 5 conversion runs per day. Upgrade when you need more runs."
+            ),
+            "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED" if not is_authenticated else "DAILY_RUN_LIMIT_EXCEEDED",
+            status.HTTP_402_PAYMENT_REQUIRED if not is_authenticated else status.HTTP_429_TOO_MANY_REQUESTS
+        )
     await _enforce_redis_limit(
         redis_service,
         f"rate:v1:{actor_type}:{safe_actor}:images:{day_bucket}",
@@ -431,22 +454,33 @@ async def enforce_upload_rate_limits(
         daily_image_limit,
         172800,
         (
-            "Your free trial includes 10 images. Create a free account to get 30 credits, or upgrade to keep converting."
+            "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting."
             if not is_authenticated
-            else "Daily image limit reached. Please try again tomorrow or upgrade your plan."
+            else "Your free account includes 5 runs with up to 5 images per run. Upgrade when you need more."
         ),
         "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED" if not is_authenticated else "DAILY_IMAGE_LIMIT_EXCEEDED",
         status.HTTP_402_PAYMENT_REQUIRED if not is_authenticated else status.HTTP_429_TOO_MANY_REQUESTS
     )
 
     if not is_authenticated:
+        if daily_run_limit:
+            await _enforce_redis_limit(
+                redis_service,
+                f"rate:v1:ip:{safe_ip}:runs:{day_bucket}",
+                1,
+                daily_run_limit,
+                172800,
+                "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting.",
+                "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED",
+                status.HTTP_402_PAYMENT_REQUIRED
+            )
         await _enforce_redis_limit(
             redis_service,
             f"rate:v1:ip:{safe_ip}:images:{day_bucket}",
             image_count,
             daily_image_limit,
             172800,
-            "Your free trial includes 10 images. Create a free account to get 30 credits, or upgrade to keep converting.",
+            "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting.",
             "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED",
             status.HTTP_402_PAYMENT_REQUIRED
         )

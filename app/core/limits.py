@@ -33,6 +33,13 @@ def get_plan_limits(plan_type: Optional[str], settings: Settings = get_settings(
         "max": settings.rate_limit_max_images_per_day,
         "mega": settings.rate_limit_mega_images_per_day,
     }
+    daily_run_limits = {
+        "anonymous": settings.rate_limit_anonymous_runs_per_day,
+        "free": settings.rate_limit_authenticated_runs_per_day,
+        "pro": 0,
+        "max": 0,
+        "mega": 0,
+    }
 
     return {
         "plan": plan,
@@ -41,6 +48,7 @@ def get_plan_limits(plan_type: Optional[str], settings: Settings = get_settings(
         "max_file_size_mb": settings.max_file_size_mb,
         "max_file_size_bytes": settings.max_file_size_bytes,
         "daily_image_limit": daily_limits[plan],
+        "daily_run_limit": daily_run_limits[plan],
         "queue": {
             "max_queued_jobs": settings.queue_admission_max_queued_jobs,
             "max_active_jobs": settings.queue_admission_max_active_jobs,
