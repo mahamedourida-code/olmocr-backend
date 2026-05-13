@@ -31,6 +31,19 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def estimate_parallel_completion(image_count: int) -> datetime:
+    effective_parallelism = max(
+        1,
+        min(
+            settings.max_concurrent_ocr_calls,
+            settings.worker_concurrency,
+            max(1, image_count)
+        )
+    )
+    waves = (max(1, image_count) + effective_parallelism - 1) // effective_parallelism
+    return datetime.utcnow() + timedelta(seconds=max(15, waves * 12))
+
+
 def simple_batch_validation(image_count: int) -> None:
     """Simple batch validation without dependencies."""
     if image_count == 0:
@@ -338,10 +351,7 @@ async def create_batch_job(
 
         logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} images")
         
-        # Calculate estimated completion (now much faster with concurrency)
-        estimated_completion = datetime.utcnow() + timedelta(
-            seconds=max(30, len(request.images) * 2)  # Much faster with parallel processing
-        )
+        estimated_completion = estimate_parallel_completion(len(request.images))
         
         return BatchConvertResponse(
             success=True,
@@ -665,10 +675,7 @@ async def create_batch_job_multipart(
 
         logger.info(f"Queued Celery processing for job {job_id} with {len(stored_images)} page image(s)")
 
-        # Calculate estimated completion (now much faster with concurrency)
-        estimated_completion = datetime.utcnow() + timedelta(
-            seconds=max(30, processing_count * 2)  # Much faster with parallel processing
-        )
+        estimated_completion = estimate_parallel_completion(processing_count)
 
         return BatchConvertResponse(
             success=True,

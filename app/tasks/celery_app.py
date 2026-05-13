@@ -121,6 +121,10 @@ celery_app.conf.update(
         'app.tasks.batch_tasks.process_batch_images': {'queue': 'batch_processing'},
         'app.tasks.batch_tasks.process_batch_from_storage': {'queue': 'batch_processing'},
         'process_batch_from_storage': {'queue': 'batch_processing'},
+        'app.tasks.batch_tasks.process_single_stored_image': {'queue': 'image_processing'},
+        'process_single_stored_image': {'queue': 'image_processing'},
+        'app.tasks.batch_tasks.finalize_storage_batch': {'queue': 'batch_processing'},
+        'finalize_storage_batch': {'queue': 'batch_processing'},
         'app.tasks.batch_tasks.cleanup_job_files': {'queue': 'cleanup'},
     },
     
@@ -150,6 +154,12 @@ celery_app.conf.update(
         },
         'app.tasks.batch_tasks.process_batch_images': {
             'rate_limit': '5/m'  # 5 batch tasks per minute per worker
+        },
+        'app.tasks.batch_tasks.process_single_stored_image': {
+            'rate_limit': '120/m'
+        },
+        'process_single_stored_image': {
+            'rate_limit': '120/m'
         },
     },
     

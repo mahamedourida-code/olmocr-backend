@@ -109,16 +109,21 @@ class OlmOCRService:
         to avoid overwhelming the OlmOCR API service.
         """
         current_time = time.time()
+        base_delay = max(0.0, settings.olmocr_base_delay_seconds)
+        if base_delay <= 0:
+            self._last_request_time = current_time
+            return
+
         self._request_count += 1
         
         # Calculate delay based on configuration
         if settings.olmocr_exponential_backoff:
             # Exponential backoff: base_delay * 2^(request_count % 4)
-            delay = settings.olmocr_base_delay_seconds * (2 ** (self._request_count % 4))
+            delay = base_delay * (2 ** (self._request_count % 4))
             delay = min(delay, settings.olmocr_max_delay_seconds)
         else:
             # Fixed delay
-            delay = settings.olmocr_base_delay_seconds
+            delay = base_delay
         
         # Add jitter to prevent thundering herd
         jitter = random.uniform(0, settings.olmocr_jitter_factor * delay)

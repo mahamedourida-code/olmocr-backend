@@ -12,7 +12,7 @@ import traceback
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
-from celery import Task
+from celery import Task, chord
 from celery.exceptions import Retry, WorkerLostError
 from celery.signals import task_prerun, task_postrun, task_failure
 
@@ -261,21 +261,65 @@ def process_batch_from_storage(
     user_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Process a batch from durable storage paths.
+    Dispatch a storage-backed batch as independent per-image tasks.
 
     The web API uploads source images first and queues only small metadata here.
+    A Celery chord lets workers process pages independently, then finalizes the
+    job once all image tasks have reported success or failure.
     """
     main_loop = None
 
     try:
-        logger.info(f"[Celery] Starting storage-backed batch job {job_id} with {len(stored_images)} images")
+        total_images = len(stored_images)
+        logger.info(f"[Celery] Dispatching storage-backed batch job {job_id} with {total_images} images")
         main_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(main_loop)
-        result = main_loop.run_until_complete(
-            _process_batch_from_storage_async(job_id, session_id, stored_images, user_id)
+
+        started_at = datetime.utcnow().isoformat()
+        main_loop.run_until_complete(
+            _prepare_storage_batch_async(job_id, session_id, stored_images, user_id, started_at)
         )
-        logger.info(f"[Celery] Storage-backed batch job {job_id} completed")
-        return result
+
+        if not stored_images:
+            result = finalize_storage_batch.apply_async(
+                args=[[], job_id, session_id, stored_images, user_id, started_at],
+                queue='batch_processing',
+                priority=6
+            )
+            return {
+                'job_id': job_id,
+                'status': 'dispatched',
+                'images': 0,
+                'finalizer_task_id': str(result.id)
+            }
+
+        header = [
+            process_single_stored_image.s(
+                job_id,
+                session_id,
+                image_info,
+                image_index,
+                total_images,
+                user_id
+            ).set(queue='image_processing', priority=8)
+            for image_index, image_info in enumerate(stored_images)
+        ]
+        callback = finalize_storage_batch.s(
+            job_id,
+            session_id,
+            stored_images,
+            user_id,
+            started_at
+        ).set(queue='batch_processing', priority=6)
+        chord_result = chord(header)(callback)
+
+        logger.info(f"[Celery] Storage-backed batch job {job_id} dispatched as {total_images} image tasks")
+        return {
+            'job_id': job_id,
+            'status': 'dispatched',
+            'images': total_images,
+            'chord_task_id': str(chord_result.id)
+        }
     except Exception as exc:
         logger.error(f"[Celery] Storage-backed batch job {job_id} failed: {exc}")
         logger.error(f"[Celery] Traceback: {traceback.format_exc()}")
@@ -288,42 +332,377 @@ def process_batch_from_storage(
                 logger.error(f"[Celery] Error closing event loop: {e}")
 
 
-async def _process_batch_from_storage_async(
+async def _prepare_storage_batch_async(
     job_id: str,
     session_id: str,
     stored_images: List[Dict[str, Any]],
+    user_id: Optional[str] = None,
+    started_at: Optional[str] = None
+) -> Dict[str, Any]:
+    from app.services.redis_service import get_redis_service
+    from app.tasks.simple_batch import _restore_image_results_from_supabase
+
+    redis = await get_redis_service()
+    total_images = len(stored_images)
+    await _restore_image_results_from_supabase(redis, job_id, user_id, session_id)
+    existing_results = await redis.get_job_image_results(job_id) or {}
+    existing_files = [
+        result.get('file_info')
+        for result in existing_results.values()
+        if isinstance(result, dict) and result.get('status') == 'success' and result.get('file_info')
+    ]
+
+    await redis.update_job(job_id, {
+        'status': 'processing',
+        'progress': int((len(existing_files) / total_images) * 100) if total_images else 0,
+        'processed_images': len(existing_files),
+        'total_images': total_images,
+        'updated_at': datetime.utcnow().isoformat()
+    })
+
+    try:
+        supabase = get_supabase_service()
+        await supabase.update_job_status(
+            job_id=job_id,
+            status='processing',
+            metadata={
+                'started_at': started_at or datetime.utcnow().isoformat(),
+                'total_images': total_images,
+                'generated_files': existing_files,
+                'image_results': existing_results,
+                'session_id': session_id,
+                'owner_user_id': user_id,
+                'owner_session_id': None if user_id else session_id
+            }
+        )
+    except Exception as e:
+        logger.warning(f"[Job {job_id}] Failed to mark storage batch as processing in Supabase: {e}")
+
+    return {'job_id': job_id, 'status': 'prepared', 'images': total_images}
+
+
+@celery_app.task(
+    bind=True,
+    base=BaseTask,
+    name="process_single_stored_image",
+    max_retries=1,
+    default_retry_delay=60,
+    queue='image_processing',
+    priority=8
+)
+def process_single_stored_image(
+    self,
+    job_id: str,
+    session_id: str,
+    image_info: Dict[str, Any],
+    img_index: int,
+    total_images: int,
     user_id: Optional[str] = None
 ) -> Dict[str, Any]:
+    """Download one stored source image/page and process it independently."""
+    main_loop = None
+
+    try:
+        main_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(main_loop)
+        return main_loop.run_until_complete(
+            _process_single_stored_image_async(
+                job_id=job_id,
+                session_id=session_id,
+                image_info=image_info,
+                img_index=img_index,
+                total_images=total_images,
+                user_id=user_id
+            )
+        )
+    except Exception as exc:
+        image_id = str(image_info.get('id') or f"img_{img_index}") if isinstance(image_info, dict) else f"img_{img_index}"
+        logger.error(f"[Job {job_id}] Stored image task failed for {image_id}: {exc}", exc_info=True)
+        return {
+            'status': 'error',
+            'image_id': image_id,
+            'filename': image_info.get('filename') if isinstance(image_info, dict) else None,
+            'error': str(exc)
+        }
+    finally:
+        if main_loop:
+            try:
+                main_loop.close()
+            except Exception as e:
+                logger.error(f"[Celery] Error closing event loop: {e}")
+
+
+async def _process_single_stored_image_async(
+    job_id: str,
+    session_id: str,
+    image_info: Dict[str, Any],
+    img_index: int,
+    total_images: int,
+    user_id: Optional[str] = None
+) -> Dict[str, Any]:
+    storage_path = image_info.get('storage_path')
+    if not storage_path:
+        raise ValueError(f"Missing storage_path for image {img_index + 1}")
+
+    from app.tasks.simple_batch import process_single_image_simple
+
     supabase_service = get_supabase_service()
-    images: List[Dict[str, str]] = []
+    image_bytes = await supabase_service.download_file_from_storage(storage_path)
+    image_payload = {
+        'id': image_info.get('id', f"img_{img_index}"),
+        'data': base64.b64encode(image_bytes).decode('utf-8'),
+        'filename': image_info.get('filename', f"image_{img_index}.png"),
+        'output_format': image_info.get('output_format', 'xlsx')
+    }
 
-    for i, image_info in enumerate(stored_images):
-        storage_path = image_info.get('storage_path')
-        if not storage_path:
-            raise ValueError(f"Missing storage_path for image {i + 1}")
-
-        image_bytes = await supabase_service.download_file_from_storage(storage_path)
-        images.append({
-            'id': image_info.get('id', f"img_{i}"),
-            'data': base64.b64encode(image_bytes).decode('utf-8'),
-            'filename': image_info.get('filename', f"image_{i}.png"),
-            'output_format': image_info.get('output_format', 'xlsx')
-        })
-
-    from app.tasks.simple_batch import process_batch_simple
-
-    await process_batch_simple(
+    return await process_single_image_simple(
+        img=image_payload,
+        img_index=img_index,
+        total_images=total_images,
         job_id=job_id,
         session_id=session_id,
-        images=images,
         user_id=user_id
     )
 
-    return {
-        'job_id': job_id,
-        'status': 'submitted',
-        'images': len(images)
-    }
+
+@celery_app.task(
+    bind=True,
+    base=BaseTask,
+    name="finalize_storage_batch",
+    max_retries=1,
+    default_retry_delay=60,
+    queue='batch_processing',
+    priority=6
+)
+def finalize_storage_batch(
+    self,
+    task_results: List[Dict[str, Any]],
+    job_id: str,
+    session_id: str,
+    stored_images: List[Dict[str, Any]],
+    user_id: Optional[str] = None,
+    started_at: Optional[str] = None
+) -> Dict[str, Any]:
+    """Aggregate per-image task results and publish the final batch state."""
+    main_loop = None
+
+    try:
+        main_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(main_loop)
+        return main_loop.run_until_complete(
+            _finalize_storage_batch_async(
+                task_results=task_results,
+                job_id=job_id,
+                session_id=session_id,
+                stored_images=stored_images,
+                user_id=user_id,
+                started_at=started_at
+            )
+        )
+    except Exception as exc:
+        logger.error(f"[Job {job_id}] Storage batch finalizer failed: {exc}", exc_info=True)
+        raise self.retry(exc=exc, countdown=60, max_retries=1)
+    finally:
+        if main_loop:
+            try:
+                main_loop.close()
+            except Exception as e:
+                logger.error(f"[Celery] Error closing event loop: {e}")
+
+
+async def _finalize_storage_batch_async(
+    task_results: List[Dict[str, Any]],
+    job_id: str,
+    session_id: str,
+    stored_images: List[Dict[str, Any]],
+    user_id: Optional[str] = None,
+    started_at: Optional[str] = None
+) -> Dict[str, Any]:
+    from app.services.redis_service import get_redis_service
+    from app.tasks.simple_batch import _settle_reserved_credits, _restore_image_results_from_supabase
+
+    redis = await get_redis_service()
+    total_images = len(stored_images)
+    start_time = datetime.utcnow()
+    if started_at:
+        try:
+            start_time = datetime.fromisoformat(started_at)
+        except ValueError:
+            start_time = datetime.utcnow()
+
+    try:
+        await _restore_image_results_from_supabase(redis, job_id, user_id, session_id)
+        completed_image_results = await redis.get_job_image_results(job_id) or {}
+        failed_results: List[Dict[str, Any]] = []
+
+        for idx, result in enumerate(task_results or []):
+            if isinstance(result, Exception):
+                image_info = stored_images[idx] if idx < total_images else {}
+                failed_results.append({
+                    'status': 'error',
+                    'image_id': str(image_info.get('id') or f"img_{idx}"),
+                    'filename': image_info.get('filename'),
+                    'error': str(result)
+                })
+            elif isinstance(result, dict) and result.get('status') != 'success':
+                failed_results.append(result)
+
+        generated_files: List[Dict[str, Any]] = []
+        successful_results: List[Dict[str, Any]] = []
+
+        for idx, image_info in enumerate(stored_images):
+            image_id = str(image_info.get('id') or f"img_{idx}")
+            result_data = completed_image_results.get(image_id)
+            file_info = result_data.get('file_info') if isinstance(result_data, dict) else None
+            if file_info and file_info.get('file_id') and file_info.get('storage_path'):
+                generated_files.append(file_info)
+                successful_results.append(result_data)
+            elif not any(
+                isinstance(failure, dict) and failure.get('image_id') == image_id
+                for failure in failed_results
+            ):
+                failed_results.append({
+                    'status': 'error',
+                    'image_id': image_id,
+                    'filename': image_info.get('filename'),
+                    'error': 'Image did not complete with a durable result'
+                })
+
+        if len(successful_results) == total_images:
+            final_status = 'completed'
+        elif successful_results:
+            final_status = 'partially_completed'
+        else:
+            final_status = 'failed'
+
+        download_urls = [f"/api/v1/download/{file_info['file_id']}" for file_info in generated_files]
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+
+        try:
+            await redis.update_job(job_id, {
+                'status': final_status,
+                'progress': 100,
+                'processing_time': processing_time,
+                'completed_at': datetime.utcnow().isoformat(),
+                'generated_files': generated_files,
+                'download_urls': download_urls,
+                'image_results': completed_image_results,
+                'file_id': generated_files[0]['file_id'] if generated_files else None,
+                'download_url': download_urls[0] if download_urls else None,
+                'failed_images': len(failed_results),
+                'processed_images': len(successful_results)
+            })
+        except Exception as redis_error:
+            logger.warning(f"[Job {job_id}] Failed to update final status in Redis: {redis_error}")
+
+        try:
+            supabase = get_supabase_service()
+            credit_metadata = await _settle_reserved_credits(
+                supabase=supabase,
+                job_id=job_id,
+                user_id=user_id,
+                total_images=total_images,
+                successful_images=len(successful_results)
+            )
+            await supabase.update_job_status(
+                job_id=job_id,
+                status='completed' if final_status in ['completed', 'partially_completed'] else 'failed',
+                result_url=download_urls[0] if download_urls else None,
+                metadata={
+                    'processing_time': processing_time,
+                    'successful_images': len(successful_results),
+                    'failed_images': len(failed_results),
+                    'total_images': total_images,
+                    'completed_at': datetime.utcnow().isoformat(),
+                    'generated_files': generated_files,
+                    'download_urls': download_urls,
+                    'image_results': completed_image_results,
+                    'session_id': session_id,
+                    'owner_user_id': user_id,
+                    'owner_session_id': None if user_id else session_id,
+                    **credit_metadata
+                }
+            )
+        except Exception as supabase_error:
+            logger.error(f"[Job {job_id}] Failed to update Supabase final status: {supabase_error}")
+
+        files_info = [
+            ProcessedFileInfo(
+                file_id=file_data['file_id'],
+                download_url=f"/api/v1/download/{file_data['file_id']}",
+                filename=file_data['filename'],
+                image_id=file_data.get('image_id'),
+                size_bytes=file_data.get('size_bytes')
+            )
+            for file_data in generated_files
+        ]
+
+        try:
+            completion_message = JobCompletedMessage(
+                job_id=job_id,
+                status=final_status,
+                successful_images=len(successful_results),
+                failed_images=len(failed_results),
+                files=files_info,
+                download_urls=download_urls,
+                primary_download_url=download_urls[0] if download_urls else None,
+                processing_time=processing_time,
+                expires_at=datetime.utcnow() + timedelta(hours=settings.file_retention_hours),
+                session_id=session_id
+            )
+            await redis.publish_message(
+                WebSocketTopics.session_topic(session_id),
+                completion_message
+            )
+        except Exception as pub_error:
+            logger.warning(f"[Job {job_id}] Failed to publish completion message: {pub_error}")
+
+        logger.info(
+            f"[Job {job_id}] Finalized storage batch: {len(successful_results)} successful, "
+            f"{len(failed_results)} failed"
+        )
+        return {
+            'job_id': job_id,
+            'status': final_status,
+            'successful_images': len(successful_results),
+            'failed_images': len(failed_results),
+            'images': total_images
+        }
+    except Exception as e:
+        logger.error(f"[Job {job_id}] Storage batch finalization failed: {e}", exc_info=True)
+        try:
+            await redis.update_job(job_id, {
+                'status': 'failed',
+                'error': str(e),
+                'updated_at': datetime.utcnow().isoformat()
+            })
+        except Exception as redis_error:
+            logger.warning(f"[Job {job_id}] Failed to update failed status in Redis: {redis_error}")
+
+        try:
+            supabase = get_supabase_service()
+            credit_metadata = await _settle_reserved_credits(
+                supabase=supabase,
+                job_id=job_id,
+                user_id=user_id,
+                total_images=total_images,
+                successful_images=0
+            )
+            await supabase.update_job_status(
+                job_id=job_id,
+                status='failed',
+                error_message=str(e),
+                metadata={
+                    'session_id': session_id,
+                    'owner_user_id': user_id,
+                    'owner_session_id': None if user_id else session_id,
+                    'failed_at': datetime.utcnow().isoformat(),
+                    **credit_metadata
+                }
+            )
+        except Exception as supabase_error:
+            logger.error(f"[Job {job_id}] Failed to update Supabase failed status: {supabase_error}")
+        raise
 
 
 @celery_app.task(

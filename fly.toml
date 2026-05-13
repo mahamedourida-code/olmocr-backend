@@ -1,19 +1,12 @@
-# fly.toml app configuration file
+# fly.toml app configuration file generated for backend-lively-hill-7043 on 2026-05-12T03:07:18+01:00
 #
-# For a new Fly account:
-# 1. Run `fly launch`
-# 2. Let Fly replace the app name below
-# 3. Attach/create Upstash Redis
-# 4. Set private values with `fly secrets set`
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
 app = 'backend-lively-hill-7043'
 primary_region = 'arn'
 
 [build]
-
-[processes]
-  app = 'python start.py'
-  worker = 'env SERVICE_TYPE=worker python start.py'
 
 [env]
   ALLOWED_ORIGINS = 'https://axliner.com,https://www.axliner.com'
@@ -28,8 +21,8 @@ primary_region = 'arn'
   DOCS_URL = '/docs'
   ENVIRONMENT = 'production'
   FILE_RETENTION_HOURS = '48'
-  FRONTEND_URL = 'https://www.axliner.com'
   FREE_MAX_FILES_PER_BATCH = '10'
+  FRONTEND_URL = 'https://www.axliner.com'
   HOST = '0.0.0.0'
   LEMONSQUEEZY_MAX_MONTHLY_CREDITS = '2000'
   LEMONSQUEEZY_MAX_MONTHLY_PRICE_CENTS = '2000'
@@ -46,16 +39,18 @@ primary_region = 'arn'
   LOG_FORMAT = 'json'
   LOG_LEVEL = 'INFO'
   MAX_BATCH_SIZE = '100'
-  MAX_MAX_FILES_PER_BATCH = '50'
-  MAX_CONCURRENT_OCR_CALLS = '3'
+  MAX_CONCURRENT_OCR_CALLS = '6'
   MAX_FILE_SIZE_MB = '10'
+  MAX_MAX_FILES_PER_BATCH = '50'
+  MEGA_MAX_FILES_PER_BATCH = '100'
   PORT = '8080'
-  REDIS_CONNECT_TIMEOUT = '10'
-  REDIS_MAX_CONNECTIONS = '20'
-  REDIS_SOCKET_TIMEOUT = '30'
+  OLMOCR_BASE_DELAY_SECONDS = '0'
+  OLMOCR_EXPONENTIAL_BACKOFF = 'false'
+  PRO_MAX_FILES_PER_BATCH = '30'
+  QUEUE_ADMISSION_MAX_ACTIVE_JOBS = '100'
+  QUEUE_ADMISSION_MAX_QUEUED_JOBS = '50'
   RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY = '10'
   RATE_LIMIT_ANONYMOUS_JOBS_PER_MINUTE = '3'
-  MEGA_MAX_FILES_PER_BATCH = '100'
   RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY = '30'
   RATE_LIMIT_AUTHENTICATED_JOBS_PER_MINUTE = '12'
   RATE_LIMIT_IP_JOBS_PER_MINUTE = '20'
@@ -63,13 +58,17 @@ primary_region = 'arn'
   RATE_LIMIT_MEGA_IMAGES_PER_DAY = '7000'
   RATE_LIMIT_PRO_IMAGES_PER_DAY = '500'
   RATE_LIMIT_WINDOW_SECONDS = '60'
+  REDIS_CONNECT_TIMEOUT = '10'
+  REDIS_MAX_CONNECTIONS = '20'
+  REDIS_SOCKET_TIMEOUT = '30'
   REDOC_URL = '/redoc'
-  PRO_MAX_FILES_PER_BATCH = '25'
-  QUEUE_ADMISSION_MAX_ACTIVE_JOBS = '100'
-  QUEUE_ADMISSION_MAX_QUEUED_JOBS = '50'
   SUPABASE_STORAGE_BUCKET = 'jobs'
   TEMP_STORAGE_PATH = '/app/temp_storage'
-  WORKER_CONCURRENCY = '2'
+  WORKER_CONCURRENCY = '4'
+
+[processes]
+  app = 'python start.py'
+  worker = 'env SERVICE_TYPE=worker python start.py'
 
 [http_service]
   internal_port = 8080

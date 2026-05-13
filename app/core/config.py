@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     max_batch_size: int = Field(100, env="MAX_BATCH_SIZE")
     anonymous_max_files_per_batch: int = Field(10, env="ANONYMOUS_MAX_FILES_PER_BATCH")
     free_max_files_per_batch: int = Field(10, env="FREE_MAX_FILES_PER_BATCH")
-    pro_max_files_per_batch: int = Field(25, env="PRO_MAX_FILES_PER_BATCH")
+    pro_max_files_per_batch: int = Field(30, env="PRO_MAX_FILES_PER_BATCH")
     max_max_files_per_batch: int = Field(50, env="MAX_MAX_FILES_PER_BATCH")
     mega_max_files_per_batch: int = Field(100, env="MEGA_MAX_FILES_PER_BATCH")
     enterprise_max_files_per_batch: int = Field(50, env="ENTERPRISE_MAX_FILES_PER_BATCH")
@@ -52,13 +52,13 @@ class Settings(BaseSettings):
     # Celery Configuration
     celery_broker_url: Optional[str] = Field(None, env="CELERY_BROKER_URL")
     celery_result_backend: Optional[str] = Field(None, env="CELERY_RESULT_BACKEND")
-    celery_worker_concurrency: int = Field(2, env="CELERY_WORKER_CONCURRENCY")
+    celery_worker_concurrency: int = Field(4, env="CELERY_WORKER_CONCURRENCY")
     celery_task_serializer: str = Field("json", env="CELERY_TASK_SERIALIZER")
     celery_result_serializer: str = Field("json", env="CELERY_RESULT_SERIALIZER")
     
     # Performance Configuration
     max_concurrent_jobs: int = Field(10, env="MAX_CONCURRENT_JOBS")
-    max_concurrent_ocr_calls: int = Field(3, env="MAX_CONCURRENT_OCR_CALLS")
+    max_concurrent_ocr_calls: int = Field(6, env="MAX_CONCURRENT_OCR_CALLS")
     
     # Rate Limiting Configuration
     rate_limit_per_minute: int = Field(100, env="RATE_LIMIT_PER_MINUTE")
@@ -106,10 +106,10 @@ class Settings(BaseSettings):
     lemonsqueezy_business_yearly_credits: int = Field(24000, env="LEMONSQUEEZY_BUSINESS_YEARLY_CREDITS")
     
     # OlmOCR API Rate Limiting Configuration
-    olmocr_base_delay_seconds: float = Field(2.0, env="OLMOCR_BASE_DELAY_SECONDS")
+    olmocr_base_delay_seconds: float = Field(0.0, env="OLMOCR_BASE_DELAY_SECONDS")
     olmocr_max_delay_seconds: float = Field(10.0, env="OLMOCR_MAX_DELAY_SECONDS")
     olmocr_jitter_factor: float = Field(0.5, env="OLMOCR_JITTER_FACTOR")
-    olmocr_exponential_backoff: bool = Field(True, env="OLMOCR_EXPONENTIAL_BACKOFF")
+    olmocr_exponential_backoff: bool = Field(False, env="OLMOCR_EXPONENTIAL_BACKOFF")
     
     # CORS Configuration
     allowed_origins: Union[str, list] = Field(["https://axliner.com", "https://www.axliner.com", "http://localhost:3000"], env="ALLOWED_ORIGINS")
@@ -128,7 +128,7 @@ class Settings(BaseSettings):
 
     # Concurrency Configuration
     max_concurrent_tasks: int = Field(50, env="MAX_CONCURRENT_TASKS")
-    worker_concurrency: int = Field(2, env="WORKER_CONCURRENCY")
+    worker_concurrency: int = Field(4, env="WORKER_CONCURRENCY")
 
     # Supabase Configuration
     supabase_url: str = Field(..., env="SUPABASE_URL")
@@ -183,7 +183,7 @@ class Settings(BaseSettings):
             "pro_monthly": {
                 "variant_id": self.lemonsqueezy_pro_monthly_variant_id,
                 "plan": "pro",
-                "display_name": "Pro Plan",
+                "display_name": "Standard Plan",
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_pro_monthly_price_cents,
                 "credits": self.lemonsqueezy_pro_monthly_credits,
@@ -192,7 +192,7 @@ class Settings(BaseSettings):
             "pro_yearly": {
                 "variant_id": self.lemonsqueezy_pro_yearly_variant_id,
                 "plan": "pro",
-                "display_name": "Pro Plan",
+                "display_name": "Standard Plan",
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_pro_yearly_price_cents,
                 "credits": self.lemonsqueezy_pro_yearly_credits,
@@ -201,7 +201,7 @@ class Settings(BaseSettings):
             "max_monthly": {
                 "variant_id": self.lemonsqueezy_max_monthly_variant_id or self.lemonsqueezy_business_monthly_variant_id,
                 "plan": "max",
-                "display_name": "Max Plan",
+                "display_name": "Pro Plan",
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_max_monthly_price_cents,
                 "credits": self.lemonsqueezy_max_monthly_credits,
@@ -210,7 +210,7 @@ class Settings(BaseSettings):
             "max_yearly": {
                 "variant_id": self.lemonsqueezy_max_yearly_variant_id or self.lemonsqueezy_business_yearly_variant_id,
                 "plan": "max",
-                "display_name": "Max Plan",
+                "display_name": "Pro Plan",
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_max_yearly_price_cents,
                 "credits": self.lemonsqueezy_max_yearly_credits,
@@ -219,7 +219,7 @@ class Settings(BaseSettings):
             "mega_monthly": {
                 "variant_id": self.lemonsqueezy_mega_monthly_variant_id,
                 "plan": "mega",
-                "display_name": "Mega Plan",
+                "display_name": "Max Plan",
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_mega_monthly_price_cents,
                 "credits": self.lemonsqueezy_mega_monthly_credits,
@@ -228,7 +228,7 @@ class Settings(BaseSettings):
             "mega_yearly": {
                 "variant_id": self.lemonsqueezy_mega_yearly_variant_id,
                 "plan": "mega",
-                "display_name": "Mega Plan",
+                "display_name": "Max Plan",
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_mega_yearly_price_cents,
                 "credits": self.lemonsqueezy_mega_yearly_credits,
