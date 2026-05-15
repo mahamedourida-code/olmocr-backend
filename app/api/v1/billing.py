@@ -105,7 +105,7 @@ def _billing_plan_catalog() -> Dict[str, Any]:
                 "price_formatted": "$0",
                 "currency": "USD",
                 "credits": free_limits["daily_image_limit"],
-                "included_volume": "5 runs with up to 5 images each",
+                "included_volume": "30 free credits after account creation",
                 "max_files_per_batch": free_limits["max_files_per_batch"],
                 "daily_image_limit": free_limits["daily_image_limit"],
                 "daily_run_limit": free_limits.get("daily_run_limit"),

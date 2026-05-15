@@ -70,9 +70,9 @@ class Settings(BaseSettings):
     rate_limit_anonymous_runs_per_day: int = Field(3, env="RATE_LIMIT_ANONYMOUS_RUNS_PER_DAY")
     rate_limit_authenticated_runs_per_day: int = Field(5, env="RATE_LIMIT_AUTHENTICATED_RUNS_PER_DAY")
     rate_limit_anonymous_images_per_day: int = Field(9, env="RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY")
-    rate_limit_authenticated_images_per_day: int = Field(25, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
-    rate_limit_pro_images_per_day: int = Field(500, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
-    rate_limit_max_images_per_day: int = Field(2000, env="RATE_LIMIT_MAX_IMAGES_PER_DAY")
+    rate_limit_authenticated_images_per_day: int = Field(30, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
+    rate_limit_pro_images_per_day: int = Field(1000, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
+    rate_limit_max_images_per_day: int = Field(2500, env="RATE_LIMIT_MAX_IMAGES_PER_DAY")
     rate_limit_mega_images_per_day: int = Field(7000, env="RATE_LIMIT_MEGA_IMAGES_PER_DAY")
     rate_limit_enterprise_images_per_day: int = Field(5000, env="RATE_LIMIT_ENTERPRISE_IMAGES_PER_DAY")
     queue_admission_max_queued_jobs: int = Field(50, env="QUEUE_ADMISSION_MAX_QUEUED_JOBS")
@@ -90,18 +90,18 @@ class Settings(BaseSettings):
     lemonsqueezy_mega_yearly_variant_id: str = Field("", env="LEMONSQUEEZY_MEGA_YEARLY_VARIANT_ID")
     lemonsqueezy_business_monthly_variant_id: str = Field("", env="LEMONSQUEEZY_BUSINESS_MONTHLY_VARIANT_ID")
     lemonsqueezy_business_yearly_variant_id: str = Field("", env="LEMONSQUEEZY_BUSINESS_YEARLY_VARIANT_ID")
-    lemonsqueezy_pro_monthly_price_cents: int = Field(700, env="LEMONSQUEEZY_PRO_MONTHLY_PRICE_CENTS")
-    lemonsqueezy_pro_yearly_price_cents: int = Field(7000, env="LEMONSQUEEZY_PRO_YEARLY_PRICE_CENTS")
+    lemonsqueezy_pro_monthly_price_cents: int = Field(1000, env="LEMONSQUEEZY_PRO_MONTHLY_PRICE_CENTS")
+    lemonsqueezy_pro_yearly_price_cents: int = Field(10000, env="LEMONSQUEEZY_PRO_YEARLY_PRICE_CENTS")
     lemonsqueezy_max_monthly_price_cents: int = Field(2000, env="LEMONSQUEEZY_MAX_MONTHLY_PRICE_CENTS")
     lemonsqueezy_max_yearly_price_cents: int = Field(19000, env="LEMONSQUEEZY_MAX_YEARLY_PRICE_CENTS")
     lemonsqueezy_mega_monthly_price_cents: int = Field(5000, env="LEMONSQUEEZY_MEGA_MONTHLY_PRICE_CENTS")
     lemonsqueezy_mega_yearly_price_cents: int = Field(53000, env="LEMONSQUEEZY_MEGA_YEARLY_PRICE_CENTS")
     lemonsqueezy_business_monthly_price_cents: int = Field(2000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_PRICE_CENTS")
     lemonsqueezy_business_yearly_price_cents: int = Field(19000, env="LEMONSQUEEZY_BUSINESS_YEARLY_PRICE_CENTS")
-    lemonsqueezy_pro_monthly_credits: int = Field(500, env="LEMONSQUEEZY_PRO_MONTHLY_CREDITS")
-    lemonsqueezy_pro_yearly_credits: int = Field(6000, env="LEMONSQUEEZY_PRO_YEARLY_CREDITS")
-    lemonsqueezy_max_monthly_credits: int = Field(2000, env="LEMONSQUEEZY_MAX_MONTHLY_CREDITS")
-    lemonsqueezy_max_yearly_credits: int = Field(24000, env="LEMONSQUEEZY_MAX_YEARLY_CREDITS")
+    lemonsqueezy_pro_monthly_credits: int = Field(1000, env="LEMONSQUEEZY_PRO_MONTHLY_CREDITS")
+    lemonsqueezy_pro_yearly_credits: int = Field(12000, env="LEMONSQUEEZY_PRO_YEARLY_CREDITS")
+    lemonsqueezy_max_monthly_credits: int = Field(2500, env="LEMONSQUEEZY_MAX_MONTHLY_CREDITS")
+    lemonsqueezy_max_yearly_credits: int = Field(30000, env="LEMONSQUEEZY_MAX_YEARLY_CREDITS")
     lemonsqueezy_mega_monthly_credits: int = Field(7000, env="LEMONSQUEEZY_MEGA_MONTHLY_CREDITS")
     lemonsqueezy_mega_yearly_credits: int = Field(84000, env="LEMONSQUEEZY_MEGA_YEARLY_CREDITS")
     lemonsqueezy_business_monthly_credits: int = Field(2000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_CREDITS")
@@ -189,7 +189,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_pro_monthly_price_cents,
                 "credits": self.lemonsqueezy_pro_monthly_credits,
-                "volume_label": "500 images",
+                "volume_label": "1,000 images",
             },
             "pro_yearly": {
                 "variant_id": self.lemonsqueezy_pro_yearly_variant_id,
@@ -198,7 +198,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_pro_yearly_price_cents,
                 "credits": self.lemonsqueezy_pro_yearly_credits,
-                "volume_label": "6,000 images/year",
+                "volume_label": "12,000 images/year",
             },
             "max_monthly": {
                 "variant_id": self.lemonsqueezy_max_monthly_variant_id or self.lemonsqueezy_business_monthly_variant_id,
@@ -207,7 +207,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_max_monthly_price_cents,
                 "credits": self.lemonsqueezy_max_monthly_credits,
-                "volume_label": "2,000 images",
+                "volume_label": "2,500 images",
             },
             "max_yearly": {
                 "variant_id": self.lemonsqueezy_max_yearly_variant_id or self.lemonsqueezy_business_yearly_variant_id,
@@ -216,7 +216,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_max_yearly_price_cents,
                 "credits": self.lemonsqueezy_max_yearly_credits,
-                "volume_label": "24,000 images/year",
+                "volume_label": "30,000 images/year",
             },
             "mega_monthly": {
                 "variant_id": self.lemonsqueezy_mega_monthly_variant_id,

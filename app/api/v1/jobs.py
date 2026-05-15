@@ -104,6 +104,88 @@ def _parse_metadata(metadata: Any) -> Dict[str, Any]:
 ACTIVE_JOB_STATUSES = {"queued", "processing"}
 
 
+def _parse_job_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None)
+        except ValueError:
+            return datetime.utcnow()
+    return datetime.utcnow()
+
+
+def _job_image_count(record: Dict[str, Any]) -> int:
+    metadata = _parse_metadata(record.get("processing_metadata"))
+    files = metadata.get("generated_files")
+    file_count = len(files) if isinstance(files, list) else 0
+    return int(
+        metadata.get("successful_images")
+        or metadata.get("processed_images")
+        or metadata.get("total_images")
+        or file_count
+        or 1
+    )
+
+
+def _job_processing_time(record: Dict[str, Any]) -> float:
+    metadata = _parse_metadata(record.get("processing_metadata"))
+    value = metadata.get("processing_time") or metadata.get("processing_time_seconds") or record.get("processing_time")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _dashboard_range_start(range_key: str, now: datetime) -> datetime:
+    if range_key == "1d":
+        return now - timedelta(hours=24)
+    if range_key == "30d":
+        return now - timedelta(days=30)
+    if range_key == "3m":
+        return now - timedelta(days=90)
+    return now - timedelta(days=7)
+
+
+def _dashboard_chart_points(jobs: List[Dict[str, Any]], range_key: str, now: datetime) -> List[Dict[str, Any]]:
+    if range_key == "1d":
+        start = now - timedelta(hours=23)
+        points = []
+        for index in range(24):
+            bucket_start = start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=index)
+            bucket_end = bucket_start + timedelta(hours=1)
+            count = sum(
+                _job_image_count(job)
+                for job in jobs
+                if bucket_start <= _parse_job_datetime(job.get("created_at")) < bucket_end
+            )
+            points.append({
+                "timestamp": bucket_start.isoformat(),
+                "count": count,
+                "formattedTime": bucket_start.strftime("%I%p").lstrip("0").lower(),
+            })
+        return points
+
+    days = 90 if range_key == "3m" else 30 if range_key == "30d" else 7
+    start_day = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    points = []
+    for index in range(days):
+        bucket_start = start_day + timedelta(days=index)
+        bucket_end = bucket_start + timedelta(days=1)
+        count = sum(
+            _job_image_count(job)
+            for job in jobs
+            if bucket_start <= _parse_job_datetime(job.get("created_at")) < bucket_end
+        )
+        points.append({
+            "timestamp": bucket_start.isoformat(),
+            "count": count,
+            "formattedDate": bucket_start.strftime("%b %d").replace(" 0", " "),
+        })
+    return points
+
+
 def _job_record_summary(record: Dict[str, Any]) -> Dict[str, Any]:
     metadata = _parse_metadata(record.get("processing_metadata"))
     status_value = record.get("status", "unknown")
@@ -1173,6 +1255,106 @@ async def get_job_history(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve job history: {str(e)}"
+        )
+
+
+@router.get("/dashboard", response_model=Dict[str, Any])
+async def get_dashboard_metrics(
+    user: dict = Depends(get_current_user),
+    range: str = "7d"
+):
+    """
+    Return dashboard-ready metrics from durable Supabase job data.
+
+    The frontend should use this endpoint for charts instead of reconstructing
+    stats from a small client-side history page.
+    """
+    range_key = range if range in {"1d", "7d", "30d", "3m"} else "7d"
+
+    try:
+        supabase_service = get_supabase_service()
+        now = datetime.utcnow()
+        range_start = _dashboard_range_start(range_key, now)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        week_start = now - timedelta(days=7)
+
+        jobs = await supabase_service.get_user_jobs(user["user_id"], limit=5000)
+
+        range_jobs = [
+            job for job in jobs
+            if _parse_job_datetime(job.get("created_at")) >= range_start
+        ]
+        today_jobs = [
+            job for job in jobs
+            if _parse_job_datetime(job.get("created_at")) >= today_start
+        ]
+        month_jobs = [
+            job for job in jobs
+            if _parse_job_datetime(job.get("created_at")) >= month_start
+        ]
+        week_jobs = [
+            job for job in jobs
+            if _parse_job_datetime(job.get("created_at")) >= week_start
+        ]
+
+        terminal_jobs = [
+            job for job in range_jobs
+            if job.get("status") not in ACTIVE_JOB_STATUSES
+        ]
+        successful_jobs = [
+            job for job in range_jobs
+            if job.get("status") in {"completed", "partially_completed"}
+        ]
+        failed_jobs = [
+            job for job in range_jobs
+            if job.get("status") == "failed"
+        ]
+        active_jobs = [
+            job for job in jobs
+            if job.get("status") in ACTIVE_JOB_STATUSES
+        ]
+        processing_times = [
+            _job_processing_time(job)
+            for job in successful_jobs
+            if _job_processing_time(job) > 0
+        ]
+
+        credits = supabase_service.get_user_credits(user["user_id"])
+        all_time_images = sum(_job_image_count(job) for job in jobs)
+        total_processed = max(int(credits.get("used_credits") or 0), all_time_images)
+        selected_period_processed = sum(_job_image_count(job) for job in range_jobs)
+
+        return {
+            "range": range_key,
+            "chart": _dashboard_chart_points(range_jobs, range_key, now),
+            "stats": {
+                "totalProcessed": total_processed,
+                "todayProcessed": sum(_job_image_count(job) for job in today_jobs),
+                "thisMonthProcessed": sum(_job_image_count(job) for job in month_jobs),
+                "monthProcessed": sum(_job_image_count(job) for job in month_jobs),
+                "lastWeekProcessed": sum(_job_image_count(job) for job in week_jobs),
+                "selectedPeriodProcessed": selected_period_processed,
+                "averageTime": (
+                    sum(processing_times) / len(processing_times)
+                    if processing_times else 0
+                ),
+                "successRate": (
+                    (len(successful_jobs) / len(terminal_jobs)) * 100
+                    if terminal_jobs else 0
+                ),
+                "totalJobs": len(jobs),
+                "activeJobs": len(active_jobs),
+                "failedJobs": len(failed_jobs),
+                "successfulJobs": len(successful_jobs),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get dashboard metrics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve dashboard metrics: {str(e)}"
         )
 
 
