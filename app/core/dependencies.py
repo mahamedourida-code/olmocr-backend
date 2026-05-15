@@ -393,6 +393,8 @@ async def enforce_upload_rate_limits(
     window_seconds = settings.rate_limit_window_seconds
     minute_bucket = int(time.time() // window_seconds)
     day_bucket = datetime.utcnow().strftime("%Y%m%d")
+    quota_bucket = day_bucket if is_authenticated else "trial"
+    quota_expire_seconds = 172800 if is_authenticated else 60 * 60 * 24 * 365
 
     actor_jobs_limit = (
         settings.rate_limit_authenticated_jobs_per_minute
@@ -435,28 +437,28 @@ async def enforce_upload_rate_limits(
     if daily_run_limit:
         await _enforce_redis_limit(
             redis_service,
-            f"rate:v1:{actor_type}:{safe_actor}:runs:{day_bucket}",
+            f"rate:v1:{actor_type}:{safe_actor}:runs:{quota_bucket}",
             1,
             daily_run_limit,
-            172800,
+            quota_expire_seconds,
             (
-                "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting."
+                "Your free trial includes 3 total runs with up to 3 images per run. Create a free account for 3 daily runs with up to 5 images per run, or upgrade to keep converting."
                 if not is_authenticated
-                else "Your free account includes 5 conversion runs per day. Upgrade when you need more runs."
+                else "Your free account includes 3 conversion runs per day. Upgrade when you need more runs."
             ),
             "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED" if not is_authenticated else "DAILY_RUN_LIMIT_EXCEEDED",
             status.HTTP_402_PAYMENT_REQUIRED if not is_authenticated else status.HTTP_429_TOO_MANY_REQUESTS
         )
     await _enforce_redis_limit(
         redis_service,
-        f"rate:v1:{actor_type}:{safe_actor}:images:{day_bucket}",
+        f"rate:v1:{actor_type}:{safe_actor}:images:{quota_bucket}",
         image_count,
         daily_image_limit,
-        172800,
+        quota_expire_seconds,
         (
-            "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting."
+            "Your free trial includes 3 total runs with up to 3 images per run. Create a free account for 3 daily runs with up to 5 images per run, or upgrade to keep converting."
             if not is_authenticated
-            else "Your free account includes 5 runs with up to 5 images per run. Upgrade when you need more."
+            else "Your free account includes 3 runs per day with up to 5 images per run. Upgrade when you need more."
         ),
         "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED" if not is_authenticated else "DAILY_IMAGE_LIMIT_EXCEEDED",
         status.HTTP_402_PAYMENT_REQUIRED if not is_authenticated else status.HTTP_429_TOO_MANY_REQUESTS
@@ -466,21 +468,21 @@ async def enforce_upload_rate_limits(
         if daily_run_limit:
             await _enforce_redis_limit(
                 redis_service,
-                f"rate:v1:ip:{safe_ip}:runs:{day_bucket}",
+                f"rate:v1:ip:{safe_ip}:runs:trial",
                 1,
                 daily_run_limit,
-                172800,
-                "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting.",
+                quota_expire_seconds,
+                "Your free trial includes 3 total runs with up to 3 images per run. Create a free account for 3 daily runs with up to 5 images per run, or upgrade to keep converting.",
                 "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED",
                 status.HTTP_402_PAYMENT_REQUIRED
             )
         await _enforce_redis_limit(
             redis_service,
-            f"rate:v1:ip:{safe_ip}:images:{day_bucket}",
+            f"rate:v1:ip:{safe_ip}:images:trial",
             image_count,
             daily_image_limit,
-            172800,
-            "Your free trial includes 3 runs with up to 3 images per run. Create a free account for 5 runs with up to 5 images per run, or upgrade to keep converting.",
+            quota_expire_seconds,
+            "Your free trial includes 3 total runs with up to 3 images per run. Create a free account for 3 daily runs with up to 5 images per run, or upgrade to keep converting.",
             "ANONYMOUS_FREE_TRIAL_LIMIT_REACHED",
             status.HTTP_402_PAYMENT_REQUIRED
         )

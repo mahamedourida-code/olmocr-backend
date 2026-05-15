@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     rate_limit_anonymous_jobs_per_minute: int = Field(3, env="RATE_LIMIT_ANONYMOUS_JOBS_PER_MINUTE")
     rate_limit_authenticated_jobs_per_minute: int = Field(12, env="RATE_LIMIT_AUTHENTICATED_JOBS_PER_MINUTE")
     rate_limit_anonymous_runs_per_day: int = Field(3, env="RATE_LIMIT_ANONYMOUS_RUNS_PER_DAY")
-    rate_limit_authenticated_runs_per_day: int = Field(5, env="RATE_LIMIT_AUTHENTICATED_RUNS_PER_DAY")
+    rate_limit_authenticated_runs_per_day: int = Field(3, env="RATE_LIMIT_AUTHENTICATED_RUNS_PER_DAY")
     rate_limit_anonymous_images_per_day: int = Field(9, env="RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY")
     rate_limit_authenticated_images_per_day: int = Field(30, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
     rate_limit_pro_images_per_day: int = Field(1000, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
