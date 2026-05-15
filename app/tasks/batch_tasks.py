@@ -452,7 +452,8 @@ async def _process_single_stored_image_async(
         'id': image_info.get('id', f"img_{img_index}"),
         'data': base64.b64encode(image_bytes).decode('utf-8'),
         'filename': image_info.get('filename', f"image_{img_index}.png"),
-        'output_format': image_info.get('output_format', 'xlsx')
+        'output_format': image_info.get('output_format', 'xlsx'),
+        'document_mode': image_info.get('document_mode', 'table')
     }
 
     return await process_single_image_simple(

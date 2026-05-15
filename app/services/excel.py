@@ -1,4 +1,5 @@
 import io
+import json
 import pandas as pd
 from typing import List, Dict, Any, Optional
 import logging
@@ -281,19 +282,126 @@ class ExcelService:
         
         output.seek(0)
         return output.getvalue()
+
+    def bank_statement_to_xlsx(self, statement_data: Dict[str, Any], sheet_name: str = "Statement") -> bytes:
+        """
+        Create a bank statement workbook that preserves what the user sees:
+        statement text first, transaction table underneath, plus review sheets.
+        """
+        try:
+            workbook = Workbook()
+            statement_sheet = workbook.active
+            statement_sheet.title = sheet_name[:31] or "Statement"
+
+            summary_rows = self._normalize_rows(statement_data.get("summary"), ["Field", "Value"])
+            transaction_rows = self._normalize_rows(
+                statement_data.get("transactions"),
+                ["Date", "Description", "Debit", "Credit", "Balance", "Reference"]
+            )
+            review_rows = self._normalize_rows(statement_data.get("review"), ["Area", "Note"])
+            raw_text = self._normalize_raw_text(statement_data.get("raw_text"))
+
+            statement_sheet.append(["Detected Statement Text"])
+            statement_sheet.merge_cells(start_row=2, start_column=1, end_row=8, end_column=8)
+            statement_sheet.cell(row=2, column=1, value=raw_text or "No non-table text detected.")
+            statement_sheet.cell(row=2, column=1).alignment = Alignment(wrap_text=True, vertical="top")
+            statement_sheet.append([])
+            table_title_row = statement_sheet.max_row + 1
+            statement_sheet.append(["Detected Transactions"])
+            for row in transaction_rows:
+                statement_sheet.append(row)
+            self._style_header_row(statement_sheet, table_title_row + 1)
+            self._style_statement_sheet(statement_sheet)
+
+            summary_sheet = workbook.create_sheet("Summary")
+            for row in summary_rows:
+                summary_sheet.append(row)
+            self._style_header_row(summary_sheet)
+            self._auto_fit_openpyxl_columns(summary_sheet)
+
+            transactions_sheet = workbook.create_sheet("Transactions")
+            for row in transaction_rows:
+                transactions_sheet.append(row)
+            self._style_header_row(transactions_sheet)
+            self._auto_fit_openpyxl_columns(transactions_sheet)
+
+            raw_sheet = workbook.create_sheet("Raw Text")
+            raw_sheet.append(["Visible Text"])
+            raw_sheet.append([raw_text or "No readable text detected."])
+            raw_sheet["A2"].alignment = Alignment(wrap_text=True, vertical="top")
+            raw_sheet.column_dimensions["A"].width = 120
+            self._style_header_row(raw_sheet)
+
+            review_sheet = workbook.create_sheet("Review")
+            for row in review_rows:
+                review_sheet.append(row)
+            self._style_header_row(review_sheet)
+            self._auto_fit_openpyxl_columns(review_sheet)
+
+            output = io.BytesIO()
+            workbook.save(output)
+            output.seek(0)
+            return output.getvalue()
+        except Exception as e:
+            logger.error(f"Bank statement workbook error: {str(e)}")
+            return self._create_raw_text_xlsx(json.dumps(statement_data, ensure_ascii=False, indent=2), sheet_name)
+
+    def _normalize_rows(self, value: Any, fallback_header: List[str]) -> List[List[Any]]:
+        if not value:
+            return [fallback_header]
+        if isinstance(value, list):
+            if all(isinstance(row, dict) for row in value):
+                keys: List[str] = []
+                for row in value:
+                    for key in row.keys():
+                        if key not in keys:
+                            keys.append(key)
+                header = keys or fallback_header
+                return [header] + [[row.get(key, "") for key in header] for row in value]
+            if all(isinstance(row, list) for row in value):
+                return value or [fallback_header]
+        if isinstance(value, dict):
+            return [fallback_header] + [[key, val] for key, val in value.items()]
+        return [fallback_header, ["Detected", str(value)]]
+
+    def _normalize_raw_text(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return "\n\n".join(str(item).strip() for item in value if str(item).strip())
+        if isinstance(value, dict):
+            return "\n".join(f"{key}: {val}" for key, val in value.items())
+        return str(value or "").strip()
     
-    def _style_header_row(self, worksheet) -> None:
+    def _style_header_row(self, worksheet, row_number: int = 1) -> None:
         """
         Style the header row of a worksheet.
         
         Args:
             worksheet: openpyxl worksheet object
         """
-        if worksheet.max_row > 0:
-            for cell in worksheet[1]:  # First row
+        if worksheet.max_row >= row_number:
+            for cell in worksheet[row_number]:
                 cell.font = self.header_font
                 cell.fill = self.header_fill
                 cell.alignment = self.alignment
+
+    def _style_statement_sheet(self, worksheet) -> None:
+        worksheet["A1"].font = self.header_font
+        worksheet["A1"].fill = self.header_fill
+        worksheet["A1"].alignment = self.alignment
+        worksheet.row_dimensions[2].height = 130
+        for column in range(1, 9):
+            worksheet.column_dimensions[chr(64 + column)].width = 18
+        for row in worksheet.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    def _auto_fit_openpyxl_columns(self, worksheet) -> None:
+        for column_cells in worksheet.columns:
+            column_letter = column_cells[0].column_letter
+            max_length = max((len(str(cell.value or "")) for cell in column_cells), default=10)
+            worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 48)
     
     def _auto_adjust_columns(self, worksheet, df: pd.DataFrame) -> None:
         """

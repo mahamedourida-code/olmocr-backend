@@ -4,6 +4,8 @@ import logging
 import time
 import random
 import io
+import json
+import re
 from typing import Optional, List, Dict, Any, Union
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
@@ -343,7 +345,7 @@ class OlmOCRService:
             ]
 
             logger.info("Making OlmOCR text extraction request")
-            response: ChatCompletion = await self._make_api_call(messages)
+            response: ChatCompletion = await self._make_api_call(messages, max_tokens=5000)
 
             if not response.choices or not response.choices[0].message.content:
                 raise OlmOCRError("Empty response from OlmOCR API")
@@ -356,9 +358,133 @@ class OlmOCRService:
         except Exception as e:
             logger.error(f"OlmOCR text extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract text: {str(e)}")
+
+    async def extract_bank_statement_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+        """Extract visible bank statement text and transactions into a structured review object."""
+        try:
+            if isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                img_b64_str = image_data.split(',', 1)[1] if image_data.startswith('data:') else image_data
+                image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                page_images = self._render_pdf_pages_to_png(image_bytes)
+                page_results = []
+                for index, page_image in enumerate(page_images, start=1):
+                    result = await self.extract_bank_statement_from_image(page_image)
+                    result["page"] = index
+                    page_results.append(result)
+                return self._merge_bank_statement_pages(page_results)
+
+            await self._apply_rate_limiting()
+
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'RGBA':
+                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                        rgb_img.paste(img, mask=img.split()[3] if len(img.split()) > 3 else None)
+                        img = rgb_img
+                    output_buffer = io.BytesIO()
+                    img.save(output_buffer, format='JPEG', quality=95)
+                    output_buffer.seek(0)
+                    image_bytes = output_buffer.read()
+                img.close()
+            except Exception as e:
+                logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
+
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are extracting a bank statement for OCR review only. "
+                                "Do not calculate, reconcile, categorize, infer missing transactions, or give advice. "
+                                "Return only valid JSON with these keys: "
+                                "summary: an object of visible statement-level fields such as bank_name, account_holder, account_number, statement_period, currency, opening_balance, closing_balance if visible; "
+                                "transactions: an array of objects with only visible columns such as date, description, debit, credit, balance, reference; "
+                                "raw_text: all visible non-table text and labels in reading order; "
+                                "review: an array of {area,note} for uncertain, unclear, or missing visible fields. "
+                                "If a value is not visible, leave it blank. Preserve original wording and number formatting."
+                            )
+                        }
+                    ]
+                }
+            ]
+
+            logger.info("Making OlmOCR bank statement extraction request")
+            response: ChatCompletion = await self._make_api_call(messages, max_tokens=5000)
+
+            if not response.choices or not response.choices[0].message.content:
+                raise OlmOCRError("Empty response from OlmOCR API")
+
+            raw_content = self._clean_ocr_response(response.choices[0].message.content.strip())
+            return self._parse_bank_statement_json(raw_content)
+        except OlmOCRError:
+            raise
+        except Exception as e:
+            logger.error(f"OlmOCR bank statement extraction error: {str(e)}")
+            raise OlmOCRError(f"Failed to extract bank statement: {str(e)}")
+
+    def _parse_bank_statement_json(self, content: str) -> Dict[str, Any]:
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+        return {
+            "summary": {},
+            "transactions": [],
+            "raw_text": content,
+            "review": [{"area": "JSON parsing", "note": "OCR returned text instead of structured JSON. Review Raw Text sheet."}],
+        }
+
+    def _merge_bank_statement_pages(self, page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        merged_summary: Dict[str, Any] = {}
+        transactions: List[Dict[str, Any]] = []
+        raw_text_parts: List[str] = []
+        review: List[Dict[str, Any]] = []
+
+        for result in page_results:
+            page = result.get("page")
+            summary = result.get("summary") or {}
+            if isinstance(summary, dict):
+                for key, value in summary.items():
+                    if value and not merged_summary.get(key):
+                        merged_summary[key] = value
+            for row in result.get("transactions") or []:
+                if isinstance(row, dict):
+                    transactions.append({"page": page, **row})
+            raw_text = result.get("raw_text")
+            if raw_text:
+                raw_text_parts.append(f"Page {page}\n{raw_text}")
+            for item in result.get("review") or []:
+                if isinstance(item, dict):
+                    review.append({"page": page, **item})
+
+        return {
+            "summary": merged_summary,
+            "transactions": transactions,
+            "raw_text": "\n\n".join(raw_text_parts),
+            "review": review,
+        }
     
 
-    async def _make_api_call(self, messages: List[Dict[str, Any]]) -> ChatCompletion:
+    async def _make_api_call(self, messages: List[Dict[str, Any]], max_tokens: Optional[int] = None) -> ChatCompletion:
         """
         Make the actual API call to OlmOCR.
         
@@ -375,7 +501,7 @@ class OlmOCRService:
             lambda: self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                max_tokens=self.max_tokens
+                max_tokens=max_tokens or self.max_tokens
             )
         )
         return response

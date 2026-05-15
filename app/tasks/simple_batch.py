@@ -195,7 +195,9 @@ async def process_single_image_simple(
         if image_data.startswith('data:'):
             image_data = image_data.split(',', 1)[1]
         output_format = str(img.get('output_format') or 'xlsx').lower()
+        document_mode = str(img.get('document_mode') or 'table').lower()
         wants_text_output = output_format in {'txt', 'text', 'plain_text'}
+        wants_bank_statement = document_mode == 'bank_statement'
 
         # Extract with OlmOCR - pass base64 string directly.
         # No need to decode→encode, olmocr service handles both formats
@@ -211,7 +213,9 @@ async def process_single_image_simple(
             raise RuntimeError("OCR capacity is busy. Please retry shortly.")
 
         try:
-            if wants_text_output:
+            if wants_bank_statement:
+                bank_statement_data = await olmocr.extract_bank_statement_from_image(image_data)
+            elif wants_text_output:
                 text_data = await olmocr.extract_text_from_image(image_data)
             else:
                 csv_data = await olmocr.extract_table_from_image(image_data)
@@ -221,7 +225,11 @@ async def process_single_image_simple(
         # Generate filename
         original_filename = img.get('filename', f"image_{image_id}")
         base_name = original_filename.split('.')[0] if '.' in original_filename else original_filename
-        if wants_text_output:
+        if wants_bank_statement:
+            output_data = excel.bank_statement_to_xlsx(bank_statement_data, "Statement")
+            output_filename = f"{base_name}_{_safe_filename_part(image_id)}_bank_statement.xlsx"
+            output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif wants_text_output:
             output_data = text_data.encode('utf-8')
             output_filename = f"{base_name}_{_safe_filename_part(image_id)}_text.txt"
             output_content_type = "text/plain; charset=utf-8"
@@ -266,6 +274,7 @@ async def process_single_image_simple(
                     "image_id": image_id,
                     "file_id": file_id,
                     "size_bytes": len(output_data),
+                    "document_mode": document_mode,
                     "completed_at": datetime.utcnow().isoformat()
                 }
                 await redis.set_cache(f"file:{file_id}", file_metadata, settings.file_retention_seconds)
@@ -285,6 +294,7 @@ async def process_single_image_simple(
             'session_id': session_id,
             'user_id': user_id or "",
             'content_type': output_content_type,
+            'document_mode': document_mode,
             'status': "completed",
             'expires_at': (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
             'completed_at': datetime.utcnow().isoformat()

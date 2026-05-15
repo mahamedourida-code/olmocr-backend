@@ -465,6 +465,7 @@ async def create_batch_job_multipart(
     files: List[UploadFile] = File(..., description="Image or PDF files to process (PNG, JPEG, WebP, HEIC, PDF)"),
     output_format: str = Form("xlsx"),
     consolidation_strategy: str = Form("consolidated"),
+    document_mode: str = Form("table"),
     session: SessionMetadata = Depends(get_or_create_session),
     redis_service: RedisService = Depends(get_redis_service),
     user: Optional[dict] = Depends(get_optional_user),
@@ -480,7 +481,7 @@ async def create_batch_job_multipart(
     """
     # Detailed logging for debugging
     logger.info(f"[BATCH-UPLOAD] Received request with {len(files)} files")
-    logger.info(f"[BATCH-UPLOAD] Parameters: output_format={output_format}, consolidation_strategy={consolidation_strategy}")
+    logger.info(f"[BATCH-UPLOAD] Parameters: output_format={output_format}, consolidation_strategy={consolidation_strategy}, document_mode={document_mode}")
     logger.info(f"[BATCH-UPLOAD] Session ID: {session.session_id if session else 'None'}")
     logger.info(f"[BATCH-UPLOAD] User ID: {user['user_id'] if user else 'None'}")
 
@@ -497,6 +498,13 @@ async def create_batch_job_multipart(
         if str(output_format).lower() in {"txt", "text", "plain_text"}
         else "xlsx"
     )
+    normalized_document_mode = (
+        "bank_statement"
+        if str(document_mode).lower() in {"bank_statement", "bank-statement", "statement"}
+        else "table"
+    )
+    if normalized_document_mode == "bank_statement":
+        normalized_output_format = "xlsx"
 
     # Validate each file
     SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif", "application/pdf"}
@@ -580,6 +588,7 @@ async def create_batch_job_multipart(
                     "filename": f"{file_info['index']}_{base_name}_page_{page_index}.png",
                     "content_type": "image/png",
                     "output_format": normalized_output_format,
+                    "document_mode": normalized_document_mode,
                     "source_filename": filename,
                     "source_content_type": "application/pdf",
                     "source_page": page_index,
@@ -593,6 +602,7 @@ async def create_batch_job_multipart(
             "filename": f"{file_info['index']}_{filename}",
             "content_type": file_info["content_type"],
             "output_format": normalized_output_format,
+            "document_mode": normalized_document_mode,
             "source_filename": filename,
             "source_content_type": file_info["content_type"],
             "source_page": None,
@@ -669,6 +679,7 @@ async def create_batch_job_multipart(
                 'filename': unit["filename"],
                 'content_type': source_file['content_type'],
                 'output_format': unit["output_format"],
+                'document_mode': unit["document_mode"],
                 'size_bytes': source_file['size_bytes'],
                 'original_filename': unit["source_filename"],
                 'source_content_type': unit["source_content_type"],
@@ -686,6 +697,7 @@ async def create_batch_job_multipart(
             'processed_images': 0,
             'progress': 0,
             'output_format': normalized_output_format,
+            'document_mode': normalized_document_mode,
             'consolidation_strategy': consolidation_strategy,
             'images': stored_images,
             'results': [],
@@ -708,6 +720,7 @@ async def create_batch_job_multipart(
                 'uploaded_files': len(files),
                 'consolidation_strategy': consolidation_strategy,
                 'output_format': normalized_output_format,
+                'document_mode': normalized_document_mode,
                 'session_id': session.session_id,
                 'owner_user_id': user['user_id'] if user else None,
                 'owner_session_id': None if user else session.session_id,
@@ -744,6 +757,7 @@ async def create_batch_job_multipart(
                     'uploaded_files': len(files),
                     'consolidation_strategy': consolidation_strategy,
                     'output_format': normalized_output_format,
+                    'document_mode': normalized_document_mode,
                     'session_id': session.session_id,
                     'owner_user_id': user['user_id'] if user else None,
                     'owner_session_id': None if user else session.session_id,
