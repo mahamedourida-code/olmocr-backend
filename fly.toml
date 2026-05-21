@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for backend-lively-hill-7043 on 2026-05-12T03:07:18+01:00
+# fly.toml app configuration file generated for backend-lively-hill-7043 on 2026-05-21T01:29:22+01:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -43,15 +43,15 @@ primary_region = 'arn'
   MAX_FILE_SIZE_MB = '10'
   MAX_MAX_FILES_PER_BATCH = '50'
   MEGA_MAX_FILES_PER_BATCH = '100'
-  PORT = '8080'
   OLMOCR_BASE_DELAY_SECONDS = '0'
   OLMOCR_EXPONENTIAL_BACKOFF = 'false'
+  PORT = '8080'
   PRO_MAX_FILES_PER_BATCH = '30'
   QUEUE_ADMISSION_MAX_ACTIVE_JOBS = '100'
   QUEUE_ADMISSION_MAX_QUEUED_JOBS = '50'
   RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY = '9'
-  RATE_LIMIT_ANONYMOUS_RUNS_PER_DAY = '3'
   RATE_LIMIT_ANONYMOUS_JOBS_PER_MINUTE = '3'
+  RATE_LIMIT_ANONYMOUS_RUNS_PER_DAY = '3'
   RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY = '30'
   RATE_LIMIT_AUTHENTICATED_JOBS_PER_MINUTE = '12'
   RATE_LIMIT_AUTHENTICATED_RUNS_PER_DAY = '3'
@@ -77,7 +77,7 @@ primary_region = 'arn'
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
 
   [http_service.concurrency]
