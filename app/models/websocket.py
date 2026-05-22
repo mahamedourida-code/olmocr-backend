@@ -44,6 +44,11 @@ class ProcessedFileInfo(BaseModel):
     filename: str = Field(..., description="Original filename")
     image_id: Optional[str] = Field(None, description="Associated image identifier")
     size_bytes: Optional[int] = Field(None, description="File size in bytes")
+    status: Optional[str] = Field(None, description="File-level processing status")
+    document_mode: Optional[str] = Field(None, description="Document mode used for extraction")
+    requires_review: Optional[bool] = Field(None, description="Whether this file has review flags")
+    confidence_score: Optional[float] = Field(None, description="Approximate confidence score for UI review")
+    review_flags: List[Dict[str, Any]] = Field(default_factory=list, description="Areas that should be checked")
 
 
 class JobCompletedMessage(WebSocketMessage):

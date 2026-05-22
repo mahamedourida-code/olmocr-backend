@@ -452,6 +452,7 @@ async def _process_single_stored_image_async(
         'id': image_info.get('id', f"img_{img_index}"),
         'data': base64.b64encode(image_bytes).decode('utf-8'),
         'filename': image_info.get('filename', f"image_{img_index}.png"),
+        'original_filename': image_info.get('original_filename') or image_info.get('filename', f"image_{img_index}.png"),
         'output_format': image_info.get('output_format', 'xlsx'),
         'document_mode': image_info.get('document_mode', 'table')
     }
@@ -633,7 +634,12 @@ async def _finalize_storage_batch_async(
                 download_url=f"/api/v1/download/{file_data['file_id']}",
                 filename=file_data['filename'],
                 image_id=file_data.get('image_id'),
-                size_bytes=file_data.get('size_bytes')
+                size_bytes=file_data.get('size_bytes'),
+                status=file_data.get('status'),
+                document_mode=file_data.get('document_mode'),
+                requires_review=file_data.get('requires_review'),
+                confidence_score=file_data.get('confidence_score'),
+                review_flags=file_data.get('review_flags') or []
             )
             for file_data in generated_files
         ]
@@ -1286,7 +1292,12 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
                 download_url=f"/api/v1/download/{file_data['file_id']}",
                 filename=file_data['filename'],
                 image_id=file_data.get('image_id'),
-                size_bytes=file_data.get('size_bytes')
+                size_bytes=file_data.get('size_bytes'),
+                status=file_data.get('status'),
+                document_mode=file_data.get('document_mode'),
+                requires_review=file_data.get('requires_review'),
+                confidence_score=file_data.get('confidence_score'),
+                review_flags=file_data.get('review_flags') or []
             ))
 
         # Publish WebSocket completion message

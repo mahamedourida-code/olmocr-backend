@@ -501,6 +501,8 @@ async def create_batch_job_multipart(
     normalized_document_mode = (
         "bank_statement"
         if str(document_mode).lower() in {"bank_statement", "bank-statement", "statement"}
+        else "invoice_receipt"
+        if str(document_mode).lower() in {"invoice_receipt", "invoice-receipt", "invoice", "receipt"}
         else "table"
     )
     if normalized_document_mode == "bank_statement":
@@ -952,6 +954,11 @@ async def get_job_status(
                         filename=file_info['filename'],
                         original_image=file_info.get('original_filename', file_info.get('image_id', 'unknown')),
                         size_bytes=file_info.get('size_bytes'),
+                        status=file_info.get('status'),
+                        document_mode=file_info.get('document_mode'),
+                        requires_review=file_info.get('requires_review'),
+                        confidence_score=file_info.get('confidence_score'),
+                        review_flags=file_info.get('review_flags') or [],
                         created_at=file_created_at
                     ))
             

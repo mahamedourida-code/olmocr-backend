@@ -198,6 +198,7 @@ async def process_single_image_simple(
         document_mode = str(img.get('document_mode') or 'table').lower()
         wants_text_output = output_format in {'txt', 'text', 'plain_text'}
         wants_bank_statement = document_mode == 'bank_statement'
+        wants_invoice_receipt = document_mode == 'invoice_receipt'
 
         # Extract with OlmOCR - pass base64 string directly.
         # No need to decode→encode, olmocr service handles both formats
@@ -223,7 +224,7 @@ async def process_single_image_simple(
             await redis.release_distributed_semaphore("deepinfra_ocr", holder_id)
 
         # Generate filename
-        original_filename = img.get('filename', f"image_{image_id}")
+        original_filename = img.get('original_filename') or img.get('filename', f"image_{image_id}")
         base_name = original_filename.split('.')[0] if '.' in original_filename else original_filename
         if wants_bank_statement:
             output_data = excel.bank_statement_to_xlsx(bank_statement_data, "Statement")
@@ -235,7 +236,8 @@ async def process_single_image_simple(
             output_content_type = "text/plain; charset=utf-8"
         else:
             output_data = excel.csv_to_xlsx(csv_data, f"Table_{image_id}")
-            output_filename = f"{base_name}_{_safe_filename_part(image_id)}_processed.xlsx"
+            suffix = "invoice_receipt" if wants_invoice_receipt else "processed"
+            output_filename = f"{base_name}_{_safe_filename_part(image_id)}_{suffix}.xlsx"
             output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
         # Save file with a deterministic file_id so retries overwrite, not duplicate.
@@ -282,6 +284,9 @@ async def process_single_image_simple(
         except Exception as upload_error:
             logger.warning(f"[Job {job_id}] Supabase result upload failed: {upload_error}")
 
+        review_flags = bank_statement_data.get("review", []) if wants_bank_statement and isinstance(bank_statement_data, dict) else []
+        requires_review = bool(review_flags)
+
         file_record = {
             'file_id': file_id,
             'job_id': job_id,
@@ -296,6 +301,9 @@ async def process_single_image_simple(
             'content_type': output_content_type,
             'document_mode': document_mode,
             'status': "completed",
+            'requires_review': requires_review,
+            'review_flags': review_flags,
+            'confidence_score': 72 if requires_review else 92,
             'expires_at': (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
             'completed_at': datetime.utcnow().isoformat()
         }
@@ -382,7 +390,12 @@ async def process_single_image_simple(
             download_url=f"/api/v1/download/{file_id}",
             filename=output_filename,
             image_id=image_id,
-            size_bytes=len(output_data)
+            size_bytes=len(output_data),
+            status="completed",
+            document_mode=document_mode,
+            requires_review=requires_review,
+            confidence_score=file_record.get("confidence_score"),
+            review_flags=review_flags
         )
 
         # Publish file_ready (will fail silently if Redis unavailable)
@@ -627,7 +640,12 @@ async def process_batch_simple(
                 download_url=f"/api/v1/download/{file_data['file_id']}",
                 filename=file_data['filename'],
                 image_id=file_data.get('image_id'),
-                size_bytes=file_data.get('size_bytes')
+                size_bytes=file_data.get('size_bytes'),
+                status=file_data.get('status'),
+                document_mode=file_data.get('document_mode'),
+                requires_review=file_data.get('requires_review'),
+                confidence_score=file_data.get('confidence_score'),
+                review_flags=file_data.get('review_flags') or []
             ))
 
         # Send completion message (gracefully handle Redis unavailability)
