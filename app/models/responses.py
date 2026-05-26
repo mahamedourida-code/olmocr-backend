@@ -1,6 +1,7 @@
 from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 from pydantic import BaseModel, Field
+from app.models.requests import DocumentMode
 
 
 class ConvertResponse(BaseModel):
@@ -31,9 +32,12 @@ class ProcessedFile(BaseModel):
     download_url: str = Field(..., description="Direct download URL for this file")
     filename: str = Field(..., description="Generated filename (e.g., 'products_processed.xlsx')")
     original_image: str = Field(..., description="Original image filename that was processed")
+    document_id: Optional[str] = Field(None, description="Durable source document identifier")
+    source_page: Optional[int] = Field(None, description="Original PDF page represented by this result")
+    source_page_count: Optional[int] = Field(None, description="Total pages in the original PDF")
     size_bytes: Optional[int] = Field(None, description="File size in bytes")
     status: Optional[str] = Field(None, description="File-level processing status")
-    document_mode: Optional[str] = Field(None, description="Document mode used for extraction")
+    document_mode: Optional[DocumentMode] = Field(None, description="Document mode used for extraction")
     requires_review: Optional[bool] = Field(None, description="Whether this file has review flags")
     confidence_score: Optional[float] = Field(None, description="Approximate confidence score for UI review")
     review_flags: List[Dict[str, Any]] = Field(default_factory=list, description="Areas that should be checked")

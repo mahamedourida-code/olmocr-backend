@@ -174,10 +174,16 @@ async def process_single_image_simple(
     redis = await get_redis_service()
     image_id = _image_id_for(img, img_index)
     file_id = _deterministic_file_id(job_id, image_id)
+    document_id = img.get('document_id')
+    source_storage_path = img.get('source_storage_path')
+    source_content_type = img.get('source_content_type')
+    source_page = img.get('source_page')
+    source_page_count = img.get('source_page_count')
+    source_sha256 = img.get('source_sha256')
 
     try:
         existing_result = await redis.get_job_image_result(job_id, image_id)
-        if existing_result and existing_result.get('status') == 'success':
+        if existing_result and existing_result.get('status') == 'success' and not img.get("force_reprocess"):
             file_info = existing_result.get('file_info') or existing_result
             if file_info.get('file_id') and file_info.get('storage_path'):
                 logger.info(f"[Job {job_id}] Skipping image {image_id}; completed result already exists")
@@ -195,10 +201,9 @@ async def process_single_image_simple(
         if image_data.startswith('data:'):
             image_data = image_data.split(',', 1)[1]
         output_format = str(img.get('output_format') or 'xlsx').lower()
-        document_mode = str(img.get('document_mode') or 'table').lower()
-        wants_text_output = output_format in {'txt', 'text', 'plain_text'}
-        wants_bank_statement = document_mode == 'bank_statement'
-        wants_invoice_receipt = document_mode == 'invoice_receipt'
+        requested_document_mode = str(img.get('document_mode') or 'table').lower()
+        document_mode = requested_document_mode
+        classification_data = None
 
         # Extract with OlmOCR - pass base64 string directly.
         # No need to decode→encode, olmocr service handles both formats
@@ -214,8 +219,92 @@ async def process_single_image_simple(
             raise RuntimeError("OCR capacity is busy. Please retry shortly.")
 
         try:
+            if requested_document_mode == "auto":
+                classification_data = await olmocr.classify_document_from_image(image_data)
+                suggested_mode = classification_data.get("document_type")
+                confidence = float(classification_data.get("confidence") or 0)
+                if (
+                    (source_page_count or 0) > 1
+                    or suggested_mode == "needs_manual_selection"
+                    or confidence < settings.auto_detection_confidence_threshold
+                ):
+                    if suggested_mode != "needs_manual_selection":
+                        classification_data["suggested_type"] = suggested_mode
+                    classification_data["document_type"] = "needs_manual_selection"
+                    classification_data["review_reason"] = (
+                        "Select one extraction mode for this multi-page document before processing."
+                        if (source_page_count or 0) > 1
+                        else classification_data.get("review_reason")
+                        or "Document type confidence is too low for automatic extraction."
+                    )
+                    document_mode = "needs_manual_selection"
+                else:
+                    document_mode = suggested_mode
+
+                if document_id:
+                    supabase = get_supabase_service()
+                    await supabase.store_job_document_detection(
+                        document_id=document_id,
+                        processing_unit_id=image_id,
+                        detection=classification_data,
+                        resolved_mode=None if document_mode == "needs_manual_selection" else document_mode,
+                    )
+
+                if document_mode == "needs_manual_selection":
+                    review_flags = [{
+                        "code": "classification_needs_review",
+                        "area": "document_mode",
+                        "note": classification_data["review_reason"],
+                    }]
+                    if document_id:
+                        await supabase.upsert_document_extraction({
+                            "document_id": document_id,
+                            "job_id": job_id,
+                            "processing_unit_id": image_id,
+                            "status": "needs_review",
+                            "structured_data": {"classification": classification_data},
+                            "raw_structured_data": {"classification": classification_data},
+                            "reviewed_data": {"classification": classification_data},
+                            "review_status": "needs_review",
+                            "validation_flags": review_flags,
+                            "edited": False,
+                            "metadata": {
+                                "source_storage_path": source_storage_path,
+                                "source_content_type": source_content_type,
+                                "source_filename": img.get('original_filename') or img.get('filename'),
+                                "source_page": source_page,
+                                "source_page_count": source_page_count,
+                                "source_sha256": source_sha256,
+                                "classification": classification_data,
+                            },
+                        })
+                    return {
+                        "status": "needs_review",
+                        "image_id": image_id,
+                        "filename": img.get("filename"),
+                        "document_id": document_id,
+                        "document_mode": document_mode,
+                        "requires_review": True,
+                        "review_flags": review_flags,
+                        "classification": classification_data,
+                    }
+
+            if document_mode == 'table' and output_format in {'txt', 'text', 'plain_text'}:
+                output_format = 'xlsx'
+            wants_text_output = output_format in {'txt', 'text', 'plain_text'}
+            wants_bank_statement = document_mode == 'bank_statement'
+            wants_invoice = document_mode == 'invoice'
+            wants_receipt = document_mode == 'receipt'
+            wants_notes = document_mode == 'notes'
+
             if wants_bank_statement:
                 bank_statement_data = await olmocr.extract_bank_statement_from_image(image_data)
+            elif wants_invoice:
+                invoice_data = await olmocr.extract_invoice_from_image(image_data)
+            elif wants_receipt:
+                receipt_data = await olmocr.extract_receipt_from_image(image_data)
+            elif wants_notes:
+                notes_data = await olmocr.extract_notes_from_image(image_data)
             elif wants_text_output:
                 text_data = await olmocr.extract_text_from_image(image_data)
             else:
@@ -227,18 +316,69 @@ async def process_single_image_simple(
         original_filename = img.get('original_filename') or img.get('filename', f"image_{image_id}")
         base_name = original_filename.split('.')[0] if '.' in original_filename else original_filename
         if wants_bank_statement:
-            output_data = excel.bank_statement_to_xlsx(bank_statement_data, "Statement")
-            output_filename = f"{base_name}_{_safe_filename_part(image_id)}_bank_statement.xlsx"
-            output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if output_format == "csv":
+                output_data = excel.bank_statement_transactions_to_csv(bank_statement_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_transactions.csv"
+                output_content_type = "text/csv; charset=utf-8"
+            else:
+                output_data = excel.bank_statement_to_xlsx(bank_statement_data, "Statement")
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_bank_statement.xlsx"
+                output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif wants_invoice:
+            if output_format == "csv":
+                output_data = excel.invoice_line_items_to_csv(invoice_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_invoice_line_items.csv"
+                output_content_type = "text/csv; charset=utf-8"
+            else:
+                output_data = excel.invoice_to_xlsx(invoice_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_invoice.xlsx"
+                output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif wants_receipt:
+            if output_format == "csv":
+                output_data = excel.receipt_line_items_to_csv(receipt_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_receipt.csv"
+                output_content_type = "text/csv; charset=utf-8"
+            else:
+                output_data = excel.receipt_to_xlsx(receipt_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_receipt.xlsx"
+                output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif wants_notes:
+            has_detected_tables = bool(notes_data.get("tables")) if isinstance(notes_data, dict) else False
+            if output_format in {"xlsx", "csv"} and not has_detected_tables:
+                notes_data.setdefault("review_flags", []).append({
+                    "code": "no_detected_table",
+                    "area": "tables",
+                    "note": "No table was detected in this notes page; readable text was exported instead.",
+                })
+                output_data = excel.notes_text_to_txt(notes_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_notes.txt"
+                output_content_type = "text/plain; charset=utf-8"
+            elif output_format == "csv":
+                output_data = excel.notes_tables_to_csv(notes_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_notes_tables.csv"
+                output_content_type = "text/csv; charset=utf-8"
+            elif output_format == "xlsx":
+                output_data = excel.notes_tables_to_xlsx(notes_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_notes_tables.xlsx"
+                output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            else:
+                output_data = excel.notes_text_to_txt(notes_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_notes.txt"
+                output_content_type = "text/plain; charset=utf-8"
         elif wants_text_output:
             output_data = text_data.encode('utf-8')
             output_filename = f"{base_name}_{_safe_filename_part(image_id)}_text.txt"
             output_content_type = "text/plain; charset=utf-8"
         else:
-            output_data = excel.csv_to_xlsx(csv_data, f"Table_{image_id}")
-            suffix = "invoice_receipt" if wants_invoice_receipt else "processed"
-            output_filename = f"{base_name}_{_safe_filename_part(image_id)}_{suffix}.xlsx"
-            output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if document_mode == "table" and output_format == "csv":
+                output_data = excel.table_to_csv(csv_data)
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_table.csv"
+                output_content_type = "text/csv; charset=utf-8"
+            else:
+                output_data = excel.csv_to_xlsx(csv_data, f"Table_{image_id}")
+                suffix = document_mode if document_mode in {'invoice', 'receipt', 'invoice_receipt'} else "processed"
+                output_filename = f"{base_name}_{_safe_filename_part(image_id)}_{suffix}.xlsx"
+                output_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
         # Save file with a deterministic file_id so retries overwrite, not duplicate.
         file_id = storage.save_result_file_sync(
@@ -271,12 +411,17 @@ async def process_single_image_simple(
                     "filename": output_filename,
                     "content_type": output_content_type,
                     "job_id": job_id,
+                    "document_id": document_id,
                     "session_id": session_id,
                     "user_id": user_id or "",
                     "image_id": image_id,
                     "file_id": file_id,
                     "size_bytes": len(output_data),
                     "document_mode": document_mode,
+                    "selected_mode": requested_document_mode,
+                    "detected_mode": classification_data.get("document_type") if classification_data else None,
+                    "detection_confidence": classification_data.get("confidence") if classification_data else None,
+                    "detection_review_reason": classification_data.get("review_reason") if classification_data else None,
                     "completed_at": datetime.utcnow().isoformat()
                 }
                 await redis.set_cache(f"file:{file_id}", file_metadata, settings.file_retention_seconds)
@@ -284,12 +429,41 @@ async def process_single_image_simple(
         except Exception as upload_error:
             logger.warning(f"[Job {job_id}] Supabase result upload failed: {upload_error}")
 
-        review_flags = bank_statement_data.get("review", []) if wants_bank_statement and isinstance(bank_statement_data, dict) else []
+        review_flags = (
+            bank_statement_data.get("review_flags", [])
+            if wants_bank_statement and isinstance(bank_statement_data, dict)
+            else invoice_data.get("review_flags", [])
+            if wants_invoice and isinstance(invoice_data, dict)
+            else receipt_data.get("review_flags", [])
+            if wants_receipt and isinstance(receipt_data, dict)
+            else notes_data.get("review_flags", [])
+            if wants_notes and isinstance(notes_data, dict)
+            else []
+        )
         requires_review = bool(review_flags)
+        structured_data = (
+            bank_statement_data
+            if wants_bank_statement
+            else invoice_data
+            if wants_invoice
+            else receipt_data
+            if wants_receipt
+            else notes_data
+            if wants_notes
+            else {"text": text_data}
+            if wants_text_output
+            else {"csv": csv_data}
+        )
+        if classification_data:
+            structured_data = {
+                **structured_data,
+                "_classification": classification_data,
+            }
 
         file_record = {
             'file_id': file_id,
             'job_id': job_id,
+            'document_id': document_id,
             'filename': output_filename,
             'original_filename': original_filename,
             'image_id': image_id,
@@ -300,10 +474,16 @@ async def process_single_image_simple(
             'user_id': user_id or "",
             'content_type': output_content_type,
             'document_mode': document_mode,
+            'selected_mode': requested_document_mode,
+            'detected_mode': classification_data.get("document_type") if classification_data else None,
+            'detection_confidence': classification_data.get("confidence") if classification_data else None,
+            'detection_review_reason': classification_data.get("review_reason") if classification_data else None,
             'status': "completed",
             'requires_review': requires_review,
             'review_flags': review_flags,
             'confidence_score': 72 if requires_review else 92,
+            'source_page': source_page,
+            'source_page_count': source_page_count,
             'expires_at': (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
             'completed_at': datetime.utcnow().isoformat()
         }
@@ -312,6 +492,35 @@ async def process_single_image_simple(
             try:
                 durable_file = await supabase.upsert_job_file(file_record)
                 file_record.update(durable_file)
+                if document_id:
+                    await supabase.upsert_document_extraction({
+                        "document_id": document_id,
+                        "job_id": job_id,
+                        "processing_unit_id": image_id,
+                        "result_file_id": file_id,
+                        "status": "completed",
+                        "structured_data": structured_data,
+                        "raw_structured_data": structured_data,
+                        "reviewed_data": structured_data,
+                        "review_status": "needs_review" if requires_review else "ready",
+                        "validation_flags": review_flags,
+                        "edited": False,
+                        "metadata": {
+                            "source_storage_path": source_storage_path,
+                            "source_content_type": source_content_type,
+                            "source_filename": original_filename,
+                            "source_page": source_page,
+                            "source_page_count": source_page_count,
+                            "source_sha256": source_sha256,
+                            "output_filename": output_filename,
+                            "output_content_type": output_content_type,
+                            "selected_mode": requested_document_mode,
+                            "resolved_mode": document_mode,
+                            "classification": classification_data,
+                        },
+                    })
+                    await supabase.finalize_job_document_statuses(job_id)
+                    await supabase.refresh_document_duplicate_warnings(job_id, document_id)
             except Exception as metadata_error:
                 logger.error(f"[Job {job_id}] Failed to store durable file metadata for {file_id}: {metadata_error}")
                 raise
@@ -390,6 +599,9 @@ async def process_single_image_simple(
             download_url=f"/api/v1/download/{file_id}",
             filename=output_filename,
             image_id=image_id,
+            document_id=document_id,
+            source_page=source_page,
+            source_page_count=source_page_count,
             size_bytes=len(output_data),
             status="completed",
             document_mode=document_mode,
@@ -447,6 +659,32 @@ async def process_single_image_simple(
                 })
         except Exception as redis_error:
             logger.debug(f"Failed to update error in Redis: {redis_error}")
+
+        if document_id:
+            try:
+                supabase = get_supabase_service()
+                await supabase.upsert_document_extraction({
+                    "document_id": document_id,
+                    "job_id": job_id,
+                    "processing_unit_id": image_id,
+                    "status": "failed",
+                    "structured_data": {},
+                    "raw_structured_data": {},
+                    "reviewed_data": {},
+                    "review_status": "needs_review",
+                    "validation_flags": [{"code": "processing_failed", "message": error_msg}],
+                    "edited": False,
+                    "metadata": {
+                        "source_storage_path": source_storage_path,
+                        "source_content_type": source_content_type,
+                        "source_filename": img.get('original_filename') or img.get('filename'),
+                        "source_page": source_page,
+                        "source_page_count": source_page_count,
+                        "source_sha256": source_sha256,
+                    },
+                })
+            except Exception as metadata_error:
+                logger.debug(f"Failed to persist extraction failure state: {metadata_error}")
 
         return {
             'status': 'error',
@@ -640,6 +878,9 @@ async def process_batch_simple(
                 download_url=f"/api/v1/download/{file_data['file_id']}",
                 filename=file_data['filename'],
                 image_id=file_data.get('image_id'),
+                document_id=file_data.get('document_id'),
+                source_page=file_data.get('source_page'),
+                source_page_count=file_data.get('source_page_count'),
                 size_bytes=file_data.get('size_bytes'),
                 status=file_data.get('status'),
                 document_mode=file_data.get('document_mode'),

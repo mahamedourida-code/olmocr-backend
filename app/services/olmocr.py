@@ -6,6 +6,7 @@ import random
 import io
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Optional, List, Dict, Any, Union
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
@@ -359,6 +360,247 @@ class OlmOCRService:
             logger.error(f"OlmOCR text extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract text: {str(e)}")
 
+    async def classify_document_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+        """Classify a document for extractor routing without inventing an accounting type."""
+        try:
+            if isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                img_b64_str = image_data.split(',', 1)[1] if image_data.startswith('data:') else image_data
+                image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                page_images = self._render_pdf_pages_to_png(image_bytes)
+                image_bytes = page_images[0]
+
+            await self._apply_rate_limiting()
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Classify this uploaded document for extraction routing only. "
+                                "Choose exactly one document_type: invoice, receipt, bank_statement, table, notes, "
+                                "or needs_manual_selection. Use invoice only for supplier bills with invoice fields; "
+                                "receipt only for proof of purchase; bank_statement only for bank account transaction statements; "
+                                "table for a visible grid/list intended as rows and columns; notes for narrative handwriting or prose. "
+                                "If the image is unclear, mixed, or could be routed incorrectly, choose needs_manual_selection. "
+                                "confidence must be between 0 and 1. review_reason must briefly explain uncertainty or be empty "
+                                "when the type is clear. Do not extract fields and do not infer accounting treatment."
+                            )
+                        }
+                    ]
+                }
+            ]
+            classification_schema = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "document_classification",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "document_type": {
+                                "type": "string",
+                                "enum": ["invoice", "receipt", "bank_statement", "table", "notes", "needs_manual_selection"]
+                            },
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            "review_reason": {"type": "string"}
+                        },
+                        "required": ["document_type", "confidence", "review_reason"],
+                        "additionalProperties": False
+                    }
+                }
+            }
+
+            try:
+                response: ChatCompletion = await self._make_api_call(
+                    messages,
+                    max_tokens=300,
+                    response_format=classification_schema,
+                    temperature=0,
+                )
+            except Exception as schema_error:
+                if "response_format" not in str(schema_error).lower() and "schema" not in str(schema_error).lower():
+                    raise
+                response = await self._make_api_call(
+                    messages,
+                    max_tokens=300,
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
+
+            if not response.choices or not response.choices[0].message.content:
+                raise OlmOCRError("Empty document classification response")
+
+            return self._parse_document_classification(
+                self._clean_ocr_response(response.choices[0].message.content.strip())
+            )
+        except OlmOCRError:
+            raise
+        except Exception as e:
+            logger.error(f"Document classification error: {str(e)}")
+            raise OlmOCRError(f"Failed to classify document: {str(e)}")
+
+    async def extract_notes_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+        """Extract handwritten narrative text and any visibly detected tables."""
+        try:
+            if isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                img_b64_str = image_data.split(',', 1)[1] if image_data.startswith('data:') else image_data
+                image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                page_results = []
+                for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
+                    page_result = await self.extract_notes_from_image(page_image)
+                    page_result["page"] = page_number
+                    page_results.append(page_result)
+                return self._merge_notes_pages(page_results)
+
+            await self._apply_rate_limiting()
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'RGBA':
+                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                        rgb_img.paste(img, mask=img.split()[3] if len(img.split()) > 3 else None)
+                        img = rgb_img
+                    output_buffer = io.BytesIO()
+                    img.save(output_buffer, format='JPEG', quality=95)
+                    output_buffer.seek(0)
+                    image_bytes = output_buffer.read()
+                img.close()
+            except Exception as e:
+                logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
+
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract handwritten or typed notes for human review only. "
+                            "Return the readable narrative in reading order, preserving headings and line breaks. "
+                            "If a visible table exists, extract only its visible columns and rows. "
+                            "Do not invent a table from prose, summarize, classify accounting, or post data anywhere. "
+                            "Use empty arrays when no table is visible and add review notes only for unclear text or cells."
+                        ),
+                    },
+                ],
+            }]
+            notes_schema = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "notes_extraction",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "readable_text": {"type": "string"},
+                            "tables": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "title": {"type": "string"},
+                                        "columns": {"type": "array", "items": {"type": "string"}},
+                                        "rows": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {"cells": {"type": "array", "items": {"type": "string"}}},
+                                                "required": ["cells"],
+                                                "additionalProperties": False,
+                                            },
+                                        },
+                                    },
+                                    "required": ["title", "columns", "rows"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "review_notes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"area": {"type": "string"}, "note": {"type": "string"}},
+                                    "required": ["area", "note"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["readable_text", "tables", "review_notes"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+
+            logger.info("Making OlmOCR notes extraction request")
+            try:
+                response: ChatCompletion = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format=notes_schema,
+                    temperature=0,
+                )
+            except Exception as structured_error:
+                error_text = str(structured_error).lower()
+                if "response_format" not in error_text and "json_schema" not in error_text and "schema" not in error_text:
+                    raise
+                logger.warning("Notes schema response format unavailable; retrying dedicated JSON request")
+                response = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
+
+            if not response.choices or not response.choices[0].message.content:
+                raise OlmOCRError("Empty response from OlmOCR API")
+            return self._parse_notes_json(self._clean_ocr_response(response.choices[0].message.content.strip()))
+        except OlmOCRError:
+            raise
+        except Exception as e:
+            logger.error(f"OlmOCR notes extraction error: {str(e)}")
+            raise OlmOCRError(f"Failed to extract notes: {str(e)}")
+
+    def _parse_document_classification(self, content: str) -> Dict[str, Any]:
+        allowed_types = {"invoice", "receipt", "bank_statement", "table", "notes", "needs_manual_selection"}
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return {
+                "document_type": "needs_manual_selection",
+                "confidence": 0.0,
+                "review_reason": "The document type could not be parsed reliably."
+            }
+
+        document_type = str(parsed.get("document_type") or "needs_manual_selection").strip().lower()
+        if document_type not in allowed_types:
+            document_type = "needs_manual_selection"
+        try:
+            confidence = min(1.0, max(0.0, float(parsed.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        review_reason = str(parsed.get("review_reason") or "").strip()
+        return {
+            "document_type": document_type,
+            "confidence": confidence,
+            "review_reason": review_reason,
+        }
+
     async def extract_bank_statement_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
         """Extract visible bank statement text and transactions into a structured review object."""
         try:
@@ -409,21 +651,99 @@ class OlmOCRService:
                             "type": "text",
                             "text": (
                                 "You are extracting a bank statement for OCR review only. "
-                                "Do not calculate, reconcile, categorize, infer missing transactions, or give advice. "
-                                "Return only valid JSON with these keys: "
-                                "summary: an object of visible statement-level fields such as bank_name, account_holder, account_number, statement_period, currency, opening_balance, closing_balance if visible; "
-                                "transactions: an array of objects with only visible columns such as date, description, debit, credit, balance, reference; "
-                                "raw_text: all visible non-table text and labels in reading order; "
-                                "review: an array of {area,note} for uncertain, unclear, or missing visible fields. "
-                                "If a value is not visible, leave it blank. Preserve original wording and number formatting."
+                                "Do not reconcile, categorize, post transactions, infer missing transactions, or give advice. "
+                                "Return JSON matching the supplied schema. Use empty strings when values or printed pagination are not visible. "
+                                "Keep every visible transaction row in document order. "
+                                "Set readable to false only when a row cannot be reliably transcribed, and describe the issue in review_note. "
+                                "Use review_notes only for visible OCR uncertainty such as an unreadable row or a visibly missing statement page. "
+                                "Preserve original wording and number formatting."
                             )
                         }
                     ]
                 }
             ]
+            bank_statement_schema = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "bank_statement_extraction",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "account_holder": {"type": "string"},
+                            "bank_name": {"type": "string"},
+                            "account_number": {"type": "string"},
+                            "period": {"type": "string"},
+                            "currency": {"type": "string"},
+                            "opening_balance": {"type": "string"},
+                            "closing_balance": {"type": "string"},
+                            "printed_page_number": {"type": "string"},
+                            "printed_page_count": {"type": "string"},
+                            "transactions": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "date": {"type": "string"},
+                                        "description": {"type": "string"},
+                                        "reference": {"type": "string"},
+                                        "debit": {"type": "string"},
+                                        "credit": {"type": "string"},
+                                        "balance": {"type": "string"},
+                                        "readable": {"type": "boolean"},
+                                        "review_note": {"type": "string"},
+                                    },
+                                    "required": [
+                                        "date", "description", "reference", "debit",
+                                        "credit", "balance", "readable", "review_note",
+                                    ],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "raw_text": {"type": "string"},
+                            "review_notes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "area": {"type": "string"},
+                                        "note": {"type": "string"},
+                                    },
+                                    "required": ["area", "note"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": [
+                            "account_holder", "bank_name", "account_number", "period",
+                            "currency", "opening_balance", "closing_balance",
+                            "printed_page_number", "printed_page_count", "transactions",
+                            "raw_text", "review_notes",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            }
 
             logger.info("Making OlmOCR bank statement extraction request")
-            response: ChatCompletion = await self._make_api_call(messages, max_tokens=5000)
+            try:
+                response: ChatCompletion = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format=bank_statement_schema,
+                    temperature=0,
+                )
+            except Exception as structured_error:
+                error_text = str(structured_error).lower()
+                if "response_format" not in error_text and "json_schema" not in error_text and "schema" not in error_text:
+                    raise
+                logger.warning("Bank statement schema response format unavailable; retrying dedicated JSON request")
+                response = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
 
             if not response.choices or not response.choices[0].message.content:
                 raise OlmOCRError("Empty response from OlmOCR API")
@@ -436,55 +756,849 @@ class OlmOCRService:
             logger.error(f"OlmOCR bank statement extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract bank statement: {str(e)}")
 
-    def _parse_bank_statement_json(self, content: str) -> Dict[str, Any]:
+    async def extract_invoice_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+        """Extract visible invoice fields and line items for review and export."""
         try:
-            return json.loads(content)
+            if isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                img_b64_str = image_data.split(',', 1)[1] if image_data.startswith('data:') else image_data
+                image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                page_results = []
+                for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
+                    page_result = await self.extract_invoice_from_image(page_image)
+                    page_result["page"] = page_number
+                    page_results.append(page_result)
+                return self._merge_invoice_pages(page_results)
+
+            await self._apply_rate_limiting()
+
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'RGBA':
+                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                        rgb_img.paste(img, mask=img.split()[3] if len(img.split()) > 3 else None)
+                        img = rgb_img
+                    output_buffer = io.BytesIO()
+                    img.save(output_buffer, format='JPEG', quality=95)
+                    output_buffer.seek(0)
+                    image_bytes = output_buffer.read()
+                img.close()
+            except Exception as e:
+                logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
+
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract only visible invoice data for human review. "
+                                "Do not infer missing values, calculate missing totals, or classify accounting. "
+                                "Return JSON matching the supplied schema. Use empty strings when fields are not visible. "
+                                "Preserve visible number and date formatting. For line_items, include one item per visible invoice row."
+                            )
+                        }
+                    ]
+                }
+            ]
+            invoice_schema = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "invoice_extraction",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "vendor_name": {"type": "string"},
+                            "supplier_tax_vat_id": {"type": "string"},
+                            "invoice_number": {"type": "string"},
+                            "invoice_date": {"type": "string"},
+                            "due_date": {"type": "string"},
+                            "po_reference": {"type": "string"},
+                            "subtotal": {"type": "string"},
+                            "tax_vat_amount": {"type": "string"},
+                            "total": {"type": "string"},
+                            "currency": {"type": "string"},
+                            "line_items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "description": {"type": "string"},
+                                        "quantity": {"type": "string"},
+                                        "unit_price": {"type": "string"},
+                                        "tax_rate": {"type": "string"},
+                                        "line_total": {"type": "string"},
+                                    },
+                                    "required": ["description", "quantity", "unit_price", "tax_rate", "line_total"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": [
+                            "vendor_name", "supplier_tax_vat_id", "invoice_number",
+                            "invoice_date", "due_date", "po_reference", "subtotal",
+                            "tax_vat_amount", "total", "currency", "line_items",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+
+            logger.info("Making OlmOCR invoice extraction request")
+            try:
+                response: ChatCompletion = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format=invoice_schema,
+                    temperature=0,
+                )
+            except Exception as structured_error:
+                error_text = str(structured_error).lower()
+                if "response_format" not in error_text and "json_schema" not in error_text and "schema" not in error_text:
+                    raise
+                logger.warning("Invoice schema response format unavailable; retrying dedicated invoice JSON request")
+                response = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
+
+            if not response.choices or not response.choices[0].message.content:
+                raise OlmOCRError("Empty response from OlmOCR API")
+
+            raw_content = self._clean_ocr_response(response.choices[0].message.content.strip())
+            return self._parse_invoice_json(raw_content)
+        except OlmOCRError:
+            raise
+        except Exception as e:
+            logger.error(f"OlmOCR invoice extraction error: {str(e)}")
+            raise OlmOCRError(f"Failed to extract invoice: {str(e)}")
+
+    async def extract_receipt_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+        """Extract visible receipt fields and line items for expense review."""
+        try:
+            if isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                img_b64_str = image_data.split(',', 1)[1] if image_data.startswith('data:') else image_data
+                image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                page_results = []
+                for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
+                    page_result = await self.extract_receipt_from_image(page_image)
+                    page_result["page"] = page_number
+                    page_results.append(page_result)
+                return self._merge_receipt_pages(page_results)
+
+            await self._apply_rate_limiting()
+
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'RGBA':
+                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                        rgb_img.paste(img, mask=img.split()[3] if len(img.split()) > 3 else None)
+                        img = rgb_img
+                    output_buffer = io.BytesIO()
+                    img.save(output_buffer, format='JPEG', quality=95)
+                    output_buffer.seek(0)
+                    image_bytes = output_buffer.read()
+                img.close()
+            except Exception as e:
+                logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
+
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract only visible receipt data for human expense review. "
+                                "Do not infer missing values, categorize expenses, create bills, or calculate missing totals. "
+                                "Return JSON matching the supplied schema. Use empty strings when fields are not visible. "
+                                "Preserve visible number and date formatting. For line_items, include one item per visible receipt row."
+                            )
+                        }
+                    ]
+                }
+            ]
+            receipt_schema = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "receipt_extraction",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "merchant": {"type": "string"},
+                            "date": {"type": "string"},
+                            "payment_method": {"type": "string"},
+                            "currency": {"type": "string"},
+                            "subtotal": {"type": "string"},
+                            "tax_vat_amount": {"type": "string"},
+                            "total": {"type": "string"},
+                            "discount": {"type": "string"},
+                            "tip": {"type": "string"},
+                            "line_items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "description": {"type": "string"},
+                                        "quantity": {"type": "string"},
+                                        "unit_price": {"type": "string"},
+                                        "tax_rate": {"type": "string"},
+                                        "line_total": {"type": "string"},
+                                    },
+                                    "required": ["description", "quantity", "unit_price", "tax_rate", "line_total"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": [
+                            "merchant", "date", "payment_method", "currency", "subtotal",
+                            "tax_vat_amount", "total", "discount", "tip", "line_items",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+
+            logger.info("Making OlmOCR receipt extraction request")
+            try:
+                response: ChatCompletion = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format=receipt_schema,
+                    temperature=0,
+                )
+            except Exception as structured_error:
+                error_text = str(structured_error).lower()
+                if "response_format" not in error_text and "json_schema" not in error_text and "schema" not in error_text:
+                    raise
+                logger.warning("Receipt schema response format unavailable; retrying dedicated receipt JSON request")
+                response = await self._make_api_call(
+                    messages,
+                    max_tokens=5000,
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                )
+
+            if not response.choices or not response.choices[0].message.content:
+                raise OlmOCRError("Empty response from OlmOCR API")
+
+            raw_content = self._clean_ocr_response(response.choices[0].message.content.strip())
+            return self._parse_receipt_json(raw_content)
+        except OlmOCRError:
+            raise
+        except Exception as e:
+            logger.error(f"OlmOCR receipt extraction error: {str(e)}")
+            raise OlmOCRError(f"Failed to extract receipt: {str(e)}")
+
+    def _parse_bank_statement_json(self, content: str) -> Dict[str, Any]:
+        parsed: Dict[str, Any] = {}
+        parse_failed = False
+        try:
+            loaded = json.loads(content)
+            parsed = loaded if isinstance(loaded, dict) else {}
         except json.JSONDecodeError:
             match = re.search(r"\{.*\}", content, flags=re.DOTALL)
             if match:
                 try:
-                    return json.loads(match.group(0))
+                    loaded = json.loads(match.group(0))
+                    parsed = loaded if isinstance(loaded, dict) else {}
                 except json.JSONDecodeError:
-                    pass
-        return {
-            "summary": {},
-            "transactions": [],
-            "raw_text": content,
-            "review": [{"area": "JSON parsing", "note": "OCR returned text instead of structured JSON. Review Raw Text sheet."}],
+                    parse_failed = True
+            else:
+                parse_failed = True
+
+        legacy_summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
+        field_aliases = {
+            "account_holder": ["account_holder", "holder_name"],
+            "bank_name": ["bank_name", "bank"],
+            "account_number": ["account_number", "account_no"],
+            "period": ["period", "statement_period"],
+            "currency": ["currency"],
+            "opening_balance": ["opening_balance"],
+            "closing_balance": ["closing_balance"],
+            "printed_page_number": ["printed_page_number", "page_number"],
+            "printed_page_count": ["printed_page_count", "page_count", "total_pages"],
         }
+        normalized: Dict[str, Any] = {}
+        for field, aliases in field_aliases.items():
+            value = next(
+                (
+                    parsed.get(alias)
+                    for alias in aliases
+                    if parsed.get(alias) not in (None, "")
+                ),
+                "",
+            )
+            if value in (None, ""):
+                value = next(
+                    (
+                        legacy_summary.get(alias)
+                        for alias in aliases
+                        if legacy_summary.get(alias) not in (None, "")
+                    ),
+                    "",
+                )
+            normalized[field] = str(value or "").strip()
+
+        normalized["transactions"] = []
+        for row in parsed.get("transactions") or []:
+            if not isinstance(row, dict):
+                continue
+            readable_value = row.get("readable", True)
+            readable = readable_value if isinstance(readable_value, bool) else str(readable_value).lower() not in {"false", "no", "0"}
+            normalized["transactions"].append({
+                "date": str(row.get("date") or "").strip(),
+                "description": str(row.get("description") or "").strip(),
+                "reference": str(row.get("reference") or "").strip(),
+                "debit": str(row.get("debit") or "").strip(),
+                "credit": str(row.get("credit") or "").strip(),
+                "balance": str(row.get("balance") or "").strip(),
+                "readable": readable,
+                "review_note": str(row.get("review_note") or row.get("note") or "").strip(),
+            })
+        normalized["raw_text"] = str(parsed.get("raw_text") or (content if parse_failed else "")).strip()
+        review_notes = parsed.get("review_notes") or parsed.get("review") or []
+        normalized["review_notes"] = [
+            {
+                "area": str(item.get("area") or "statement").strip(),
+                "note": str(item.get("note") or "").strip(),
+            }
+            for item in review_notes
+            if isinstance(item, dict) and str(item.get("note") or "").strip()
+        ]
+        normalized["summary"] = {
+            "account_holder": normalized["account_holder"],
+            "bank_name": normalized["bank_name"],
+            "account_number": normalized["account_number"],
+            "statement_period": normalized["period"],
+            "currency": normalized["currency"],
+            "opening_balance": normalized["opening_balance"],
+            "closing_balance": normalized["closing_balance"],
+        }
+        normalized["review_flags"] = self._validate_bank_statement_data(normalized)
+        if parse_failed:
+            normalized["review_flags"].append({
+                "code": "unstructured_statement_response",
+                "area": "bank_statement",
+                "note": "Structured bank statement response could not be parsed. Review the source document.",
+            })
+        return normalized
 
     def _merge_bank_statement_pages(self, page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        merged_summary: Dict[str, Any] = {}
+        fields = [
+            "account_holder", "bank_name", "account_number", "period",
+            "currency", "opening_balance", "closing_balance",
+        ]
+        merged: Dict[str, Any] = {field: "" for field in fields}
         transactions: List[Dict[str, Any]] = []
         raw_text_parts: List[str] = []
-        review: List[Dict[str, Any]] = []
+        review_notes: List[Dict[str, Any]] = []
+        page_review_flags: List[Dict[str, str]] = []
+        printed_page_numbers: List[int] = []
+        printed_page_count: Optional[int] = None
 
         for result in page_results:
             page = result.get("page")
-            summary = result.get("summary") or {}
-            if isinstance(summary, dict):
-                for key, value in summary.items():
-                    if value and not merged_summary.get(key):
-                        merged_summary[key] = value
+            for field in fields:
+                if result.get(field) and not merged[field]:
+                    merged[field] = result[field]
             for row in result.get("transactions") or []:
                 if isinstance(row, dict):
                     transactions.append({"page": page, **row})
             raw_text = result.get("raw_text")
             if raw_text:
                 raw_text_parts.append(f"Page {page}\n{raw_text}")
-            for item in result.get("review") or []:
+            for item in result.get("review_notes") or []:
                 if isinstance(item, dict):
-                    review.append({"page": page, **item})
+                    review_notes.append({"page": page, **item})
+            for flag in result.get("review_flags") or []:
+                if isinstance(flag, dict) and flag.get("code") and flag.get("note"):
+                    page_review_flags.append({
+                        "code": str(flag["code"]),
+                        "area": str(flag.get("area") or "statement"),
+                        "note": str(flag["note"]),
+                    })
+            detected_page = self._parse_positive_integer(result.get("printed_page_number"))
+            detected_count = self._parse_positive_integer(result.get("printed_page_count"))
+            if detected_page is not None:
+                printed_page_numbers.append(detected_page)
+            if detected_count is not None:
+                printed_page_count = max(printed_page_count or 0, detected_count)
 
-        return {
-            "summary": merged_summary,
-            "transactions": transactions,
-            "raw_text": "\n\n".join(raw_text_parts),
-            "review": review,
+        merged["printed_page_number"] = ""
+        merged["printed_page_count"] = str(printed_page_count or "")
+        merged["transactions"] = transactions
+        merged["raw_text"] = "\n\n".join(raw_text_parts)
+        merged["review_notes"] = review_notes
+        merged["summary"] = {
+            "account_holder": merged["account_holder"],
+            "bank_name": merged["bank_name"],
+            "account_number": merged["account_number"],
+            "statement_period": merged["period"],
+            "currency": merged["currency"],
+            "opening_balance": merged["opening_balance"],
+            "closing_balance": merged["closing_balance"],
         }
-    
+        merged["review_flags"] = self._validate_bank_statement_data(
+            merged,
+            available_printed_pages=printed_page_numbers,
+        )
+        for flag in page_review_flags:
+            self._append_unique_review_flag(
+                merged["review_flags"],
+                flag["code"],
+                flag["area"],
+                flag["note"],
+            )
+        return merged
 
-    async def _make_api_call(self, messages: List[Dict[str, Any]], max_tokens: Optional[int] = None) -> ChatCompletion:
+    def _validate_bank_statement_data(
+        self,
+        statement_data: Dict[str, Any],
+        available_printed_pages: Optional[List[int]] = None,
+    ) -> List[Dict[str, str]]:
+        flags: List[Dict[str, str]] = []
+
+        for note in statement_data.get("review_notes") or []:
+            if not isinstance(note, dict):
+                continue
+            area = str(note.get("area") or "statement").strip()
+            note_text = str(note.get("note") or "").strip()
+            if not note_text:
+                continue
+            lowered = f"{area} {note_text}".lower()
+            if "unread" in lowered or "illegib" in lowered:
+                code = "unreadable_row"
+            elif "missing" in lowered and "page" in lowered:
+                code = "missing_pages"
+            elif "balance" in lowered and any(word in lowered for word in ("mismatch", "inconsisten", "does not match")):
+                code = "balance_sequence_inconsistency"
+            else:
+                code = "statement_review_note"
+            self._append_unique_review_flag(flags, code, area, note_text)
+
+        for index, row in enumerate(statement_data.get("transactions") or [], start=1):
+            if not isinstance(row, dict):
+                continue
+            if row.get("readable") is False:
+                note = str(row.get("review_note") or "Transaction row could not be read reliably.").strip()
+                self._append_unique_review_flag(flags, "unreadable_row", f"transaction_{index}", note)
+
+        expected_pages = self._parse_positive_integer(statement_data.get("printed_page_count"))
+        if expected_pages and available_printed_pages is not None:
+            detected_pages = {page for page in available_printed_pages if 1 <= page <= expected_pages}
+            missing_pages = [str(page) for page in range(1, expected_pages + 1) if page not in detected_pages]
+            if missing_pages:
+                self._append_unique_review_flag(
+                    flags,
+                    "missing_pages",
+                    "pages",
+                    f"Statement indicates missing page(s): {', '.join(missing_pages)}.",
+                )
+
+        transactions = [
+            row for row in statement_data.get("transactions") or []
+            if isinstance(row, dict) and row.get("readable", True) is not False
+        ]
+        previous_balance = self._parse_invoice_amount(statement_data.get("opening_balance"))
+        for index, row in enumerate(transactions, start=1):
+            balance = self._parse_invoice_amount(row.get("balance"))
+            debit = self._parse_invoice_amount(row.get("debit"))
+            credit = self._parse_invoice_amount(row.get("credit"))
+            if previous_balance is not None and balance is not None and (debit is not None or credit is not None):
+                expected_balance = previous_balance - (debit or Decimal("0")) + (credit or Decimal("0"))
+                if abs(expected_balance - balance) > Decimal("0.02"):
+                    self._append_unique_review_flag(
+                        flags,
+                        "balance_sequence_inconsistency",
+                        f"transaction_{index}",
+                        "Visible debit, credit, and running balance values do not follow the displayed sequence.",
+                    )
+            if balance is not None:
+                previous_balance = balance
+
+        closing_balance = self._parse_invoice_amount(statement_data.get("closing_balance"))
+        if previous_balance is not None and closing_balance is not None and transactions:
+            if abs(previous_balance - closing_balance) > Decimal("0.02"):
+                self._append_unique_review_flag(
+                    flags,
+                    "balance_sequence_inconsistency",
+                    "closing_balance",
+                    "The last visible running balance does not match the visible closing balance.",
+                )
+        return flags
+
+    def _append_unique_review_flag(
+        self,
+        flags: List[Dict[str, str]],
+        code: str,
+        area: str,
+        note: str,
+    ) -> None:
+        candidate = {"code": code, "area": area, "note": note}
+        if candidate not in flags:
+            flags.append(candidate)
+
+    def _parse_positive_integer(self, value: Any) -> Optional[int]:
+        match = re.search(r"\d+", str(value or ""))
+        if not match:
+            return None
+        parsed = int(match.group(0))
+        return parsed if parsed > 0 else None
+
+    def _parse_notes_json(self, content: str) -> Dict[str, Any]:
+        parsed: Dict[str, Any] = {}
+        parse_failed = False
+        try:
+            loaded = json.loads(content)
+            parsed = loaded if isinstance(loaded, dict) else {}
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            if match:
+                try:
+                    loaded = json.loads(match.group(0))
+                    parsed = loaded if isinstance(loaded, dict) else {}
+                except json.JSONDecodeError:
+                    parse_failed = True
+            else:
+                parse_failed = True
+
+        tables: List[Dict[str, Any]] = []
+        for table in parsed.get("tables") or []:
+            if not isinstance(table, dict):
+                continue
+            columns = [str(cell or "").strip() for cell in table.get("columns") or []]
+            rows = []
+            for row in table.get("rows") or []:
+                raw_cells = row.get("cells") if isinstance(row, dict) else row
+                if isinstance(raw_cells, list):
+                    rows.append([str(cell or "").strip() for cell in raw_cells])
+            if columns or rows:
+                tables.append({
+                    "title": str(table.get("title") or "").strip(),
+                    "columns": columns,
+                    "rows": rows,
+                })
+        normalized = {
+            "readable_text": str(parsed.get("readable_text") or (content if parse_failed else "")).strip(),
+            "tables": tables,
+            "review_notes": [
+                {
+                    "area": str(note.get("area") or "notes").strip(),
+                    "note": str(note.get("note") or "").strip(),
+                }
+                for note in parsed.get("review_notes") or []
+                if isinstance(note, dict) and str(note.get("note") or "").strip()
+            ],
+        }
+        normalized["review_flags"] = self._validate_notes_data(normalized)
+        if parse_failed:
+            normalized["review_flags"].append({
+                "code": "unstructured_notes_response",
+                "area": "notes",
+                "note": "Structured notes response could not be parsed. Review the readable text output.",
+            })
+        return normalized
+
+    def _merge_notes_pages(self, page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        text_parts: List[str] = []
+        tables: List[Dict[str, Any]] = []
+        review_notes: List[Dict[str, str]] = []
+        page_flags: List[Dict[str, str]] = []
+        for result in page_results:
+            page = result.get("page")
+            if result.get("readable_text"):
+                text_parts.append(f"Page {page}\n{result['readable_text']}")
+            for table in result.get("tables") or []:
+                if isinstance(table, dict):
+                    tables.append({"page": page, **table})
+            for note in result.get("review_notes") or []:
+                if isinstance(note, dict):
+                    review_notes.append({"area": f"page_{page}:{note.get('area', 'notes')}", "note": str(note.get("note") or "")})
+            for flag in result.get("review_flags") or []:
+                if isinstance(flag, dict) and flag.get("code") and flag.get("note"):
+                    page_flags.append(flag)
+        merged = {
+            "readable_text": "\n\n".join(text_parts),
+            "tables": tables,
+            "review_notes": review_notes,
+        }
+        merged["review_flags"] = self._validate_notes_data(merged)
+        for flag in page_flags:
+            self._append_unique_review_flag(merged["review_flags"], str(flag["code"]), str(flag.get("area") or "notes"), str(flag["note"]))
+        return merged
+
+    def _validate_notes_data(self, notes_data: Dict[str, Any]) -> List[Dict[str, str]]:
+        flags: List[Dict[str, str]] = []
+        for note in notes_data.get("review_notes") or []:
+            if not isinstance(note, dict):
+                continue
+            area = str(note.get("area") or "notes").strip()
+            message = str(note.get("note") or "").strip()
+            if not message:
+                continue
+            lowered = f"{area} {message}".lower()
+            code = "unreadable_notes_content" if any(term in lowered for term in ("unread", "unclear", "illegib")) else "notes_review_note"
+            self._append_unique_review_flag(flags, code, area, message)
+        return flags
+
+    def _parse_invoice_json(self, content: str) -> Dict[str, Any]:
+        parsed: Dict[str, Any] = {}
+        parse_failed = False
+        try:
+            loaded = json.loads(content)
+            parsed = loaded if isinstance(loaded, dict) else {}
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            if match:
+                try:
+                    loaded = json.loads(match.group(0))
+                    parsed = loaded if isinstance(loaded, dict) else {}
+                except json.JSONDecodeError:
+                    parse_failed = True
+            else:
+                parse_failed = True
+
+        field_aliases = {
+            "vendor_name": ["vendor_name", "vendor", "supplier_name"],
+            "supplier_tax_vat_id": ["supplier_tax_vat_id", "supplier_tax_id", "vat_id", "tax_id"],
+            "invoice_number": ["invoice_number", "invoice_no", "invoice_id"],
+            "invoice_date": ["invoice_date", "date"],
+            "due_date": ["due_date"],
+            "po_reference": ["po_reference", "po_number", "reference"],
+            "subtotal": ["subtotal", "sub_total"],
+            "tax_vat_amount": ["tax_vat_amount", "tax_amount", "vat_amount", "tax"],
+            "total": ["total", "invoice_total", "grand_total"],
+            "currency": ["currency"],
+        }
+        normalized = {
+            field: next((str(parsed.get(alias) or "").strip() for alias in aliases if parsed.get(alias) not in (None, "")), "")
+            for field, aliases in field_aliases.items()
+        }
+        normalized["line_items"] = []
+        for row in parsed.get("line_items") or []:
+            if not isinstance(row, dict):
+                continue
+            normalized["line_items"].append({
+                "description": str(row.get("description") or "").strip(),
+                "quantity": str(row.get("quantity") or "").strip(),
+                "unit_price": str(row.get("unit_price") or "").strip(),
+                "tax_rate": str(row.get("tax_rate") or row.get("tax") or "").strip(),
+                "line_total": str(row.get("line_total") or row.get("total") or "").strip(),
+            })
+        normalized["review_flags"] = self._validate_invoice_data(normalized)
+        if parse_failed:
+            normalized["review_flags"].append({
+                "code": "unstructured_invoice_response",
+                "area": "invoice",
+                "note": "Structured invoice response could not be parsed. Review the source document.",
+            })
+        return normalized
+
+    def _merge_invoice_pages(self, page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        fields = [
+            "vendor_name", "supplier_tax_vat_id", "invoice_number", "invoice_date",
+            "due_date", "po_reference", "subtotal", "tax_vat_amount", "total", "currency",
+        ]
+        merged: Dict[str, Any] = {field: "" for field in fields}
+        merged["line_items"] = []
+        for result in page_results:
+            page = result.get("page")
+            for field in fields:
+                if result.get(field) and not merged[field]:
+                    merged[field] = result[field]
+            for row in result.get("line_items") or []:
+                if isinstance(row, dict):
+                    merged["line_items"].append({"page": page, **row})
+        merged["review_flags"] = self._validate_invoice_data(merged)
+        return merged
+
+    def _validate_invoice_data(self, invoice_data: Dict[str, Any]) -> List[Dict[str, str]]:
+        flags: List[Dict[str, str]] = []
+        required_fields = [
+            ("vendor_name", "missing_vendor", "Vendor name was not detected."),
+            ("invoice_number", "missing_invoice_number", "Invoice number was not detected."),
+            ("invoice_date", "missing_invoice_date", "Invoice date was not detected."),
+            ("total", "missing_total", "Invoice total was not detected."),
+        ]
+        for field, code, note in required_fields:
+            if not str(invoice_data.get(field) or "").strip():
+                flags.append({"code": code, "area": field, "note": note})
+
+        subtotal = self._parse_invoice_amount(invoice_data.get("subtotal"))
+        tax_amount = self._parse_invoice_amount(invoice_data.get("tax_vat_amount"))
+        total = self._parse_invoice_amount(invoice_data.get("total"))
+        if subtotal is not None and tax_amount is not None and total is not None:
+            if abs((subtotal + tax_amount) - total) > Decimal("0.02"):
+                flags.append({
+                    "code": "subtotal_tax_mismatch",
+                    "area": "total",
+                    "note": "Subtotal plus tax/VAT does not match the visible total.",
+                })
+        return flags
+
+    def _parse_invoice_amount(self, value: Any) -> Optional[Decimal]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        sanitized = re.sub(r"[^\d,.\-]", "", raw)
+        if "," in sanitized and "." in sanitized:
+            if sanitized.rfind(",") > sanitized.rfind("."):
+                sanitized = sanitized.replace(".", "").replace(",", ".")
+            else:
+                sanitized = sanitized.replace(",", "")
+        elif "," in sanitized:
+            last_group = sanitized.rsplit(",", 1)[-1]
+            sanitized = sanitized.replace(",", ".") if len(last_group) in {1, 2} else sanitized.replace(",", "")
+        try:
+            return Decimal(sanitized)
+        except InvalidOperation:
+            return None
+
+    def _parse_receipt_json(self, content: str) -> Dict[str, Any]:
+        parsed: Dict[str, Any] = {}
+        parse_failed = False
+        try:
+            loaded = json.loads(content)
+            parsed = loaded if isinstance(loaded, dict) else {}
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            if match:
+                try:
+                    loaded = json.loads(match.group(0))
+                    parsed = loaded if isinstance(loaded, dict) else {}
+                except json.JSONDecodeError:
+                    parse_failed = True
+            else:
+                parse_failed = True
+
+        field_aliases = {
+            "merchant": ["merchant", "merchant_name", "vendor_name", "vendor", "store_name"],
+            "date": ["date", "receipt_date", "transaction_date"],
+            "payment_method": ["payment_method", "payment", "tender"],
+            "currency": ["currency"],
+            "subtotal": ["subtotal", "sub_total"],
+            "tax_vat_amount": ["tax_vat_amount", "tax_amount", "vat_amount", "tax"],
+            "total": ["total", "grand_total", "receipt_total"],
+            "discount": ["discount", "discount_amount"],
+            "tip": ["tip", "tip_amount", "gratuity"],
+        }
+        normalized = {
+            field: next((str(parsed.get(alias) or "").strip() for alias in aliases if parsed.get(alias) not in (None, "")), "")
+            for field, aliases in field_aliases.items()
+        }
+        normalized["line_items"] = []
+        for row in parsed.get("line_items") or []:
+            if not isinstance(row, dict):
+                continue
+            normalized["line_items"].append({
+                "description": str(row.get("description") or "").strip(),
+                "quantity": str(row.get("quantity") or "").strip(),
+                "unit_price": str(row.get("unit_price") or "").strip(),
+                "tax_rate": str(row.get("tax_rate") or row.get("tax") or "").strip(),
+                "line_total": str(row.get("line_total") or row.get("total") or "").strip(),
+            })
+        normalized["review_flags"] = self._validate_receipt_data(normalized)
+        if parse_failed:
+            normalized["review_flags"].append({
+                "code": "unstructured_receipt_response",
+                "area": "receipt",
+                "note": "Structured receipt response could not be parsed. Review the source document.",
+            })
+        return normalized
+
+    def _merge_receipt_pages(self, page_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        fields = [
+            "merchant", "date", "payment_method", "currency", "subtotal",
+            "tax_vat_amount", "total", "discount", "tip",
+        ]
+        merged: Dict[str, Any] = {field: "" for field in fields}
+        merged["line_items"] = []
+        for result in page_results:
+            page = result.get("page")
+            for field in fields:
+                if result.get(field) and not merged[field]:
+                    merged[field] = result[field]
+            for row in result.get("line_items") or []:
+                if isinstance(row, dict):
+                    merged["line_items"].append({"page": page, **row})
+        merged["review_flags"] = self._validate_receipt_data(merged)
+        return merged
+
+    def _validate_receipt_data(self, receipt_data: Dict[str, Any]) -> List[Dict[str, str]]:
+        flags: List[Dict[str, str]] = []
+        required_fields = [
+            ("merchant", "missing_merchant", "Merchant was not detected."),
+            ("date", "missing_receipt_date", "Receipt date was not detected."),
+            ("total", "missing_total", "Receipt total was not detected."),
+        ]
+        for field, code, note in required_fields:
+            if not str(receipt_data.get(field) or "").strip():
+                flags.append({"code": code, "area": field, "note": note})
+        if not str(receipt_data.get("tax_vat_amount") or "").strip():
+            flags.append({
+                "code": "unclear_tax",
+                "area": "tax_vat_amount",
+                "note": "Tax/VAT is not clearly visible on the receipt.",
+            })
+
+        line_items = [row for row in receipt_data.get("line_items") or [] if isinstance(row, dict)]
+        line_totals = [self._parse_invoice_amount(row.get("line_total")) for row in line_items]
+        subtotal = self._parse_invoice_amount(receipt_data.get("subtotal"))
+        tax_amount = self._parse_invoice_amount(receipt_data.get("tax_vat_amount"))
+        total = self._parse_invoice_amount(receipt_data.get("total"))
+        discount = self._parse_invoice_amount(receipt_data.get("discount")) or Decimal("0")
+        tip = self._parse_invoice_amount(receipt_data.get("tip")) or Decimal("0")
+        has_complete_line_totals = bool(line_items) and all(amount is not None for amount in line_totals)
+
+        if has_complete_line_totals and total is not None and tax_amount is not None:
+            line_items_subtotal = sum((amount for amount in line_totals if amount is not None), Decimal("0"))
+            visible_subtotal = subtotal if subtotal is not None else line_items_subtotal
+            line_items_disagree = subtotal is not None and abs(line_items_subtotal - subtotal) > Decimal("0.02")
+            total_disagrees = abs((visible_subtotal + tax_amount - discount + tip) - total) > Decimal("0.02")
+            if line_items_disagree or total_disagrees:
+                flags.append({
+                    "code": "line_items_total_mismatch",
+                    "area": "total",
+                    "note": "Visible receipt line items and adjustments do not match the visible total.",
+                })
+        return flags
+
+    async def _make_api_call(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        temperature: Optional[float] = None,
+    ) -> ChatCompletion:
         """
         Make the actual API call to OlmOCR.
         
@@ -496,13 +1610,18 @@ class OlmOCRService:
         """
         # Run the synchronous OpenAI call in a thread pool
         loop = asyncio.get_event_loop()
+        request_options: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens or self.max_tokens,
+        }
+        if response_format is not None:
+            request_options["response_format"] = response_format
+        if temperature is not None:
+            request_options["temperature"] = temperature
         response = await loop.run_in_executor(
             None,
-            lambda: self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens or self.max_tokens
-            )
+            lambda: self.client.chat.completions.create(**request_options)
         )
         return response
     

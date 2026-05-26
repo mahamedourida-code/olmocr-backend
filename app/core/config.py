@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     # Performance Configuration
     max_concurrent_jobs: int = Field(10, env="MAX_CONCURRENT_JOBS")
     max_concurrent_ocr_calls: int = Field(6, env="MAX_CONCURRENT_OCR_CALLS")
+    auto_detection_confidence_threshold: float = Field(0.78, env="AUTO_DETECTION_CONFIDENCE_THRESHOLD")
     
     # Rate Limiting Configuration
     rate_limit_per_minute: int = Field(100, env="RATE_LIMIT_PER_MINUTE")
@@ -106,6 +107,14 @@ class Settings(BaseSettings):
     lemonsqueezy_mega_yearly_credits: int = Field(84000, env="LEMONSQUEEZY_MEGA_YEARLY_CREDITS")
     lemonsqueezy_business_monthly_credits: int = Field(2000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_CREDITS")
     lemonsqueezy_business_yearly_credits: int = Field(24000, env="LEMONSQUEEZY_BUSINESS_YEARLY_CREDITS")
+
+    # QuickBooks Online Integration Configuration
+    quickbooks_client_id: str = Field("", env="QUICKBOOKS_CLIENT_ID")
+    quickbooks_client_secret: str = Field("", env="QUICKBOOKS_CLIENT_SECRET")
+    quickbooks_redirect_uri: str = Field("", env="QUICKBOOKS_REDIRECT_URI")
+    quickbooks_token_encryption_key: str = Field("", env="QUICKBOOKS_TOKEN_ENCRYPTION_KEY")
+    quickbooks_environment: str = Field("sandbox", env="QUICKBOOKS_ENVIRONMENT")
+    quickbooks_minor_version: str = Field("75", env="QUICKBOOKS_MINOR_VERSION")
     
     # OlmOCR API Rate Limiting Configuration
     olmocr_base_delay_seconds: float = Field(0.0, env="OLMOCR_BASE_DELAY_SECONDS")

@@ -1,5 +1,8 @@
 import io
 import json
+import csv
+import os
+import re
 import pandas as pd
 from typing import List, Dict, Any, Optional
 import logging
@@ -72,6 +75,10 @@ class ExcelService:
             logger.error(f"Excel conversion error: {str(e)}")
             # Instead of raising an error, create an Excel file with the error message
             return self._create_empty_xlsx_with_message(f"Error processing image: {str(e)}", sheet_name)
+
+    def table_to_csv(self, csv_content: str) -> bytes:
+        """Return raw detected table rows as a downloadable UTF-8 CSV."""
+        return (csv_content or "").encode("utf-8-sig")
     
     def create_batch_xlsx(
         self, 
@@ -293,12 +300,36 @@ class ExcelService:
             statement_sheet = workbook.active
             statement_sheet.title = sheet_name[:31] or "Statement"
 
-            summary_rows = self._normalize_rows(statement_data.get("summary"), ["Field", "Value"])
-            transaction_rows = self._normalize_rows(
-                statement_data.get("transactions"),
-                ["Date", "Description", "Debit", "Credit", "Balance", "Reference"]
-            )
-            review_rows = self._normalize_rows(statement_data.get("review"), ["Area", "Note"])
+            summary = statement_data.get("summary") or {
+                "account_holder": statement_data.get("account_holder", ""),
+                "bank_name": statement_data.get("bank_name", ""),
+                "account_number": statement_data.get("account_number", ""),
+                "statement_period": statement_data.get("period", ""),
+                "currency": statement_data.get("currency", ""),
+                "opening_balance": statement_data.get("opening_balance", ""),
+                "closing_balance": statement_data.get("closing_balance", ""),
+            }
+            summary_rows = self._normalize_rows(summary, ["Field", "Value"])
+            transaction_rows = [["Page", "Date", "Description", "Reference", "Debit", "Credit", "Balance"]]
+            for transaction in statement_data.get("transactions") or []:
+                if isinstance(transaction, dict):
+                    transaction_rows.append([
+                        transaction.get("page", ""),
+                        transaction.get("date", ""),
+                        transaction.get("description", ""),
+                        transaction.get("reference", ""),
+                        transaction.get("debit", ""),
+                        transaction.get("credit", ""),
+                        transaction.get("balance", ""),
+                    ])
+            review_rows = [["Code", "Field", "Note"]]
+            for flag in statement_data.get("review_flags") or statement_data.get("review") or []:
+                if isinstance(flag, dict):
+                    review_rows.append([
+                        flag.get("code", "statement_review_note"),
+                        flag.get("area", ""),
+                        flag.get("note", ""),
+                    ])
             raw_text = self._normalize_raw_text(statement_data.get("raw_text"))
 
             statement_sheet.append(["Detected Statement Text"])
@@ -332,7 +363,7 @@ class ExcelService:
             raw_sheet.column_dimensions["A"].width = 120
             self._style_header_row(raw_sheet)
 
-            review_sheet = workbook.create_sheet("Review")
+            review_sheet = workbook.create_sheet("Review Flags")
             for row in review_rows:
                 review_sheet.append(row)
             self._style_header_row(review_sheet)
@@ -345,6 +376,428 @@ class ExcelService:
         except Exception as e:
             logger.error(f"Bank statement workbook error: {str(e)}")
             return self._create_raw_text_xlsx(json.dumps(statement_data, ensure_ascii=False, indent=2), sheet_name)
+
+    def bank_statement_transactions_to_csv(self, statement_data: Dict[str, Any]) -> bytes:
+        """Create a clean CSV export of visible bank statement transactions."""
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        columns = [
+            ("page", "Page"),
+            ("date", "Date"),
+            ("description", "Description"),
+            ("reference", "Reference"),
+            ("debit", "Debit"),
+            ("credit", "Credit"),
+            ("balance", "Balance"),
+        ]
+        writer.writerow([label for _, label in columns])
+        for row in statement_data.get("transactions") or []:
+            if isinstance(row, dict):
+                writer.writerow([row.get(key, "") for key, _ in columns])
+        return output.getvalue().encode("utf-8-sig")
+
+    def notes_text_to_txt(self, notes_data: Dict[str, Any]) -> bytes:
+        """Return readable narrative notes text without inventing table structure."""
+        return str(notes_data.get("readable_text") or "").encode("utf-8")
+
+    def notes_tables_to_xlsx(self, notes_data: Dict[str, Any]) -> bytes:
+        """Create a workbook from tables explicitly detected in a notes page."""
+        workbook = Workbook()
+        default_sheet = workbook.active
+        tables = [table for table in notes_data.get("tables") or [] if isinstance(table, dict)]
+        used_names = set()
+        for index, table in enumerate(tables):
+            raw_title = table.get("title") or f"Table {index + 1}"
+            title = "".join(char if char not in r'[]:*?/\\' else "_" for char in str(raw_title))[:31] or f"Table {index + 1}"
+            candidate = title
+            counter = 2
+            while candidate in used_names:
+                suffix = f"_{counter}"
+                candidate = f"{title[:31-len(suffix)]}{suffix}"
+                counter += 1
+            used_names.add(candidate)
+            sheet = default_sheet if index == 0 else workbook.create_sheet()
+            sheet.title = candidate
+            columns = table.get("columns") or []
+            if columns:
+                sheet.append(columns)
+                self._style_header_row(sheet)
+            for row in table.get("rows") or []:
+                if isinstance(row, list):
+                    sheet.append(row)
+            self._auto_fit_openpyxl_columns(sheet)
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return output.getvalue()
+
+    def notes_tables_to_csv(self, notes_data: Dict[str, Any]) -> bytes:
+        """Create CSV rows only from tables explicitly detected in notes."""
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        tables = [table for table in notes_data.get("tables") or [] if isinstance(table, dict)]
+        for index, table in enumerate(tables):
+            if index:
+                writer.writerow([])
+            if len(tables) > 1:
+                writer.writerow([table.get("title") or f"Table {index + 1}"])
+            columns = table.get("columns") or []
+            if columns:
+                writer.writerow(columns)
+            for row in table.get("rows") or []:
+                if isinstance(row, list):
+                    writer.writerow(row)
+        return output.getvalue().encode("utf-8-sig")
+
+    def invoice_to_xlsx(self, invoice_data: Dict[str, Any]) -> bytes:
+        """Create a review-ready invoice workbook with summary and line-item sheets."""
+        try:
+            workbook = Workbook()
+            summary_sheet = workbook.active
+            summary_sheet.title = "Invoice Summary"
+            summary_fields = [
+                ("Vendor name", "vendor_name"),
+                ("Supplier tax/VAT ID", "supplier_tax_vat_id"),
+                ("Invoice number", "invoice_number"),
+                ("Invoice date", "invoice_date"),
+                ("Due date", "due_date"),
+                ("PO/reference", "po_reference"),
+                ("Subtotal", "subtotal"),
+                ("Tax/VAT amount", "tax_vat_amount"),
+                ("Total", "total"),
+                ("Currency", "currency"),
+            ]
+            summary_sheet.append(["Field", "Value"])
+            for label, key in summary_fields:
+                summary_sheet.append([label, invoice_data.get(key, "")])
+            self._style_header_row(summary_sheet)
+            self._auto_fit_openpyxl_columns(summary_sheet)
+
+            items_sheet = workbook.create_sheet("Line Items")
+            item_fields = [
+                ("Description", "description"),
+                ("Quantity", "quantity"),
+                ("Unit price", "unit_price"),
+                ("Tax/rate", "tax_rate"),
+                ("Line total", "line_total"),
+            ]
+            items_sheet.append([label for label, _ in item_fields])
+            for item in invoice_data.get("line_items") or []:
+                if isinstance(item, dict):
+                    items_sheet.append([item.get(key, "") for _, key in item_fields])
+            self._style_header_row(items_sheet)
+            self._auto_fit_openpyxl_columns(items_sheet)
+
+            review_sheet = workbook.create_sheet("Review Flags")
+            review_sheet.append(["Code", "Field", "Note"])
+            for flag in invoice_data.get("review_flags") or []:
+                if isinstance(flag, dict):
+                    review_sheet.append([
+                        flag.get("code", ""),
+                        flag.get("area", ""),
+                        flag.get("note", ""),
+                    ])
+            self._style_header_row(review_sheet)
+            self._auto_fit_openpyxl_columns(review_sheet)
+
+            output = io.BytesIO()
+            workbook.save(output)
+            output.seek(0)
+            return output.getvalue()
+        except Exception as e:
+            logger.error(f"Invoice workbook error: {str(e)}")
+            return self._create_raw_text_xlsx(json.dumps(invoice_data, ensure_ascii=False, indent=2), "Invoice")
+
+    def invoice_line_items_to_csv(self, invoice_data: Dict[str, Any]) -> bytes:
+        """Create a CSV export containing invoice identity fields and line items."""
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        summary_columns = [
+            ("vendor_name", "Vendor name"),
+            ("supplier_tax_vat_id", "Supplier tax/VAT ID"),
+            ("invoice_number", "Invoice number"),
+            ("invoice_date", "Invoice date"),
+            ("due_date", "Due date"),
+            ("po_reference", "PO/reference"),
+            ("subtotal", "Subtotal"),
+            ("tax_vat_amount", "Tax/VAT amount"),
+            ("total", "Total"),
+            ("currency", "Currency"),
+        ]
+        item_columns = [
+            ("description", "Description"),
+            ("quantity", "Quantity"),
+            ("unit_price", "Unit price"),
+            ("tax_rate", "Tax/rate"),
+            ("line_total", "Line total"),
+        ]
+        writer.writerow([label for _, label in summary_columns + item_columns])
+        items = [item for item in invoice_data.get("line_items") or [] if isinstance(item, dict)] or [{}]
+        for item in items:
+            writer.writerow(
+                [invoice_data.get(key, "") for key, _ in summary_columns]
+                + [item.get(key, "") for key, _ in item_columns]
+            )
+        return output.getvalue().encode("utf-8-sig")
+
+    def receipt_to_xlsx(self, receipt_data: Dict[str, Any]) -> bytes:
+        """Create an expense-review workbook from visible receipt fields."""
+        try:
+            workbook = Workbook()
+            summary_sheet = workbook.active
+            summary_sheet.title = "Receipt Summary"
+            summary_fields = [
+                ("Merchant", "merchant"),
+                ("Date", "date"),
+                ("Payment method", "payment_method"),
+                ("Currency", "currency"),
+                ("Subtotal", "subtotal"),
+                ("Tax/VAT amount", "tax_vat_amount"),
+                ("Discount", "discount"),
+                ("Tip", "tip"),
+                ("Total", "total"),
+            ]
+            summary_sheet.append(["Field", "Value"])
+            for label, key in summary_fields:
+                summary_sheet.append([label, receipt_data.get(key, "")])
+            self._style_header_row(summary_sheet)
+            self._auto_fit_openpyxl_columns(summary_sheet)
+
+            items_sheet = workbook.create_sheet("Line Items")
+            item_fields = [
+                ("Description", "description"),
+                ("Quantity", "quantity"),
+                ("Unit price", "unit_price"),
+                ("Tax/rate", "tax_rate"),
+                ("Line total", "line_total"),
+            ]
+            items_sheet.append([label for label, _ in item_fields])
+            for item in receipt_data.get("line_items") or []:
+                if isinstance(item, dict):
+                    items_sheet.append([item.get(key, "") for _, key in item_fields])
+            self._style_header_row(items_sheet)
+            self._auto_fit_openpyxl_columns(items_sheet)
+
+            review_sheet = workbook.create_sheet("Review Flags")
+            review_sheet.append(["Code", "Field", "Note"])
+            for flag in receipt_data.get("review_flags") or []:
+                if isinstance(flag, dict):
+                    review_sheet.append([
+                        flag.get("code", ""),
+                        flag.get("area", ""),
+                        flag.get("note", ""),
+                    ])
+            self._style_header_row(review_sheet)
+            self._auto_fit_openpyxl_columns(review_sheet)
+
+            output = io.BytesIO()
+            workbook.save(output)
+            output.seek(0)
+            return output.getvalue()
+        except Exception as e:
+            logger.error(f"Receipt workbook error: {str(e)}")
+            return self._create_raw_text_xlsx(json.dumps(receipt_data, ensure_ascii=False, indent=2), "Receipt")
+
+    def receipt_line_items_to_csv(self, receipt_data: Dict[str, Any]) -> bytes:
+        """Create an expense-review CSV containing receipt fields and visible items."""
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        summary_columns = [
+            ("merchant", "Merchant"),
+            ("date", "Date"),
+            ("payment_method", "Payment method"),
+            ("currency", "Currency"),
+            ("subtotal", "Subtotal"),
+            ("tax_vat_amount", "Tax/VAT amount"),
+            ("discount", "Discount"),
+            ("tip", "Tip"),
+            ("total", "Total"),
+        ]
+        item_columns = [
+            ("description", "Description"),
+            ("quantity", "Quantity"),
+            ("unit_price", "Unit price"),
+            ("tax_rate", "Tax/rate"),
+            ("line_total", "Line total"),
+        ]
+        writer.writerow([label for _, label in summary_columns + item_columns])
+        items = [item for item in receipt_data.get("line_items") or [] if isinstance(item, dict)] or [{}]
+        for item in items:
+            writer.writerow(
+                [receipt_data.get(key, "") for key, _ in summary_columns]
+                + [item.get(key, "") for key, _ in item_columns]
+            )
+        return output.getvalue().encode("utf-8-sig")
+
+    def export_reviewed_document(
+        self,
+        document: Dict[str, Any],
+        requested_format: str = "xlsx",
+    ) -> Dict[str, Any]:
+        """Render one durable document from reviewed values rather than raw OCR output."""
+        mode, reviewed_data = self._merge_reviewed_document_data(document)
+        output_format = str(requested_format or "xlsx").lower()
+        if output_format not in {"xlsx", "csv", "txt"}:
+            output_format = "xlsx"
+
+        if mode == "invoice":
+            if output_format == "csv":
+                content = self.invoice_line_items_to_csv(reviewed_data)
+                extension = "csv"
+                content_type = "text/csv; charset=utf-8"
+            else:
+                content = self.invoice_to_xlsx(reviewed_data)
+                extension = "xlsx"
+                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif mode == "receipt":
+            if output_format == "csv":
+                content = self.receipt_line_items_to_csv(reviewed_data)
+                extension = "csv"
+                content_type = "text/csv; charset=utf-8"
+            else:
+                content = self.receipt_to_xlsx(reviewed_data)
+                extension = "xlsx"
+                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif mode == "bank_statement":
+            if output_format == "csv":
+                content = self.bank_statement_transactions_to_csv(reviewed_data)
+                extension = "csv"
+                content_type = "text/csv; charset=utf-8"
+            else:
+                content = self.bank_statement_to_xlsx(reviewed_data, "Statement")
+                extension = "xlsx"
+                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif mode == "notes":
+            has_tables = bool(reviewed_data.get("tables"))
+            if output_format == "csv" and has_tables:
+                content = self.notes_tables_to_csv(reviewed_data)
+                extension = "csv"
+                content_type = "text/csv; charset=utf-8"
+            elif output_format == "xlsx" and has_tables:
+                content = self.notes_tables_to_xlsx(reviewed_data)
+                extension = "xlsx"
+                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            else:
+                content = self.notes_text_to_txt(reviewed_data)
+                extension = "txt"
+                content_type = "text/plain; charset=utf-8"
+        else:
+            csv_content = str(reviewed_data.get("csv") or "")
+            if output_format == "csv":
+                content = self.table_to_csv(csv_content)
+                extension = "csv"
+                content_type = "text/csv; charset=utf-8"
+            else:
+                content = self.csv_to_xlsx(csv_content, "Table")
+                extension = "xlsx"
+                content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+        original_name = document.get("original_filename") or "document"
+        filename = f"{self._safe_export_stem(original_name)}_reviewed.{extension}"
+        return {
+            "content": content,
+            "filename": filename,
+            "content_type": content_type,
+            "mode": mode,
+        }
+
+    def _merge_reviewed_document_data(self, document: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        """Combine reviewed page/unit values into the logical document export shape."""
+        mode = str(
+            document.get("resolved_mode")
+            or document.get("detected_mode")
+            or document.get("selected_mode")
+            or "table"
+        )
+        extractions = sorted(
+            document.get("extractions") or [],
+            key=self._extraction_page_order,
+        )
+        reviewed_units = [
+            (extraction, self._reviewed_extraction_data(extraction))
+            for extraction in extractions
+            if isinstance(extraction, dict)
+        ]
+        payloads = [payload for _, payload in reviewed_units if payload]
+
+        if mode == "invoice_receipt":
+            mode = "invoice" if any(payload.get("invoice_number") for payload in payloads) else "receipt"
+
+        if mode in {"invoice", "receipt", "bank_statement"}:
+            data: Dict[str, Any] = {}
+            list_key = "transactions" if mode == "bank_statement" else "line_items"
+            data[list_key] = []
+            data["review_flags"] = []
+            for extraction, payload in reviewed_units:
+                for key, value in payload.items():
+                    if key not in {list_key, "review_flags"} and value not in (None, "", [], {}):
+                        if data.get(key) in (None, "", [], {}):
+                            data[key] = value
+                data[list_key].extend(
+                    item for item in payload.get(list_key) or [] if isinstance(item, dict)
+                )
+                data["review_flags"].extend(
+                    flag for flag in payload.get("review_flags") or [] if isinstance(flag, dict)
+                )
+                data["review_flags"].extend(
+                    flag for flag in extraction.get("validation_flags") or [] if isinstance(flag, dict)
+                )
+            return mode, data
+
+        if mode == "notes":
+            readable_pages = [
+                str(payload.get("readable_text") or "").strip()
+                for payload in payloads
+                if str(payload.get("readable_text") or "").strip()
+            ]
+            data = {"readable_text": "\n\n".join(readable_pages), "tables": [], "review_flags": []}
+            for extraction, payload in reviewed_units:
+                data["tables"].extend(table for table in payload.get("tables") or [] if isinstance(table, dict))
+                data["review_flags"].extend(
+                    flag for flag in payload.get("review_flags") or [] if isinstance(flag, dict)
+                )
+                data["review_flags"].extend(
+                    flag for flag in extraction.get("validation_flags") or [] if isinstance(flag, dict)
+                )
+            return mode, data
+
+        merged_grid: List[List[Any]] = []
+        for payload in payloads:
+            grid = payload.get("review_grid")
+            if not isinstance(grid, list):
+                csv_content = payload.get("csv")
+                grid = list(csv.reader(io.StringIO(csv_content))) if isinstance(csv_content, str) else []
+            clean_grid = [list(row) for row in grid if isinstance(row, list)]
+            if merged_grid and clean_grid and clean_grid[0] == merged_grid[0]:
+                clean_grid = clean_grid[1:]
+            merged_grid.extend(clean_grid)
+        output = io.StringIO(newline="")
+        csv.writer(output).writerows(merged_grid)
+        return "table", {"review_grid": merged_grid, "csv": output.getvalue()}
+
+    @staticmethod
+    def _reviewed_extraction_data(extraction: Dict[str, Any]) -> Dict[str, Any]:
+        reviewed = extraction.get("reviewed_data")
+        if isinstance(reviewed, dict) and reviewed:
+            return reviewed
+        structured = extraction.get("raw_structured_data") or extraction.get("structured_data")
+        return structured if isinstance(structured, dict) else {}
+
+    @staticmethod
+    def _extraction_page_order(extraction: Dict[str, Any]) -> tuple[int, str]:
+        metadata = extraction.get("metadata") if isinstance(extraction.get("metadata"), dict) else {}
+        source_page = extraction.get("source_page") or metadata.get("source_page") or 0
+        try:
+            page = int(source_page)
+        except (TypeError, ValueError):
+            page = 0
+        return page, str(extraction.get("processing_unit_id") or "")
+
+    @staticmethod
+    def _safe_export_stem(filename: str) -> str:
+        stem = os.path.splitext(os.path.basename(str(filename or "document")))[0]
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+        return cleaned or "document"
 
     def _normalize_rows(self, value: Any, fallback_header: List[str]) -> List[List[Any]]:
         if not value:

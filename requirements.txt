@@ -11,6 +11,7 @@ python-dotenv
 aiofiles
 backoff
 httpx
+cryptography  # Encrypt backend-only accounting integration tokens at rest
 
 # Redis and Celery for distributed task processing
 redis

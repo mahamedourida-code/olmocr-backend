@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, File, UploadFile, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from celery import chord
 from typing import Dict, Any, List
 import os
 import uuid
@@ -7,10 +8,21 @@ import logging
 import traceback
 import threading
 import base64
+import hashlib
 import json
+import io
+import zipfile
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
-from app.models.requests import BatchConvertRequest
+from app.models.requests import (
+    BatchConvertRequest,
+    DocumentModeOverrideRequest,
+    DocumentDuplicateOverrideRequest,
+    DocumentReviewChangeRequest,
+    DocumentReviewStatusRequest,
+    VendorRuleFromDocumentRequest,
+)
 from app.models.responses import BatchConvertResponse, JobStatusResponse, ErrorResponse
 from app.models.jobs import JobStatus, BatchProcessingContext, ImageProcessingResult
 from app.core.dependencies import (
@@ -22,7 +34,12 @@ from app.core.config import settings
 from app.core.limits import get_plan_limits, get_user_plan_type
 from app.services.redis_service import get_redis_service, RedisService
 from app.services.supabase_service import get_supabase_service
-from app.tasks.batch_tasks import process_batch_from_storage
+from app.services.excel import ExcelService
+from app.tasks.batch_tasks import (
+    finalize_document_override,
+    process_batch_from_storage,
+    process_single_stored_image,
+)
 from app.utils.exceptions import ProcessingError, ValidationError
 from app.utils.pdf_pages import is_pdf_bytes, render_pdf_pages_to_png
 from app.models.jobs import SessionMetadata
@@ -102,6 +119,90 @@ def _parse_metadata(metadata: Any) -> Dict[str, Any]:
 
 
 ACTIVE_JOB_STATUSES = {"queued", "processing"}
+SUPPORTED_DOCUMENT_MODES = {
+    "auto",
+    "table",
+    "invoice",
+    "receipt",
+    "bank_statement",
+    "notes",
+    "invoice_receipt",
+}
+
+
+def normalize_document_mode(document_mode: str) -> str:
+    """Normalize public mode names while preserving the legacy combined mode."""
+    requested_mode = str(document_mode or "table").strip().lower().replace("-", "_")
+    aliases = {
+        "statement": "bank_statement",
+        "bankstatement": "bank_statement",
+        "note": "notes",
+    }
+    normalized_mode = aliases.get(requested_mode, requested_mode)
+    return normalized_mode if normalized_mode in SUPPORTED_DOCUMENT_MODES else "table"
+
+
+async def require_owned_durable_job(
+    supabase_service,
+    job_id: str,
+    session: SessionMetadata,
+    user: Optional[dict],
+) -> Dict[str, Any]:
+    """Load a durable job and enforce the same owner/session rule for review routes."""
+    supabase_job = await supabase_service.get_job(job_id)
+    if not supabase_job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+    stored_user_id = str(supabase_job.get("user_id") or "")
+    owner_user_id = metadata.get("owner_user_id") or (
+        stored_user_id if not stored_user_id.startswith("session:") else ""
+    )
+    owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
+    verify_job_data_access(
+        {"job_id": job_id, "user_id": owner_user_id or "", "session_id": owner_session_id or ""},
+        user,
+        session.session_id,
+    )
+    return supabase_job
+
+
+async def persist_queued_documents(
+    supabase_service,
+    documents: List[Dict[str, Any]],
+    processing_units: List[Dict[str, Any]],
+) -> None:
+    """Create durable source and extraction rows before worker dispatch."""
+    for document in documents:
+        await supabase_service.create_job_document(document)
+
+    for unit in processing_units:
+        await supabase_service.upsert_document_extraction({
+            "document_id": unit["document_id"],
+            "job_id": unit["job_id"],
+            "processing_unit_id": unit["id"],
+            "status": "queued",
+            "structured_data": {},
+            "review_status": "pending",
+            "validation_flags": [],
+            "edited": False,
+            "metadata": {
+                "source_storage_path": unit.get("storage_path"),
+                "source_content_type": unit.get("content_type"),
+                "source_page": unit.get("source_page"),
+                "source_page_count": unit.get("source_page_count"),
+                "source_filename": unit.get("original_filename") or unit.get("source_filename"),
+                "source_sha256": unit.get("source_sha256"),
+            },
+        })
+
+
+async def refresh_uploaded_duplicate_warnings(supabase_service, documents: List[Dict[str, Any]]) -> None:
+    """Populate source-hash duplicate warnings without failing job creation."""
+    for document in documents:
+        try:
+            await supabase_service.refresh_document_duplicate_warnings(document["job_id"], document["id"])
+        except Exception as exc:
+            logger.warning(f"Unable to evaluate duplicate source warning for document {document['id']}: {exc}")
 
 
 def _parse_job_datetime(value: Any) -> datetime:
@@ -277,6 +378,19 @@ async def create_batch_job(
     supabase_service = get_supabase_service()
     limits = resolve_upload_limits(user, supabase_service)
     enforce_batch_limit(len(request.images), limits)
+    normalized_document_mode = normalize_document_mode(request.document_mode)
+    normalized_output_format = (
+        "xlsx"
+        if normalized_document_mode == "table" and request.output_format == "txt"
+        else request.output_format
+    )
+    try:
+        workspace_id = await supabase_service.resolve_owned_workspace_id(
+            user["user_id"] if user else None,
+            request.workspace_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
     await enforce_upload_rate_limits(
         request=http_request,
@@ -333,10 +447,13 @@ async def create_batch_job(
     try:
         storage_owner_id = user['user_id'] if user else session.session_id
         stored_images = []
+        document_records = []
 
         for i, img in enumerate(request.images):
+            document_id = str(uuid.uuid4())
             image_data = img.image.split(',', 1)[1] if img.image.startswith('data:') else img.image
             image_bytes = base64.b64decode(image_data)
+            source_sha256 = hashlib.sha256(image_bytes).hexdigest()
             filename = img.filename or f"image_{i}.png"
             source_file = await supabase_service.upload_source_file(
                 file_data=image_bytes,
@@ -347,10 +464,34 @@ async def create_batch_job(
             )
             stored_images.append({
                 'id': f"img_{i}",
+                'document_id': document_id,
                 'storage_path': source_file['storage_path'],
                 'filename': filename,
                 'content_type': source_file['content_type'],
-                'size_bytes': source_file['size_bytes']
+                'size_bytes': source_file['size_bytes'],
+                'output_format': normalized_output_format,
+                'document_mode': normalized_document_mode,
+                'original_filename': filename,
+                'source_sha256': source_sha256,
+            })
+            document_records.append({
+                "id": document_id,
+                "job_id": job_id,
+                "owner_user_id": user['user_id'] if user else None,
+                "owner_session_id": None if user else session.session_id,
+                "workspace_id": workspace_id,
+                "original_filename": filename,
+                "source_storage_path": source_file["storage_path"],
+                "source_content_type": source_file["content_type"],
+                "selected_mode": normalized_document_mode,
+                "resolved_mode": (
+                    normalized_document_mode
+                    if normalized_document_mode in {"table", "invoice", "receipt", "bank_statement", "notes"}
+                    else None
+                ),
+                "status": "queued",
+                "metadata": {"source_sha256": source_sha256},
+                "expires_at": (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
             })
 
         # Create job metadata for Redis with storage paths, not raw image payloads.
@@ -362,7 +503,8 @@ async def create_batch_job(
             'total_images': len(request.images),
             'processed_images': 0,
             'progress': 0,
-            'output_format': request.output_format,
+            'output_format': normalized_output_format,
+            'document_mode': normalized_document_mode,
             'consolidation_strategy': request.consolidation_strategy,
             'images': stored_images,
             'results': [],
@@ -383,10 +525,12 @@ async def create_batch_job(
             metadata={
                 'total_images': len(request.images),
                 'consolidation_strategy': request.consolidation_strategy,
-                'output_format': request.output_format,
+                'output_format': normalized_output_format,
+                'document_mode': normalized_document_mode,
                 'session_id': session.session_id,
                 'owner_user_id': user['user_id'] if user else None,
                 'owner_session_id': None if user else session.session_id,
+                'workspace_id': workspace_id,
                 'plan': limits["plan"],
                 'max_files_per_batch': limits["max_files_per_batch"],
                 'credits_reserved': len(request.images) if user else 0,
@@ -394,6 +538,20 @@ async def create_batch_job(
             },
             status='queued'
         )
+        await persist_queued_documents(
+            supabase_service,
+            document_records,
+            [
+                {
+                    **stored_image,
+                    "job_id": job_id,
+                    "source_page": None,
+                    "source_page_count": None,
+                }
+                for stored_image in stored_images
+            ],
+        )
+        await refresh_uploaded_duplicate_warnings(supabase_service, document_records)
         logger.info(f"Created durable Supabase job {job_id} for owner {durable_owner_id}")
         
         # Store job in Redis
@@ -418,10 +576,12 @@ async def create_batch_job(
                 metadata={
                     'total_images': len(request.images),
                     'consolidation_strategy': request.consolidation_strategy,
-                    'output_format': request.output_format,
+                    'output_format': normalized_output_format,
+                    'document_mode': normalized_document_mode,
                     'session_id': session.session_id,
                     'owner_user_id': user['user_id'] if user else None,
                     'owner_session_id': None if user else session.session_id,
+                    'workspace_id': workspace_id,
                     'celery_task_id': async_result.id,
                     'plan': limits["plan"],
                     'max_files_per_batch': limits["max_files_per_batch"],
@@ -450,6 +610,10 @@ async def create_batch_job(
             await redis_service.delete_job(job_id)
         except:
             pass
+        try:
+            await supabase_service.update_job_documents_status(job_id, "failed")
+        except Exception:
+            pass
 
         if user and credits_reserved:
             supabase_service.refund_credits(user['user_id'], len(request.images))
@@ -466,6 +630,7 @@ async def create_batch_job_multipart(
     output_format: str = Form("xlsx"),
     consolidation_strategy: str = Form("consolidated"),
     document_mode: str = Form("table"),
+    workspace_id: Optional[str] = Form(None),
     session: SessionMetadata = Depends(get_or_create_session),
     redis_service: RedisService = Depends(get_redis_service),
     user: Optional[dict] = Depends(get_optional_user),
@@ -493,20 +658,24 @@ async def create_batch_job_multipart(
     simple_batch_validation(len(files))
     supabase_service = get_supabase_service()
     limits = resolve_upload_limits(user, supabase_service)
+    normalized_document_mode = normalize_document_mode(document_mode)
+    requested_output_format = str(output_format).lower()
     normalized_output_format = (
         "txt"
-        if str(output_format).lower() in {"txt", "text", "plain_text"}
+        if requested_output_format in {"txt", "text", "plain_text"}
+        else "csv"
+        if requested_output_format == "csv" and normalized_document_mode in {"table", "invoice", "receipt", "bank_statement", "notes"}
         else "xlsx"
     )
-    normalized_document_mode = (
-        "bank_statement"
-        if str(document_mode).lower() in {"bank_statement", "bank-statement", "statement"}
-        else "invoice_receipt"
-        if str(document_mode).lower() in {"invoice_receipt", "invoice-receipt", "invoice", "receipt"}
-        else "table"
-    )
-    if normalized_document_mode == "bank_statement":
+    if normalized_document_mode in {"table", "bank_statement", "invoice", "receipt"} and normalized_output_format == "txt":
         normalized_output_format = "xlsx"
+    try:
+        workspace_id = await supabase_service.resolve_owned_workspace_id(
+            user["user_id"] if user else None,
+            workspace_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
     # Validate each file
     SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/heic", "image/heif", "application/pdf"}
@@ -555,21 +724,27 @@ async def create_batch_job_multipart(
                 detail=error_msg
             )
 
-        normalized_content_type = (
-            "application/pdf"
-            if file_ext == "pdf" or file.content_type == "application/pdf" or is_pdf_bytes(file_content)
-            else file.content_type or "application/octet-stream"
-        )
+        if file_ext == "pdf" or file.content_type == "application/pdf" or is_pdf_bytes(file_content):
+            normalized_content_type = "application/pdf"
+        elif file_ext in {"heic", "heif"}:
+            normalized_content_type = f"image/{file_ext}"
+        elif file.content_type == "image/jpg":
+            normalized_content_type = "image/jpeg"
+        else:
+            normalized_content_type = file.content_type or "application/octet-stream"
         validated_files.append({
             "index": i,
+            "document_id": str(uuid.uuid4()),
             "filename": file.filename or f"image_{i}.png",
             "content_type": normalized_content_type,
-            "content": file_content
+            "content": file_content,
+            "source_sha256": hashlib.sha256(file_content).hexdigest(),
         })
         logger.info(f"[BATCH-UPLOAD] File {i+1} validation passed")
 
     processing_units = []
     for file_info in validated_files:
+        document_id = file_info["document_id"]
         filename = file_info["filename"]
         content = file_info["content"]
 
@@ -586,6 +761,7 @@ async def create_batch_job_multipart(
             for page_index, page_bytes in enumerate(page_images, start=1):
                 processing_units.append({
                     "id": f"img_{file_info['index']}_page_{page_index}",
+                    "document_id": document_id,
                     "content": page_bytes,
                     "filename": f"{file_info['index']}_{base_name}_page_{page_index}.png",
                     "content_type": "image/png",
@@ -594,12 +770,14 @@ async def create_batch_job_multipart(
                     "source_filename": filename,
                     "source_content_type": "application/pdf",
                     "source_page": page_index,
-                    "source_page_count": len(page_images)
+                    "source_page_count": len(page_images),
+                    "source_sha256": hashlib.sha256(page_bytes).hexdigest(),
                 })
             continue
 
         processing_units.append({
             "id": f"img_{file_info['index']}",
+            "document_id": document_id,
             "content": content,
             "filename": f"{file_info['index']}_{filename}",
             "content_type": file_info["content_type"],
@@ -608,7 +786,8 @@ async def create_batch_job_multipart(
             "source_filename": filename,
             "source_content_type": file_info["content_type"],
             "source_page": None,
-            "source_page_count": None
+            "source_page_count": None,
+            "source_sha256": file_info["source_sha256"],
         })
 
     processing_count = len(processing_units)
@@ -677,6 +856,7 @@ async def create_batch_job_multipart(
 
             stored_images.append({
                 'id': unit["id"],
+                'document_id': unit["document_id"],
                 'storage_path': source_file['storage_path'],
                 'filename': unit["filename"],
                 'content_type': source_file['content_type'],
@@ -686,7 +866,50 @@ async def create_batch_job_multipart(
                 'original_filename': unit["source_filename"],
                 'source_content_type': unit["source_content_type"],
                 'source_page': unit["source_page"],
-                'source_page_count': unit["source_page_count"]
+                'source_page_count': unit["source_page_count"],
+                'source_sha256': unit["source_sha256"],
+            })
+
+        document_records = []
+        for source_file_info in validated_files:
+            document_id = source_file_info["document_id"]
+            first_unit = next(
+                stored_image for stored_image in stored_images
+                if stored_image["document_id"] == document_id
+            )
+            source_storage_path = first_unit["storage_path"]
+
+            if source_file_info["content_type"] == "application/pdf":
+                durable_source = await supabase_service.upload_source_file(
+                    file_data=source_file_info["content"],
+                    owner_id=storage_owner_id,
+                    job_id=job_id,
+                    filename=f"source_{source_file_info['index']}_{source_file_info['filename']}",
+                    content_type=source_file_info["content_type"],
+                )
+                source_storage_path = durable_source["storage_path"]
+
+            document_records.append({
+                "id": document_id,
+                "job_id": job_id,
+                "owner_user_id": user['user_id'] if user else None,
+                "owner_session_id": None if user else session.session_id,
+                "workspace_id": workspace_id,
+                "original_filename": source_file_info["filename"],
+                "source_storage_path": source_storage_path,
+                "source_content_type": source_file_info["content_type"],
+                "selected_mode": normalized_document_mode,
+                "resolved_mode": (
+                    normalized_document_mode
+                    if normalized_document_mode in {"table", "invoice", "receipt", "bank_statement", "notes"}
+                    else None
+                ),
+                "status": "queued",
+                "metadata": {
+                    "source_page_count": first_unit.get("source_page_count"),
+                    "source_sha256": source_file_info["source_sha256"],
+                },
+                "expires_at": (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
             })
 
         # Create job metadata for Redis with storage paths, not raw image payloads.
@@ -726,6 +949,7 @@ async def create_batch_job_multipart(
                 'session_id': session.session_id,
                 'owner_user_id': user['user_id'] if user else None,
                 'owner_session_id': None if user else session.session_id,
+                'workspace_id': workspace_id,
                 'plan': limits["plan"],
                 'max_files_per_batch': limits["max_files_per_batch"],
                 'credits_reserved': credits_reserved_count,
@@ -733,6 +957,12 @@ async def create_batch_job_multipart(
             },
             status='queued'
         )
+        await persist_queued_documents(
+            supabase_service,
+            document_records,
+            [{**stored_image, "job_id": job_id} for stored_image in stored_images],
+        )
+        await refresh_uploaded_duplicate_warnings(supabase_service, document_records)
         logger.info(f"Created durable Supabase job {job_id} for owner {durable_owner_id}")
 
         # Store job in Redis
@@ -763,6 +993,7 @@ async def create_batch_job_multipart(
                     'session_id': session.session_id,
                     'owner_user_id': user['user_id'] if user else None,
                     'owner_session_id': None if user else session.session_id,
+                    'workspace_id': workspace_id,
                     'celery_task_id': async_result.id,
                     'plan': limits["plan"],
                     'max_files_per_batch': limits["max_files_per_batch"],
@@ -798,6 +1029,10 @@ async def create_batch_job_multipart(
             logger.info(f"[BATCH-UPLOAD] Cleaned up failed job {job_id}")
         except Exception as cleanup_error:
             logger.warning(f"[BATCH-UPLOAD] Failed to cleanup job {job_id}: {cleanup_error}")
+        try:
+            await supabase_service.update_job_documents_status(job_id, "failed")
+        except Exception:
+            pass
 
         if user and credits_reserved:
             supabase_service.refund_credits(user['user_id'], credits_reserved_count)
@@ -953,6 +1188,9 @@ async def get_job_status(
                         download_url=f"/api/v1/download/{file_info['file_id']}",
                         filename=file_info['filename'],
                         original_image=file_info.get('original_filename', file_info.get('image_id', 'unknown')),
+                        document_id=file_info.get('document_id'),
+                        source_page=file_info.get('source_page'),
+                        source_page_count=file_info.get('source_page_count'),
                         size_bytes=file_info.get('size_bytes'),
                         status=file_info.get('status'),
                         document_mode=file_info.get('document_mode'),
@@ -1060,6 +1298,451 @@ async def get_job_status(
             )
 
 
+@router.get("/{job_id}/documents", response_model=Dict[str, Any])
+async def get_job_documents(
+    job_id: str,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Return durable logical documents and extraction states for an owned batch."""
+    supabase_service = get_supabase_service()
+    supabase_job = await supabase_service.get_job(job_id)
+    if not supabase_job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+
+    metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+    stored_user_id = str(supabase_job.get("user_id") or "")
+    owner_user_id = metadata.get("owner_user_id") or (
+        stored_user_id if not stored_user_id.startswith("session:") else ""
+    )
+    owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
+    verify_job_data_access(
+        {
+            "job_id": job_id,
+            "user_id": owner_user_id or "",
+            "session_id": owner_session_id or "",
+        },
+        user,
+        session.session_id,
+    )
+
+    documents = await supabase_service.get_job_documents(job_id)
+    preview_expires_in = 60 * 60
+    for document in documents:
+        if user:
+            document["vendor_suggestion"] = await supabase_service.get_vendor_suggestion(document, user["user_id"])
+        document["source_access_url"] = await supabase_service.create_signed_url(
+            document["source_storage_path"],
+            expires_in=preview_expires_in,
+        )
+        document["preview_expires_in"] = preview_expires_in
+
+        result_files_by_id = {
+            result_file["file_id"]: result_file
+            for result_file in document.get("result_files", [])
+            if result_file.get("file_id")
+        }
+        for extraction in document.get("extractions", []):
+            extraction_metadata = _parse_metadata(extraction.get("metadata"))
+            source_preview_path = (
+                extraction_metadata.get("source_storage_path")
+                or document["source_storage_path"]
+            )
+            extraction["source_preview_url"] = await supabase_service.create_signed_url(
+                source_preview_path,
+                expires_in=preview_expires_in,
+            )
+            extraction["source_page"] = extraction_metadata.get("source_page")
+            extraction["source_page_count"] = extraction_metadata.get("source_page_count")
+            extraction["source_filename"] = (
+                extraction_metadata.get("source_filename")
+                or document["original_filename"]
+            )
+            result_file = result_files_by_id.get(extraction.get("result_file_id"))
+            if result_file:
+                result_file["input_preview_url"] = extraction["source_preview_url"]
+                result_file["source_page"] = extraction["source_page"]
+                result_file["source_page_count"] = extraction["source_page_count"]
+                result_file["source_filename"] = extraction["source_filename"]
+
+    return {
+        "job_id": job_id,
+        "status": supabase_job.get("status", "unknown"),
+        "documents": documents,
+        "total": len(documents),
+    }
+
+
+@router.get("/{job_id}/documents/{document_id}/review", response_model=Dict[str, Any])
+async def get_document_review(
+    job_id: str,
+    document_id: str,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Return raw extraction data, reviewed values, and audit history for an owned document."""
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    document = await supabase_service.get_document_review(job_id, document_id)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    if user:
+        document["vendor_suggestion"] = await supabase_service.get_vendor_suggestion(document, user["user_id"])
+    return {"job_id": job_id, "document": document}
+
+
+@router.post("/{job_id}/documents/{document_id}/review/changes", response_model=Dict[str, Any])
+async def update_document_review_value(
+    job_id: str,
+    document_id: str,
+    request: DocumentReviewChangeRequest,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Persist one corrected structured value or grid cell for an owned document."""
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
+    try:
+        result = await supabase_service.apply_document_review_change(
+            job_id=job_id,
+            document_id=document_id,
+            processing_unit_id=request.processing_unit_id,
+            field_path=request.field_path,
+            value=request.value,
+            actor=actor,
+            base_review_grid=request.base_review_grid,
+        )
+        return {"job_id": job_id, "document_id": document_id, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{job_id}/documents/{document_id}/review/status", response_model=Dict[str, Any])
+async def update_document_review_status(
+    job_id: str,
+    document_id: str,
+    request: DocumentReviewStatusRequest,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Confirm Ready or persist another supported document review state."""
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
+    try:
+        document = await supabase_service.set_document_review_status(
+            job_id=job_id,
+            document_id=document_id,
+            review_status=request.review_status,
+            actor=actor,
+            reason=request.reason,
+        )
+        return {"job_id": job_id, "document": document}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{job_id}/documents/{document_id}/vendor-rule", response_model=Dict[str, Any])
+async def save_document_vendor_rule(
+    job_id: str,
+    document_id: str,
+    request: VendorRuleFromDocumentRequest,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: dict = Depends(get_current_user),
+):
+    """Store explicit vendor memory only from a confirmed owned invoice or receipt."""
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    try:
+        rule = await supabase_service.save_vendor_rule_from_document(
+            job_id=job_id,
+            document_id=document_id,
+            user_id=user["user_id"],
+            suggested_fields=request.suggested_fields.model_dump(exclude_none=True),
+        )
+        document = await supabase_service.get_document_review(job_id, document_id)
+        if document:
+            document["vendor_suggestion"] = rule
+        return {"job_id": job_id, "rule": rule, "document": document}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{job_id}/documents/{document_id}/duplicates/override", response_model=Dict[str, Any])
+async def override_document_duplicate_warning(
+    job_id: str,
+    document_id: str,
+    request: DocumentDuplicateOverrideRequest,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Acknowledge a duplicate warning while retaining an auditable document."""
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
+    try:
+        document = await supabase_service.override_document_duplicate_warning(
+            job_id=job_id,
+            document_id=document_id,
+            warning_id=request.warning_id,
+            actor=actor,
+            reason=request.reason,
+        )
+        return {"job_id": job_id, "document": document}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.get("/{job_id}/documents/{document_id}/export")
+async def export_reviewed_document(
+    job_id: str,
+    document_id: str,
+    format: str = "xlsx",
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Download one document rendered from durable human-reviewed values."""
+    export_format = str(format or "xlsx").lower()
+    if export_format not in {"xlsx", "csv", "txt"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported export format")
+
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    document = await supabase_service.refresh_document_duplicate_warnings(job_id, document_id)
+    if supabase_service.active_duplicate_warnings(document):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "DUPLICATE_REVIEW_REQUIRED",
+                "message": "Review or keep this possible duplicate before exporting.",
+                "document_id": document_id,
+            },
+        )
+    document = await supabase_service.get_document_review(job_id, document_id)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    if not document.get("extractions"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Document has no extracted data to export")
+
+    rendered = ExcelService().export_reviewed_document(document, export_format)
+    return StreamingResponse(
+        io.BytesIO(rendered["content"]),
+        media_type=rendered["content_type"],
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(rendered['filename'], safe='')}",
+            "Content-Length": str(len(rendered["content"])),
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+        },
+    )
+
+
+@router.get("/{job_id}/exports/reviewed")
+async def export_reviewed_batch(
+    job_id: str,
+    format: str = "xlsx",
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Download one reviewed output per durable source document in a ZIP archive."""
+    export_format = str(format or "xlsx").lower()
+    if export_format not in {"xlsx", "csv", "txt"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported export format")
+
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    documents = await supabase_service.get_job_documents(job_id)
+    documents = [
+        await supabase_service.refresh_document_duplicate_warnings(job_id, document["id"])
+        for document in documents
+    ]
+    duplicate_documents = [
+        document["id"]
+        for document in documents
+        if supabase_service.active_duplicate_warnings(document)
+    ]
+    if duplicate_documents:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "DUPLICATE_REVIEW_REQUIRED",
+                "message": "Resolve possible duplicate files before downloading the reviewed batch.",
+                "document_ids": duplicate_documents,
+            },
+        )
+    documents = [
+        document
+        for document in documents
+        if document.get("review_status") != "deleted" and document.get("extractions")
+    ]
+    if not documents:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No reviewed documents available")
+
+    exporter = ExcelService()
+    buffer = io.BytesIO()
+    used_names: Dict[str, int] = {}
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for document in documents:
+            rendered = exporter.export_reviewed_document(document, export_format)
+            filename = rendered["filename"]
+            count = used_names.get(filename, 0)
+            used_names[filename] = count + 1
+            if count:
+                stem, extension = os.path.splitext(filename)
+                filename = f"{stem}_{count + 1}{extension}"
+            archive.writestr(filename, rendered["content"])
+
+    buffer.seek(0)
+    archive_name = f"reviewed_batch_{job_id[:8]}.zip"
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(archive_name, safe='')}",
+            "Content-Length": str(len(buffer.getvalue())),
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+        },
+    )
+
+
+@router.post("/{job_id}/documents/{document_id}/override-mode", response_model=Dict[str, Any])
+async def override_job_document_mode(
+    job_id: str,
+    document_id: str,
+    request: DocumentModeOverrideRequest,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: Optional[dict] = Depends(get_optional_user),
+):
+    """Audit a manual auto-detection override and rerun the selected extractor."""
+    supabase_service = get_supabase_service()
+    supabase_job = await supabase_service.get_job(job_id)
+    if not supabase_job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+    stored_user_id = str(supabase_job.get("user_id") or "")
+    owner_user_id = metadata.get("owner_user_id") or (
+        stored_user_id if not stored_user_id.startswith("session:") else ""
+    )
+    owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
+    verify_job_data_access(
+        {"job_id": job_id, "user_id": owner_user_id or "", "session_id": owner_session_id or ""},
+        user,
+        session.session_id,
+    )
+
+    document = await supabase_service.get_job_document(job_id, document_id)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    units = document.get("extractions") or []
+    if not units:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Document has no source units to reprocess")
+
+    selected_mode = request.document_mode
+    output_format = request.output_format
+    if selected_mode != "notes" and output_format == "txt":
+        output_format = "xlsx"
+
+    credits_reserved = 0
+    if user:
+        if not supabase_service.check_and_use_credits(user["user_id"], len(units)):
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "code": "INSUFFICIENT_CREDITS",
+                    "message": "More credits are required to reprocess this document.",
+                    "credits_required": len(units),
+                },
+            )
+        credits_reserved = len(units)
+
+    actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
+    try:
+        await supabase_service.override_job_document_mode(
+            job_id=job_id,
+            document_id=document_id,
+            document_mode=selected_mode,
+            actor=actor,
+            reason=request.reason,
+        )
+        rerun_units = []
+        for extraction in units:
+            source_metadata = _parse_metadata(extraction.get("metadata"))
+            processing_unit_id = extraction["processing_unit_id"]
+            source_path = source_metadata.get("source_storage_path") or document["source_storage_path"]
+            image_info = {
+                "id": processing_unit_id,
+                "document_id": document_id,
+                "storage_path": source_path,
+                "filename": source_metadata.get("source_filename") or document["original_filename"],
+                "original_filename": source_metadata.get("source_filename") or document["original_filename"],
+                "content_type": source_metadata.get("source_content_type") or document.get("source_content_type"),
+                "output_format": output_format,
+                "document_mode": selected_mode,
+                "source_page": source_metadata.get("source_page"),
+                "source_page_count": source_metadata.get("source_page_count"),
+                "source_sha256": source_metadata.get("source_sha256"),
+                "force_reprocess": True,
+            }
+            rerun_units.append(image_info)
+            await supabase_service.upsert_document_extraction({
+                "document_id": document_id,
+                "job_id": job_id,
+                "processing_unit_id": processing_unit_id,
+                "status": "queued",
+                "structured_data": {},
+                "review_status": "pending",
+                "validation_flags": [],
+                "edited": False,
+                "metadata": {
+                    **source_metadata,
+                    "manual_override_mode": selected_mode,
+                    "manual_override_requested_at": datetime.utcnow().isoformat(),
+                },
+            })
+
+        header = [
+            process_single_stored_image.s(
+                job_id,
+                session.session_id,
+                image_info,
+                index,
+                len(rerun_units),
+                user["user_id"] if user else None,
+            ).set(queue="image_processing", priority=8)
+            for index, image_info in enumerate(rerun_units)
+        ]
+        callback = finalize_document_override.s(
+            job_id,
+            document_id,
+            user["user_id"] if user else None,
+            credits_reserved,
+        ).set(queue="batch_processing", priority=7)
+        chord_result = chord(header)(callback)
+        return {
+            "job_id": job_id,
+            "document_id": document_id,
+            "status": "processing",
+            "resolved_mode": selected_mode,
+            "task_id": str(chord_result.id),
+        }
+    except HTTPException:
+        if user and credits_reserved:
+            supabase_service.refund_credits(user["user_id"], credits_reserved)
+        raise
+    except Exception as exc:
+        if user and credits_reserved:
+            supabase_service.refund_credits(user["user_id"], credits_reserved)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unable to reprocess this document: {str(exc)}",
+        )
+
+
 @router.delete("/{job_id}")
 async def cancel_job(
     job_id: str,
@@ -1128,6 +1811,10 @@ async def cancel_job(
         'error': 'Job cancelled by user',
         'updated_at': datetime.utcnow().isoformat()
     })
+    try:
+        await get_supabase_service().update_job_documents_status(job_id, "cancelled")
+    except Exception as e:
+        logger.debug(f"Failed to update durable document cancellation for job {job_id}: {e}")
 
     if user:
         try:

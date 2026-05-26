@@ -362,6 +362,7 @@ async def _prepare_storage_batch_async(
 
     try:
         supabase = get_supabase_service()
+        await supabase.update_job_documents_status(job_id, "processing")
         await supabase.update_job_status(
             job_id=job_id,
             status='processing',
@@ -450,11 +451,18 @@ async def _process_single_stored_image_async(
     image_bytes = await supabase_service.download_file_from_storage(storage_path)
     image_payload = {
         'id': image_info.get('id', f"img_{img_index}"),
+        'document_id': image_info.get('document_id'),
         'data': base64.b64encode(image_bytes).decode('utf-8'),
         'filename': image_info.get('filename', f"image_{img_index}.png"),
         'original_filename': image_info.get('original_filename') or image_info.get('filename', f"image_{img_index}.png"),
         'output_format': image_info.get('output_format', 'xlsx'),
-        'document_mode': image_info.get('document_mode', 'table')
+        'document_mode': image_info.get('document_mode', 'table'),
+        'source_storage_path': image_info.get('storage_path'),
+        'source_content_type': image_info.get('content_type'),
+        'source_page': image_info.get('source_page'),
+        'source_page_count': image_info.get('source_page_count'),
+        'source_sha256': image_info.get('source_sha256'),
+        'force_reprocess': bool(image_info.get('force_reprocess')),
     }
 
     return await process_single_image_simple(
@@ -536,6 +544,7 @@ async def _finalize_storage_batch_async(
         await _restore_image_results_from_supabase(redis, job_id, user_id, session_id)
         completed_image_results = await redis.get_job_image_results(job_id) or {}
         failed_results: List[Dict[str, Any]] = []
+        needs_review_results: List[Dict[str, Any]] = []
 
         for idx, result in enumerate(task_results or []):
             if isinstance(result, Exception):
@@ -546,6 +555,8 @@ async def _finalize_storage_batch_async(
                     'filename': image_info.get('filename'),
                     'error': str(result)
                 })
+            elif isinstance(result, dict) and result.get('status') == 'needs_review':
+                needs_review_results.append(result)
             elif isinstance(result, dict) and result.get('status') != 'success':
                 failed_results.append(result)
 
@@ -562,6 +573,9 @@ async def _finalize_storage_batch_async(
             elif not any(
                 isinstance(failure, dict) and failure.get('image_id') == image_id
                 for failure in failed_results
+            ) and not any(
+                isinstance(review_item, dict) and review_item.get('image_id') == image_id
+                for review_item in needs_review_results
             ):
                 failed_results.append({
                     'status': 'error',
@@ -570,9 +584,9 @@ async def _finalize_storage_batch_async(
                     'error': 'Image did not complete with a durable result'
                 })
 
-        if len(successful_results) == total_images:
+        if len(successful_results) + len(needs_review_results) == total_images:
             final_status = 'completed'
-        elif successful_results:
+        elif successful_results or needs_review_results:
             final_status = 'partially_completed'
         else:
             final_status = 'failed'
@@ -592,13 +606,15 @@ async def _finalize_storage_batch_async(
                 'file_id': generated_files[0]['file_id'] if generated_files else None,
                 'download_url': download_urls[0] if download_urls else None,
                 'failed_images': len(failed_results),
-                'processed_images': len(successful_results)
+                'processed_images': len(successful_results) + len(needs_review_results),
+                'needs_review_images': len(needs_review_results)
             })
         except Exception as redis_error:
             logger.warning(f"[Job {job_id}] Failed to update final status in Redis: {redis_error}")
 
         try:
             supabase = get_supabase_service()
+            await supabase.finalize_job_document_statuses(job_id)
             credit_metadata = await _settle_reserved_credits(
                 supabase=supabase,
                 job_id=job_id,
@@ -614,6 +630,7 @@ async def _finalize_storage_batch_async(
                     'processing_time': processing_time,
                     'successful_images': len(successful_results),
                     'failed_images': len(failed_results),
+                    'needs_review_images': len(needs_review_results),
                     'total_images': total_images,
                     'completed_at': datetime.utcnow().isoformat(),
                     'generated_files': generated_files,
@@ -634,6 +651,9 @@ async def _finalize_storage_batch_async(
                 download_url=f"/api/v1/download/{file_data['file_id']}",
                 filename=file_data['filename'],
                 image_id=file_data.get('image_id'),
+                document_id=file_data.get('document_id'),
+                source_page=file_data.get('source_page'),
+                source_page_count=file_data.get('source_page_count'),
                 size_bytes=file_data.get('size_bytes'),
                 status=file_data.get('status'),
                 document_mode=file_data.get('document_mode'),
@@ -666,12 +686,13 @@ async def _finalize_storage_batch_async(
 
         logger.info(
             f"[Job {job_id}] Finalized storage batch: {len(successful_results)} successful, "
-            f"{len(failed_results)} failed"
+            f"{len(needs_review_results)} needs review, {len(failed_results)} failed"
         )
         return {
             'job_id': job_id,
             'status': final_status,
             'successful_images': len(successful_results),
+            'needs_review_images': len(needs_review_results),
             'failed_images': len(failed_results),
             'images': total_images
         }
@@ -710,6 +731,64 @@ async def _finalize_storage_batch_async(
         except Exception as supabase_error:
             logger.error(f"[Job {job_id}] Failed to update Supabase failed status: {supabase_error}")
         raise
+
+
+@celery_app.task(
+    bind=True,
+    base=BaseTask,
+    name="finalize_document_override",
+    max_retries=1,
+    default_retry_delay=30,
+    queue="batch_processing",
+    priority=7,
+)
+def finalize_document_override(
+    self,
+    task_results: List[Dict[str, Any]],
+    job_id: str,
+    document_id: str,
+    user_id: Optional[str] = None,
+    credits_reserved: int = 0,
+) -> Dict[str, Any]:
+    """Finish a user-selected auto-detection override without rewriting the batch lifecycle."""
+    main_loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(main_loop)
+        return main_loop.run_until_complete(
+            _finalize_document_override_async(
+                task_results=task_results,
+                job_id=job_id,
+                document_id=document_id,
+                user_id=user_id,
+                credits_reserved=credits_reserved,
+            )
+        )
+    finally:
+        main_loop.close()
+
+
+async def _finalize_document_override_async(
+    task_results: List[Dict[str, Any]],
+    job_id: str,
+    document_id: str,
+    user_id: Optional[str],
+    credits_reserved: int,
+) -> Dict[str, Any]:
+    supabase = get_supabase_service()
+    successful = sum(
+        1 for result in (task_results or [])
+        if isinstance(result, dict) and result.get("status") == "success"
+    )
+    if user_id and credits_reserved > successful:
+        supabase.refund_credits(user_id, credits_reserved - successful)
+    await supabase.finalize_job_document_statuses(job_id)
+    document = await supabase.get_job_document(job_id, document_id)
+    return {
+        "job_id": job_id,
+        "document_id": document_id,
+        "status": document.get("status") if document else "unknown",
+        "successful_images": successful,
+    }
 
 
 @celery_app.task(
