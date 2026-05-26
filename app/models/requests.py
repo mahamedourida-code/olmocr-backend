@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, Literal, Union
+from typing import Any, Dict, List, Optional, Literal, Union
 from pydantic import BaseModel, Field, validator
 from app.core.config import settings
 
