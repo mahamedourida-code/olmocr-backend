@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     max_max_files_per_batch: int = Field(50, env="MAX_MAX_FILES_PER_BATCH")
     mega_max_files_per_batch: int = Field(100, env="MEGA_MAX_FILES_PER_BATCH")
     enterprise_max_files_per_batch: int = Field(50, env="ENTERPRISE_MAX_FILES_PER_BATCH")
-    file_retention_hours: int = Field(24, env="FILE_RETENTION_HOURS")
+    file_retention_hours: int = Field(720, env="FILE_RETENTION_HOURS")
     
     # Server Configuration
     host: str = Field("0.0.0.0", env="HOST")

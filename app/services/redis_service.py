@@ -849,7 +849,7 @@ class RedisService:
                     download_urls=job_data.get('download_urls', []),
                     primary_download_url=job_data.get('download_url'),
                     processing_time=processing_time,
-                    expires_at=datetime.utcnow() + timedelta(hours=24),  # Default expiration
+                    expires_at=datetime.utcnow() + timedelta(hours=settings.file_retention_hours),
                     errors=job_data.get('errors', []),
                     session_id=session_id
                 )

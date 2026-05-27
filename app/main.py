@@ -14,6 +14,7 @@ from datetime import datetime
 from app.core.config import get_settings
 from app.api.v1 import api_router
 from app.services.storage import FileStorageManager
+from app.services.supabase_service import get_supabase_service
 from app.services.websocket_service import get_websocket_manager
 from app.utils.exceptions import ProcessingError, ValidationError
 
@@ -341,9 +342,10 @@ async def periodic_cleanup(storage_service: FileStorageManager, interval_hours: 
             
             # Clean up expired files and sessions
             cleanup_count = storage_service.cleanup_expired_files()
+            durable_cleanup_count = await get_supabase_service().delete_expired_document_content()
             
             logger.info(
-                f"Cleanup complete: {cleanup_count} items cleaned up"
+                f"Cleanup complete: {cleanup_count} local items and {durable_cleanup_count} stored documents cleaned up"
             )
             
         except Exception as e:

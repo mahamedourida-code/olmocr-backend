@@ -8,6 +8,7 @@ import copy
 import csv
 import io
 import re
+import hashlib
 from typing import Optional, Dict, Any, List
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -2022,6 +2023,237 @@ class SupabaseService:
             }
             for document in documents
         ]
+
+    @staticmethod
+    def _session_audit_hash(session_id: Optional[str]) -> Optional[str]:
+        """Keep an anonymous deletion audit without retaining a usable session token."""
+        if not session_id:
+            return None
+        return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()
+
+    async def _remove_storage_objects(self, storage_paths: List[str]) -> int:
+        """Delete private storage objects before deleting their authorization records."""
+        paths = sorted({str(path) for path in storage_paths if path})
+        for index in range(0, len(paths), 1000):
+            response = self.client.storage.from_(self.storage_bucket).remove(paths[index:index + 1000])
+            if hasattr(response, "error") and response.error:
+                raise Exception(f"Unable to delete stored document content: {response.error}")
+            if isinstance(response, dict) and response.get("error"):
+                raise Exception(f"Unable to delete stored document content: {response['error']}")
+        return len(paths)
+
+    async def _revoke_share_sessions_for_files(self, file_ids: List[str]) -> None:
+        """Deactivate public share links that contain any deleted result file."""
+        deleted_ids = {str(file_id) for file_id in file_ids if file_id}
+        if not deleted_ids:
+            return
+        response = self.client.table("share_sessions")\
+            .select("session_id,file_ids")\
+            .eq("is_active", True)\
+            .execute()
+        for share_session in response.data or []:
+            shared_ids = {str(file_id) for file_id in (share_session.get("file_ids") or [])}
+            if shared_ids.intersection(deleted_ids):
+                self.client.table("share_sessions").update({
+                    "is_active": False,
+                    "file_ids": [],
+                    "metadata": {},
+                }).eq("session_id", share_session["session_id"]).execute()
+
+    async def _scrub_job_after_content_deletion(
+        self,
+        job_id: str,
+        deleted_documents: int,
+        all_documents_deleted: bool,
+        deleted_file_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Remove content-bearing job/history fields after durable document erasure."""
+        deleted_ids = {str(file_id) for file_id in (deleted_file_ids or []) if file_id}
+        history_response = self.client.table("job_history")\
+            .select("id,processing_metadata")\
+            .like("original_job_id", f"{job_id}%")\
+            .execute()
+        for history_item in history_response.data or []:
+            metadata = self._document_metadata({"metadata": history_item.get("processing_metadata")})
+            storage_files = metadata.get("storage_files") or []
+            history_file_ids = {
+                str(metadata.get("file_id") or ""),
+                *{
+                    str(storage_file.get("file_id") or "")
+                    for storage_file in storage_files
+                    if isinstance(storage_file, dict)
+                },
+            }
+            if all_documents_deleted or history_file_ids.intersection(deleted_ids):
+                self.client.table("job_history").delete().eq("id", history_item["id"]).execute()
+
+        job = await self.get_job(job_id)
+        if not job:
+            return
+        if all_documents_deleted:
+            self.client.table("processing_jobs").delete().eq("id", job_id).execute()
+            return
+
+        raw_metadata = job.get("processing_metadata") or {}
+        if isinstance(raw_metadata, dict):
+            metadata = raw_metadata
+        elif isinstance(raw_metadata, str):
+            try:
+                parsed_metadata = json.loads(raw_metadata)
+                metadata = parsed_metadata if isinstance(parsed_metadata, dict) else {}
+            except json.JSONDecodeError:
+                metadata = {}
+        else:
+            metadata = {}
+        retained_metadata = {
+            key: metadata[key]
+            for key in (
+                "owner_user_id",
+                "owner_session_id",
+                "session_id",
+                "credits_reserved",
+                "credits_charged",
+                "credits_refunded",
+                "credits_settled",
+            )
+            if key in metadata
+        }
+        retained_metadata.update({
+            "stored_content_deleted": True,
+            "deleted_documents": deleted_documents,
+            "deleted_at": datetime.utcnow().isoformat(),
+        })
+        self.client.table("processing_jobs").update({
+            "filename": "Deleted batch" if all_documents_deleted else "Stored batch",
+            "image_url": None,
+            "result_url": None,
+            "processing_metadata": retained_metadata,
+            "status": "deleted" if all_documents_deleted else job.get("status", "completed"),
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", job_id).execute()
+
+    async def delete_document_content(
+        self,
+        job_id: str,
+        document_id: str,
+        actor: Dict[str, Any],
+        deletion_scope: str = "document",
+        reason: str = "user_requested",
+        scrub_job: bool = True,
+    ) -> Dict[str, Any]:
+        """Permanently erase one stored document while keeping a non-content audit marker."""
+        document = await self.get_job_document(job_id, document_id)
+        if not document:
+            raise ValueError("Document not found")
+
+        result_files = document.get("result_files") or []
+        storage_paths = [document.get("source_storage_path")]
+        storage_paths.extend(file_info.get("storage_path") for file_info in result_files)
+        for extraction in document.get("extractions") or []:
+            storage_paths.append(self._document_metadata(extraction).get("source_storage_path"))
+        file_ids = [file_info.get("file_id") for file_info in result_files if file_info.get("file_id")]
+
+        storage_object_count = await self._remove_storage_objects(storage_paths)
+        await self._revoke_share_sessions_for_files(file_ids)
+
+        self.client.table("quickbooks_receipt_publications").delete().eq("document_id", document_id).execute()
+        self.client.table("quickbooks_bill_publications").delete().eq("document_id", document_id).execute()
+        self.client.table("accounts_payable_items").delete().eq("document_id", document_id).execute()
+        self.client.table("vendor_rules").update({
+            "source_document_id": None,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("source_document_id", document_id).execute()
+        self.client.table("document_review_changes").delete().eq("document_id", document_id).execute()
+        self.client.table("document_extractions").delete().eq("document_id", document_id).execute()
+        self.client.table("job_files").delete().eq("document_id", document_id).execute()
+        self.client.table("job_documents").delete().eq("id", document_id).eq("job_id", job_id).execute()
+
+        actor_user_id = actor.get("user_id")
+        actor_session_id = actor.get("session_id")
+        self.client.table("document_deletion_audit").insert({
+            "deletion_scope": deletion_scope,
+            "document_id": document_id,
+            "job_id": job_id,
+            "workspace_id": document.get("workspace_id"),
+            "owner_user_id": document.get("owner_user_id"),
+            "owner_session_hash": self._session_audit_hash(document.get("owner_session_id")),
+            "actor_user_id": actor_user_id,
+            "actor_session_hash": self._session_audit_hash(actor_session_id),
+            "reason": reason,
+            "storage_object_count": storage_object_count,
+            "result_file_count": len(file_ids),
+        }).execute()
+
+        remaining_documents = await self.get_job_documents(job_id)
+        if scrub_job:
+            await self._scrub_job_after_content_deletion(
+                job_id,
+                deleted_documents=1,
+                all_documents_deleted=not remaining_documents,
+                deleted_file_ids=file_ids,
+            )
+        return {
+            "document_id": document_id,
+            "deleted": True,
+            "deleted_file_ids": file_ids,
+            "remaining_documents": len(remaining_documents),
+        }
+
+    async def delete_batch_content(
+        self,
+        job_id: str,
+        actor: Dict[str, Any],
+        reason: str = "user_requested",
+    ) -> Dict[str, Any]:
+        """Permanently erase every durable document in one owned batch."""
+        documents = await self.get_job_documents(job_id)
+        if not documents:
+            raise ValueError("No stored documents found")
+        deleted_file_ids: List[str] = []
+        for document in documents:
+            result = await self.delete_document_content(
+                job_id=job_id,
+                document_id=document["id"],
+                actor=actor,
+                deletion_scope="batch",
+                reason=reason,
+                scrub_job=False,
+            )
+            deleted_file_ids.extend(result.get("deleted_file_ids") or [])
+        await self._scrub_job_after_content_deletion(
+            job_id,
+            deleted_documents=len(documents),
+            all_documents_deleted=True,
+            deleted_file_ids=deleted_file_ids,
+        )
+        return {
+            "job_id": job_id,
+            "deleted": True,
+            "deleted_documents": len(documents),
+            "deleted_file_ids": deleted_file_ids,
+        }
+
+    async def delete_expired_document_content(self, limit: int = 100) -> int:
+        """Remove expired stored financial data under the configured retention policy."""
+        expired = self.client.table("job_documents")\
+            .select("id,job_id")\
+            .lte("expires_at", datetime.utcnow().isoformat())\
+            .limit(limit)\
+            .execute()
+        deleted = 0
+        for document in expired.data or []:
+            try:
+                await self.delete_document_content(
+                    job_id=str(document["job_id"]),
+                    document_id=str(document["id"]),
+                    actor={},
+                    deletion_scope="retention",
+                    reason="retention_expired",
+                )
+                deleted += 1
+            except Exception as exc:
+                logger.error(f"Failed to erase expired document {document['id']}: {exc}")
+        return deleted
 
     async def upload_job_file(
         self,
