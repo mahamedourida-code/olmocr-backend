@@ -493,6 +493,175 @@ class QuickBooksService:
             payload["CurrencyRef"] = {"value": str(draft["currency"]).upper()}
         return payload
 
+    def _reviewed_receipt_payload(self, document: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge durable reviewed receipt fields and source-linked line items."""
+        payload = self.supabase._duplicate_review_payload(document)
+        line_items: List[Dict[str, Any]] = []
+        for extraction in sorted(
+            document.get("extractions") or [],
+            key=lambda row: (
+                self.supabase._document_metadata(row).get("source_page") is None,
+                self.supabase._document_metadata(row).get("source_page") or 0,
+            ),
+        ):
+            extracted_lines = self.supabase._initial_review_data(extraction).get("line_items")
+            if isinstance(extracted_lines, list):
+                line_items.extend(item for item in extracted_lines if isinstance(item, dict))
+        payload["line_items"] = line_items
+        return payload
+
+    def _receipt_lines(
+        self,
+        payload: Dict[str, Any],
+        connection: Dict[str, Any],
+        user_id: str,
+        account_ref_id: str,
+        tax_code_ref_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        account = self._selected_reference(connection, user_id, "account", account_ref_id, "expense account")
+        tax_code = self._selected_reference(
+            connection, user_id, "tax_code", tax_code_ref_id, "tax code", required=False
+        )
+        assert account is not None
+        detail: Dict[str, Any] = {
+            "AccountRef": {"value": account["external_id"], "name": account["display_name"]},
+            "BillableStatus": "NotBillable",
+        }
+        if tax_code:
+            detail["TaxCodeRef"] = {"value": tax_code["external_id"], "name": tax_code["display_name"]}
+        lines: List[Dict[str, Any]] = []
+        for raw in payload.get("line_items") or []:
+            amount = (
+                self._amount(raw.get("line_total"))
+                or self._amount(raw.get("total"))
+                or self._amount(raw.get("amount"))
+            )
+            if amount is None:
+                continue
+            line: Dict[str, Any] = {
+                "Amount": float(amount),
+                "DetailType": "AccountBasedExpenseLineDetail",
+                "AccountBasedExpenseLineDetail": dict(detail),
+            }
+            description = raw.get("description") or raw.get("item") or raw.get("name")
+            if description:
+                line["Description"] = str(description)[:4000]
+            lines.append(line)
+        if not lines:
+            total = self._amount(payload.get("total"))
+            if total is None:
+                raise ValueError("Confirm a receipt total or line amounts before publishing")
+            lines.append({
+                "Amount": float(total),
+                "Description": str(payload.get("merchant") or "Reviewed receipt")[:4000],
+                "DetailType": "AccountBasedExpenseLineDetail",
+                "AccountBasedExpenseLineDetail": dict(detail),
+            })
+        return lines
+
+    def _receipt_transaction_payload(
+        self,
+        document: Dict[str, Any],
+        connection: Dict[str, Any],
+        user_id: str,
+        request: Dict[str, Any],
+    ) -> tuple[str, Dict[str, Any]]:
+        reviewed = self._reviewed_receipt_payload(document)
+        lines = self._receipt_lines(
+            reviewed,
+            connection,
+            user_id,
+            str(request["account_ref_id"]),
+            request.get("tax_code_ref_id"),
+        )
+        destination = str(request["destination"])
+        vendor = self._selected_reference(
+            connection,
+            user_id,
+            "vendor",
+            request.get("vendor_ref_id"),
+            "vendor",
+            required=destination == "bill",
+        )
+        if destination == "bill":
+            assert vendor is not None
+            result: Dict[str, Any] = {
+                "VendorRef": {"value": vendor["external_id"], "name": vendor["display_name"]},
+                "Line": lines,
+            }
+            entity_type = "Bill"
+        else:
+            payment_type = request.get("payment_type")
+            if not payment_type or not request.get("payment_account_ref_id"):
+                raise ValueError("Select a paid-from account and payment type for an expense")
+            payment_account = self._selected_reference(
+                connection,
+                user_id,
+                "account",
+                request.get("payment_account_ref_id"),
+                "paid-from account",
+            )
+            assert payment_account is not None
+            payment_account_type = str((payment_account.get("details") or {}).get("account_type") or "").replace(" ", "").casefold()
+            if payment_type == "CreditCard" and payment_account_type != "creditcard":
+                raise ValueError("Credit card expenses must use a QuickBooks credit card account")
+            if payment_type in {"Cash", "Check"} and payment_account_type != "bank":
+                raise ValueError("Cash or check expenses must use a QuickBooks bank account")
+            result = {
+                "AccountRef": {
+                    "value": payment_account["external_id"],
+                    "name": payment_account["display_name"],
+                },
+                "PaymentType": payment_type,
+                "Line": lines,
+            }
+            if vendor:
+                result["EntityRef"] = {
+                    "value": vendor["external_id"],
+                    "name": vendor["display_name"],
+                    "type": "Vendor",
+                }
+            entity_type = "Purchase"
+        if reviewed.get("date"):
+            result["TxnDate"] = str(reviewed["date"])
+        if reviewed.get("currency"):
+            result["CurrencyRef"] = {"value": str(reviewed["currency"]).upper()}
+        return entity_type, result
+
+    async def _remember_receipt_coding(
+        self,
+        document: Dict[str, Any],
+        connection: Dict[str, Any],
+        user_id: str,
+        request: Dict[str, Any],
+    ) -> None:
+        """Persist mappings chosen during a successful receipt publication for later suggestions."""
+        existing = await self.supabase.get_vendor_suggestion(document, user_id)
+        fields = dict((existing or {}).get("suggested_fields") or {})
+        vendor = self._selected_reference(
+            connection, user_id, "vendor", request.get("vendor_ref_id"), "vendor", required=False
+        )
+        account = self._selected_reference(
+            connection, user_id, "account", request.get("account_ref_id"), "expense account"
+        )
+        tax_code = self._selected_reference(
+            connection, user_id, "tax_code", request.get("tax_code_ref_id"), "tax code", required=False
+        )
+        assert account is not None
+        fields.update({
+            "account_ref_id": account["external_id"],
+            "category_account": account["display_name"],
+            "destination_treatment": str(request["destination"]),
+        })
+        if vendor:
+            fields["vendor_ref_id"] = vendor["external_id"]
+        if tax_code:
+            fields["tax_code_ref_id"] = tax_code["external_id"]
+            fields["tax_code"] = tax_code["display_name"]
+        await self.supabase.save_vendor_rule_from_document(
+            str(document["job_id"]), str(document["id"]), user_id, fields
+        )
+
     @staticmethod
     def _safe_publication(publication: Dict[str, Any]) -> Dict[str, Any]:
         allowed = {
@@ -518,17 +687,45 @@ class QuickBooksService:
             raise ValueError("QuickBooks publication record could not be updated")
         return response.data[0]
 
-    async def _attach_source_to_bill(
+    @staticmethod
+    def _safe_receipt_publication(publication: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {
+            "id",
+            "destination",
+            "remote_entity_type",
+            "status",
+            "attempt_count",
+            "quickbooks_remote_id",
+            "quickbooks_attachment_id",
+            "attachment_status",
+            "failure_details",
+            "attempted_at",
+            "published_at",
+            "updated_at",
+        }
+        return {key: value for key, value in publication.items() if key in allowed}
+
+    def _update_receipt_publication(self, publication_id: str, update: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.client.table("quickbooks_receipt_publications")\
+            .update({**update, "updated_at": self._now().isoformat()})\
+            .eq("id", publication_id)\
+            .execute()
+        if not response.data:
+            raise ValueError("QuickBooks receipt publication record could not be updated")
+        return response.data[0]
+
+    async def _attach_source_to_entity(
         self,
         connection: Dict[str, Any],
-        item: Dict[str, Any],
-        bill_id: str,
+        source_storage_path: str,
+        source_filename: str,
+        source_content_type: Optional[str],
+        entity_type: str,
+        entity_id: str,
     ) -> str:
-        content = await self.supabase.download_file_from_storage(str(item["source_storage_path"]))
-        content_type = str(item.get("source_content_type") or "application/octet-stream")
-        filename = str(item.get("source_filename") or "source-document")
+        content = await self.supabase.download_file_from_storage(source_storage_path)
         metadata = {
-            "AttachableRef": [{"EntityRef": {"type": "Bill", "value": bill_id}}],
+            "AttachableRef": [{"EntityRef": {"type": entity_type, "value": entity_id}}],
             "Note": "Source document reviewed in AxLiner.",
         }
         payload = await self._accounting_post(
@@ -536,7 +733,11 @@ class QuickBooksService:
             f"{self._company_base_url}/v3/company/{connection['realm_id']}/upload?minorversion={settings.quickbooks_minor_version}",
             files={
                 "file_metadata_01": ("attachment.json", json.dumps(metadata), "application/json"),
-                "file_content_01": (filename, content, content_type),
+                "file_content_01": (
+                    source_filename,
+                    content,
+                    str(source_content_type or "application/octet-stream"),
+                ),
             },
         )
         entries = payload.get("AttachableResponse") or []
@@ -544,6 +745,21 @@ class QuickBooksService:
         if not attachable or not attachable.get("Id"):
             raise ValueError("QuickBooks returned no attachment identifier")
         return str(attachable["Id"])
+
+    async def _attach_source_to_bill(
+        self,
+        connection: Dict[str, Any],
+        item: Dict[str, Any],
+        bill_id: str,
+    ) -> str:
+        return await self._attach_source_to_entity(
+            connection,
+            str(item["source_storage_path"]),
+            str(item.get("source_filename") or "source-document"),
+            item.get("source_content_type"),
+            "Bill",
+            bill_id,
+        )
 
     async def publish_accounts_payable_bill(self, item_id: str, user_id: str) -> Dict[str, Any]:
         """Publish one explicitly ready AP invoice as one unpaid QBO Bill."""
@@ -699,6 +915,204 @@ class QuickBooksService:
             except ValueError as exc:
                 failures.append({"item_id": item_id, "detail": str(exc)})
         return {"items": items, "failures": failures, "total": len(items)}
+
+    async def publish_reviewed_receipt(
+        self,
+        job_id: str,
+        document_id: str,
+        user_id: str,
+        request: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Publish one reviewed receipt only after the user selects its QBO treatment."""
+        document = await self.supabase.get_job_document(job_id, document_id)
+        if not document or document.get("owner_user_id") != user_id:
+            raise ValueError("Receipt not found")
+        reviewed = self._reviewed_receipt_payload(document)
+        if self.supabase._duplicate_document_mode(document, reviewed) != "receipt":
+            raise ValueError("Only reviewed receipts can be published from this action")
+        if document.get("review_status") not in {"ready", "published"}:
+            raise ValueError("Confirm this receipt as Ready before publishing")
+        if self.supabase.active_duplicate_warnings(document):
+            raise ValueError("Resolve possible duplicate warnings before publishing this receipt")
+        destination = str(request.get("destination") or "")
+        if destination not in {"expense", "bill"}:
+            raise ValueError("Choose Expense or Bill before publishing this receipt")
+        workspace_id = document.get("workspace_id") or await self.supabase.resolve_owned_workspace_id(user_id)
+        if not workspace_id:
+            raise ValueError("Select a workspace before publishing")
+        _, connection = await self._owned_connection(user_id, workspace_id, require_connected=True)
+        assert connection is not None
+        entity_type, payload = self._receipt_transaction_payload(document, connection, user_id, request)
+        existing = self.client.table("quickbooks_receipt_publications")\
+            .select("*")\
+            .eq("document_id", document_id)\
+            .eq("owner_user_id", user_id)\
+            .limit(1)\
+            .execute()
+        publication = existing.data[0] if existing.data else None
+        if publication and publication.get("destination") != destination:
+            raise ValueError("This receipt already has a QuickBooks destination choice and cannot be republished differently")
+        if document.get("review_status") == "published" and (
+            not publication or not publication.get("quickbooks_remote_id")
+        ):
+            raise ValueError("This published receipt has no recorded QuickBooks transaction and cannot be published again")
+        if publication and publication.get("quickbooks_remote_id"):
+            if publication.get("attachment_status") != "attached":
+                try:
+                    attachment_id = await self._attach_source_to_entity(
+                        connection,
+                        str(document["source_storage_path"]),
+                        str(document.get("original_filename") or "receipt"),
+                        document.get("source_content_type"),
+                        str(publication["remote_entity_type"]),
+                        str(publication["quickbooks_remote_id"]),
+                    )
+                    publication = self._update_receipt_publication(publication["id"], {
+                        "attachment_status": "attached",
+                        "quickbooks_attachment_id": attachment_id,
+                    })
+                except Exception as exc:
+                    publication = self._update_receipt_publication(publication["id"], {
+                        "attachment_status": "failed",
+                        "failure_details": list(publication.get("failure_details") or []) + [{
+                            "stage": "attachment",
+                            "message": str(exc)[:240],
+                            "at": self._now().isoformat(),
+                        }],
+                    })
+            refreshed = await self.supabase.mark_receipt_quickbooks_published(
+                job_id, document_id, user_id, str(publication["id"]), destination
+            )
+            try:
+                await self._remember_receipt_coding(document, connection, user_id, request)
+            except Exception:
+                pass
+            refreshed["quickbooks_receipt_publication"] = self._safe_receipt_publication(publication)
+            return refreshed
+        if publication and publication.get("status") in {"publishing", "indeterminate"}:
+            raise ValueError(
+                "This receipt may already exist in QuickBooks. Check the connected company before retrying."
+            )
+        now = self._now().isoformat()
+        coding_snapshot = {
+            key: request.get(key)
+            for key in (
+                "destination",
+                "vendor_ref_id",
+                "account_ref_id",
+                "tax_code_ref_id",
+                "payment_account_ref_id",
+                "payment_type",
+            )
+            if request.get(key)
+        }
+        if publication:
+            updated = self.client.table("quickbooks_receipt_publications")\
+                .update({
+                    "status": "publishing",
+                    "attempt_count": int(publication.get("attempt_count") or 0) + 1,
+                    "coding_snapshot": coding_snapshot,
+                    "payload_snapshot": payload,
+                    "attempted_at": now,
+                    "status_history": list(publication.get("status_history") or []) + [{"status": "publishing", "at": now}],
+                    "updated_at": now,
+                })\
+                .eq("id", publication["id"])\
+                .eq("status", "failed")\
+                .execute()
+            if not updated.data:
+                raise ValueError("This receipt is already being published")
+            publication = updated.data[0]
+        else:
+            try:
+                inserted = self.client.table("quickbooks_receipt_publications").insert({
+                    "document_id": document_id,
+                    "job_id": job_id,
+                    "owner_user_id": user_id,
+                    "workspace_id": workspace_id,
+                    "connection_id": connection["id"],
+                    "destination": destination,
+                    "remote_entity_type": entity_type,
+                    "idempotency_key": f"quickbooks:receipt:{destination}:{document_id}",
+                    "status": "publishing",
+                    "coding_snapshot": coding_snapshot,
+                    "payload_snapshot": payload,
+                    "attempted_at": now,
+                    "status_history": [{"status": "publishing", "at": now}],
+                    "attachment_status": "pending",
+                }).execute()
+                publication = inserted.data[0]
+            except Exception:
+                raise ValueError("This receipt is already being published")
+        endpoint = "purchase" if destination == "expense" else "bill"
+        try:
+            response = await self._accounting_post(
+                connection,
+                f"{self._company_base_url}/v3/company/{connection['realm_id']}/{endpoint}?minorversion={settings.quickbooks_minor_version}",
+                json_payload=payload,
+            )
+            transaction = response.get(entity_type) or {}
+            if not transaction.get("Id"):
+                raise QuickBooksPublishError(
+                    "QuickBooks did not return a transaction identifier. Check the company before retrying.",
+                    indeterminate=True,
+                )
+        except QuickBooksPublishError as exc:
+            publish_state = "indeterminate" if exc.indeterminate else "failed"
+            self._update_receipt_publication(publication["id"], {
+                "status": publish_state,
+                "failure_details": list(publication.get("failure_details") or []) + [{
+                    "stage": endpoint,
+                    "message": str(exc)[:240],
+                    "at": self._now().isoformat(),
+                }],
+                "status_history": list(publication.get("status_history") or []) + [{
+                    "status": publish_state,
+                    "at": self._now().isoformat(),
+                }],
+            })
+            raise ValueError(str(exc))
+        publication = self._update_receipt_publication(publication["id"], {
+            "status": "published",
+            "quickbooks_remote_id": str(transaction["Id"]),
+            "quickbooks_sync_token": str(transaction.get("SyncToken") or ""),
+            "published_at": self._now().isoformat(),
+            "status_history": list(publication.get("status_history") or []) + [{
+                "status": "published",
+                "at": self._now().isoformat(),
+            }],
+        })
+        try:
+            attachment_id = await self._attach_source_to_entity(
+                connection,
+                str(document["source_storage_path"]),
+                str(document.get("original_filename") or "receipt"),
+                document.get("source_content_type"),
+                entity_type,
+                str(transaction["Id"]),
+            )
+            publication = self._update_receipt_publication(publication["id"], {
+                "attachment_status": "attached",
+                "quickbooks_attachment_id": attachment_id,
+            })
+        except Exception as exc:
+            publication = self._update_receipt_publication(publication["id"], {
+                "attachment_status": "failed",
+                "failure_details": list(publication.get("failure_details") or []) + [{
+                    "stage": "attachment",
+                    "message": str(exc)[:240],
+                    "at": self._now().isoformat(),
+                }],
+            })
+        refreshed = await self.supabase.mark_receipt_quickbooks_published(
+            job_id, document_id, user_id, str(publication["id"]), destination
+        )
+        try:
+            await self._remember_receipt_coding(document, connection, user_id, request)
+        except Exception:
+            pass
+        refreshed["quickbooks_receipt_publication"] = self._safe_receipt_publication(publication)
+        return refreshed
 
     async def _safe_status(self, connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not connection:

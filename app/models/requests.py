@@ -137,7 +137,10 @@ class VendorRuleFields(BaseModel):
     """User-approved recurring vendor suggestions."""
 
     category_account: Optional[str] = Field(None, max_length=120)
+    vendor_ref_id: Optional[str] = Field(None, max_length=120)
+    account_ref_id: Optional[str] = Field(None, max_length=120)
     tax_code: Optional[str] = Field(None, max_length=80)
+    tax_code_ref_id: Optional[str] = Field(None, max_length=120)
     currency: Optional[str] = Field(None, max_length=12)
     payment_terms: Optional[str] = Field(None, max_length=80)
     destination_treatment: Optional[str] = Field(None, max_length=120)
@@ -210,3 +213,23 @@ class QuickBooksWorkspaceRequest(BaseModel):
     """Target the user's currently selected workspace for an integration action."""
 
     workspace_id: Optional[str] = Field(None, description="Owned workspace; defaults to the active workspace")
+
+
+ReceiptPublishingDestination = Literal["expense", "bill"]
+
+
+class ReceiptQuickBooksPublishRequest(BaseModel):
+    """Explicitly publish a reviewed receipt as either a paid Purchase or unpaid Bill."""
+
+    destination: ReceiptPublishingDestination = Field(
+        ...,
+        description="expense creates a paid QuickBooks Purchase; bill creates an unpaid QuickBooks Bill",
+    )
+    vendor_ref_id: Optional[str] = Field(None, max_length=120)
+    account_ref_id: str = Field(..., min_length=1, max_length=120, description="Expense/category account")
+    tax_code_ref_id: Optional[str] = Field(None, max_length=120)
+    payment_account_ref_id: Optional[str] = Field(None, max_length=120, description="Paid-from account for expenses")
+    payment_type: Optional[Literal["Cash", "Check", "CreditCard"]] = Field(
+        None,
+        description="QuickBooks Purchase payment type; required when destination is expense",
+    )

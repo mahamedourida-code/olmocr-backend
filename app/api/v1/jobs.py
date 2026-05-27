@@ -21,6 +21,7 @@ from app.models.requests import (
     DocumentDuplicateOverrideRequest,
     DocumentReviewChangeRequest,
     DocumentReviewStatusRequest,
+    ReceiptQuickBooksPublishRequest,
     VendorRuleFromDocumentRequest,
 )
 from app.models.responses import BatchConvertResponse, JobStatusResponse, ErrorResponse
@@ -34,6 +35,7 @@ from app.core.config import settings
 from app.core.limits import get_plan_limits, get_user_plan_type
 from app.services.redis_service import get_redis_service, RedisService
 from app.services.supabase_service import get_supabase_service
+from app.services.quickbooks_service import get_quickbooks_service
 from app.services.excel import ExcelService
 from app.tasks.batch_tasks import (
     finalize_document_override,
@@ -1334,6 +1336,9 @@ async def get_job_documents(
     for document in documents:
         if user:
             document["vendor_suggestion"] = await supabase_service.get_vendor_suggestion(document, user["user_id"])
+            document["quickbooks_receipt_publication"] = await supabase_service.get_quickbooks_receipt_publication(
+                document["id"], user["user_id"]
+            )
         document["source_access_url"] = await supabase_service.create_signed_url(
             document["source_storage_path"],
             expires_in=preview_expires_in,
@@ -1391,6 +1396,9 @@ async def get_document_review(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
     if user:
         document["vendor_suggestion"] = await supabase_service.get_vendor_suggestion(document, user["user_id"])
+        document["quickbooks_receipt_publication"] = await supabase_service.get_quickbooks_receipt_publication(
+            document_id, user["user_id"]
+        )
     return {"job_id": job_id, "document": document}
 
 
@@ -1470,6 +1478,29 @@ async def save_document_vendor_rule(
         return {"job_id": job_id, "rule": rule, "document": document}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{job_id}/documents/{document_id}/quickbooks/receipt/publish", response_model=Dict[str, Any])
+async def publish_receipt_to_quickbooks(
+    job_id: str,
+    document_id: str,
+    request: ReceiptQuickBooksPublishRequest,
+    session: SessionMetadata = Depends(get_or_create_session),
+    user: dict = Depends(get_current_user),
+):
+    """Publish one explicitly reviewed receipt as a paid Purchase or unpaid Bill."""
+    supabase_service = get_supabase_service()
+    await require_owned_durable_job(supabase_service, job_id, session, user)
+    try:
+        document = await get_quickbooks_service().publish_reviewed_receipt(
+            job_id=job_id,
+            document_id=document_id,
+            user_id=user["user_id"],
+            request=request.model_dump(exclude_none=True),
+        )
+        return {"job_id": job_id, "document": document}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
 @router.post("/{job_id}/documents/{document_id}/duplicates/override", response_model=Dict[str, Any])

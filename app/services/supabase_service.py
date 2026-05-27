@@ -1008,7 +1008,10 @@ class SupabaseService:
     def _clean_vendor_rule_fields(fields: Dict[str, Any]) -> Dict[str, str]:
         allowed = {
             "category_account",
+            "vendor_ref_id",
+            "account_ref_id",
             "tax_code",
+            "tax_code_ref_id",
             "currency",
             "payment_terms",
             "destination_treatment",
@@ -1051,6 +1054,20 @@ class SupabaseService:
             (rule for rule in rules if rule.get("applies_to") == identity["applies_to"]),
             next((rule for rule in rules if rule.get("applies_to") == "both"), None),
         )
+
+    async def get_quickbooks_receipt_publication(
+        self,
+        document_id: str,
+        user_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Expose only receipt publication lifecycle data needed by the review UI."""
+        response = self.client.table("quickbooks_receipt_publications")\
+            .select("id,destination,remote_entity_type,status,attempt_count,quickbooks_remote_id,quickbooks_attachment_id,attachment_status,failure_details,attempted_at,published_at,updated_at")\
+            .eq("document_id", document_id)\
+            .eq("owner_user_id", user_id)\
+            .limit(1)\
+            .execute()
+        return response.data[0] if response.data else None
 
     async def save_vendor_rule_from_document(
         self,
@@ -1411,6 +1428,65 @@ class SupabaseService:
         if not response.data:
             raise ValueError("Accounts Payable item not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
+
+    async def mark_receipt_quickbooks_published(
+        self,
+        job_id: str,
+        document_id: str,
+        user_id: str,
+        publication_id: str,
+        destination: str,
+    ) -> Dict[str, Any]:
+        """Mark a reviewed receipt published after a recorded QuickBooks transaction exists."""
+        document = await self.get_job_document(job_id, document_id)
+        if not document or document.get("owner_user_id") != user_id:
+            raise ValueError("Document not found")
+        changed_at = datetime.utcnow().isoformat()
+        metadata = self._document_metadata(document)
+        history = list(metadata.get("review_status_history") or [])
+        if document.get("review_status") != "published":
+            history.append({
+                "from_status": document.get("review_status"),
+                "to_status": "published",
+                "reason": (
+                    "Created as an already-paid expense in QuickBooks Online"
+                    if destination == "expense"
+                    else "Created as an unpaid bill in QuickBooks Online"
+                ),
+                "actor": {"user_id": user_id},
+                "changed_at": changed_at,
+                "publication_id": publication_id,
+            })
+        response = self.client.table("job_documents")\
+            .update({
+                "review_status": "published",
+                "reviewed_at": changed_at,
+                "reviewed_by_user_id": user_id,
+                "metadata": {
+                    **metadata,
+                    "review_status_history": history,
+                    "quickbooks_receipt_publication_id": publication_id,
+                },
+                "updated_at": changed_at,
+            })\
+            .eq("id", document_id)\
+            .eq("job_id", job_id)\
+            .eq("owner_user_id", user_id)\
+            .execute()
+        if not response.data:
+            raise ValueError("Document not found")
+        self.client.table("document_extractions").update({
+            "review_status": "published",
+            "reviewed_at": changed_at,
+            "updated_at": changed_at,
+        }).eq("document_id", document_id).eq("job_id", job_id).execute()
+        refreshed = await self.get_document_review(job_id, document_id)
+        if not refreshed:
+            raise ValueError("Document not found")
+        refreshed["quickbooks_receipt_publication"] = await self.get_quickbooks_receipt_publication(
+            document_id, user_id
+        )
+        return refreshed
 
     def _source_page_hashes(self, document: Dict[str, Any]) -> set:
         return {
