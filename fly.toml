@@ -67,7 +67,7 @@ primary_region = 'arn'
   SUPABASE_STORAGE_BUCKET = 'jobs'
   TEMP_STORAGE_PATH = '/app/temp_storage'
   WORKER_CONCURRENCY = '4'
-  QUICKBOOKS_ENVIRONMENT = 'sandbox'
+  QUICKBOOKS_ENVIRONMENT = 'production'
   QUICKBOOKS_MINOR_VERSION = '75'
   QUICKBOOKS_REDIRECT_URI = 'https://backend-lively-hill-7043.fly.dev/api/v1/integrations/quickbooks/callback'
 
