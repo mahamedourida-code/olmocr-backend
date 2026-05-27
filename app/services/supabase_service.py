@@ -1138,7 +1138,10 @@ class SupabaseService:
         if updates.get("display_name") is not None:
             update["display_name"] = str(updates["display_name"]).strip()
         if updates.get("suggested_fields") is not None:
-            update["suggested_fields"] = self._clean_vendor_rule_fields(updates["suggested_fields"])
+            clean_fields = self._clean_vendor_rule_fields(updates["suggested_fields"])
+            if response.data[0].get("applies_to") == "receipt":
+                clean_fields.pop("destination_treatment", None)
+            update["suggested_fields"] = clean_fields
         if updates.get("enabled") is not None:
             update["enabled"] = bool(updates["enabled"])
         updated = self.client.table("vendor_rules")\
