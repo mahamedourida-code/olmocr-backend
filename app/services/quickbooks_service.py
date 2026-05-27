@@ -651,8 +651,8 @@ class QuickBooksService:
         fields.update({
             "account_ref_id": account["external_id"],
             "category_account": account["display_name"],
-            "destination_treatment": str(request["destination"]),
         })
+        fields.pop("destination_treatment", None)
         if vendor:
             fields["vendor_ref_id"] = vendor["external_id"]
         if tax_code:

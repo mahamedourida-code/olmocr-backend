@@ -1086,6 +1086,8 @@ class SupabaseService:
         if not identity:
             raise ValueError("Vendor memory is available only for reviewed invoices and receipts with a vendor name")
         clean_fields = self._clean_vendor_rule_fields(suggested_fields)
+        if identity["applies_to"] == "receipt":
+            clean_fields.pop("destination_treatment", None)
         if not clean_fields:
             raise ValueError("Enter at least one vendor suggestion before saving")
         workspace_id = document.get("workspace_id") or await self.resolve_owned_workspace_id(user_id)
