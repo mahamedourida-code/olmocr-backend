@@ -12,6 +12,7 @@ aiofiles
 backoff
 httpx
 cryptography  # Encrypt backend-only accounting integration tokens at rest
+svix  # Verify signed Resend inbound email webhooks
 
 # Redis and Celery for distributed task processing
 redis

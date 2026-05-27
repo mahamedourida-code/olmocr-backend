@@ -9,6 +9,7 @@ import csv
 import io
 import re
 import hashlib
+import secrets
 from typing import Optional, Dict, Any, List
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -1004,6 +1005,116 @@ class SupabaseService:
             .limit(1)\
             .execute()
         return str(fallback.data[0]["id"]) if fallback.data else None
+
+    async def get_or_create_email_intake(
+        self,
+        user_id: str,
+        workspace_id: Optional[str],
+        inbound_domain: str,
+    ) -> Dict[str, Any]:
+        """Return one provider-facing inbound mailbox owned by a workspace."""
+        resolved_workspace_id = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved_workspace_id:
+            raise ValueError("Create a workspace before enabling email intake")
+
+        response = self.client.table("workspace_email_intakes")\
+            .select("*")\
+            .eq("workspace_id", resolved_workspace_id)\
+            .eq("owner_user_id", user_id)\
+            .limit(1)\
+            .execute()
+        if response.data:
+            return response.data[0]
+
+        domain = str(inbound_domain or "").strip().lower().lstrip("@")
+        if not domain:
+            raise ValueError("Email intake domain is not configured")
+        token = secrets.token_urlsafe(12).replace("_", "").replace("-", "").lower()
+        address = f"documents-{token}@{domain}"
+        created = self.client.table("workspace_email_intakes").insert({
+            "workspace_id": resolved_workspace_id,
+            "owner_user_id": user_id,
+            "provider": "resend",
+            "address": address,
+            "address_token": token,
+            "enabled": True,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).execute()
+        if not created.data:
+            raise Exception("Supabase returned no email intake row")
+        return created.data[0]
+
+    async def find_enabled_email_intake(self, addresses: List[str]) -> Optional[Dict[str, Any]]:
+        """Resolve a signed inbound event to its destination workspace mailbox."""
+        normalized = sorted({str(address).strip().lower() for address in addresses if address})
+        if not normalized:
+            return None
+        response = self.client.table("workspace_email_intakes")\
+            .select("*")\
+            .in_("address", normalized)\
+            .eq("enabled", True)\
+            .limit(1)\
+            .execute()
+        return response.data[0] if response.data else None
+
+    async def get_email_intake_message(self, provider_email_id: str) -> Optional[Dict[str, Any]]:
+        response = self.client.table("email_intake_messages")\
+            .select("*")\
+            .eq("provider_email_id", provider_email_id)\
+            .limit(1)\
+            .execute()
+        return response.data[0] if response.data else None
+
+    async def create_email_intake_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.client.table("email_intake_messages").insert(data).execute()
+        if not response.data:
+            raise Exception("Supabase returned no email intake message row")
+        return response.data[0]
+
+    async def update_email_intake_message(self, message_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.client.table("email_intake_messages")\
+            .update({**updates, "updated_at": datetime.utcnow().isoformat()})\
+            .eq("id", message_id)\
+            .execute()
+        if not response.data:
+            raise Exception("Supabase returned no updated email intake message row")
+        return response.data[0]
+
+    async def list_owned_email_intake_messages(
+        self,
+        user_id: str,
+        workspace_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        resolved_workspace_id = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved_workspace_id:
+            return []
+        response = self.client.table("email_intake_messages")\
+            .select("*")\
+            .eq("workspace_id", resolved_workspace_id)\
+            .eq("owner_user_id", user_id)\
+            .order("received_at", desc=True)\
+            .limit(max(1, min(limit, 100)))\
+            .execute()
+        messages = response.data or []
+        for message in messages:
+            job_id = message.get("job_id")
+            if not job_id:
+                message["documents"] = []
+                continue
+            job = await self.get_job(str(job_id))
+            documents = await self.get_job_documents(str(job_id))
+            message["job_status"] = job.get("status") if job else None
+            message["documents"] = [
+                {
+                    "id": document.get("id"),
+                    "original_filename": document.get("original_filename"),
+                    "status": document.get("status"),
+                    "review_status": document.get("review_status"),
+                }
+                for document in documents
+            ]
+        return messages
 
     @staticmethod
     def _clean_vendor_rule_fields(fields: Dict[str, Any]) -> Dict[str, str]:

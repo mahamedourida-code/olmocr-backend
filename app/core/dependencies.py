@@ -332,6 +332,7 @@ async def enforce_upload_rate_limits(
     queue_name: str = "batch_processing",
     daily_image_limit_override: Optional[int] = None,
     daily_run_limit_override: Optional[int] = None,
+    enforce_ip_limit: bool = True,
     settings: Settings = get_settings()
 ) -> None:
     """
@@ -416,15 +417,16 @@ async def enforce_upload_rate_limits(
         else settings.rate_limit_anonymous_runs_per_day
     )
 
-    await _enforce_redis_limit(
-        redis_service,
-        f"rate:v1:ip:{safe_ip}:jobs:{minute_bucket}",
-        1,
-        settings.rate_limit_ip_jobs_per_minute,
-        window_seconds * 2,
-        "Too many upload requests from this network. Please slow down.",
-        "IP_RATE_LIMIT_EXCEEDED"
-    )
+    if enforce_ip_limit:
+        await _enforce_redis_limit(
+            redis_service,
+            f"rate:v1:ip:{safe_ip}:jobs:{minute_bucket}",
+            1,
+            settings.rate_limit_ip_jobs_per_minute,
+            window_seconds * 2,
+            "Too many upload requests from this network. Please slow down.",
+            "IP_RATE_LIMIT_EXCEEDED"
+        )
     await _enforce_redis_limit(
         redis_service,
         f"rate:v1:{actor_type}:{safe_actor}:jobs:{minute_bucket}",
@@ -464,7 +466,7 @@ async def enforce_upload_rate_limits(
         status.HTTP_402_PAYMENT_REQUIRED if not is_authenticated else status.HTTP_429_TOO_MANY_REQUESTS
     )
 
-    if not is_authenticated:
+    if not is_authenticated and enforce_ip_limit:
         if daily_run_limit:
             await _enforce_redis_limit(
                 redis_service,

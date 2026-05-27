@@ -115,6 +115,11 @@ class Settings(BaseSettings):
     quickbooks_token_encryption_key: str = Field("", env="QUICKBOOKS_TOKEN_ENCRYPTION_KEY")
     quickbooks_environment: str = Field("sandbox", env="QUICKBOOKS_ENVIRONMENT")
     quickbooks_minor_version: str = Field("75", env="QUICKBOOKS_MINOR_VERSION")
+
+    # Resend Inbound Email Intake Configuration
+    resend_api_key: str = Field("", env="RESEND_API_KEY")
+    resend_webhook_secret: str = Field("", env="RESEND_WEBHOOK_SECRET")
+    inbound_email_domain: str = Field("intake.axliner.com", env="INBOUND_EMAIL_DOMAIN")
     
     # OlmOCR API Rate Limiting Configuration
     olmocr_base_delay_seconds: float = Field(0.0, env="OLMOCR_BASE_DELAY_SECONDS")
