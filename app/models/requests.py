@@ -168,13 +168,18 @@ class AccountsPayableFromDocumentRequest(BaseModel):
 
 
 class AccountsPayableDraftFields(BaseModel):
-    """Editable draft-bill values; no accounting submission is performed."""
+    """Editable reviewed bill values and selected QuickBooks coding references."""
 
     vendor: Optional[str] = Field(None, max_length=200)
+    vendor_ref_id: Optional[str] = Field(None, max_length=120)
+    invoice_date: Optional[str] = Field(None, max_length=40)
     due_date: Optional[str] = Field(None, max_length=40)
     account_category: Optional[str] = Field(None, max_length=160)
+    account_ref_id: Optional[str] = Field(None, max_length=120)
     tax_code: Optional[str] = Field(None, max_length=80)
+    tax_code_ref_id: Optional[str] = Field(None, max_length=120)
     reference: Optional[str] = Field(None, max_length=160)
+    currency: Optional[str] = Field(None, max_length=12)
     line_items: Optional[List[Dict[str, Any]]] = None
 
 
@@ -193,6 +198,12 @@ class AccountsPayableBulkStatusRequest(BaseModel):
     item_ids: List[str] = Field(..., min_length=1)
     status: Literal["published"] = "published"
     reason: Optional[str] = Field(None, max_length=240)
+
+
+class AccountsPayableBulkPublishRequest(BaseModel):
+    """Publish confirmed AP items as unpaid QuickBooks Bills."""
+
+    item_ids: List[str] = Field(..., min_length=1)
 
 
 class QuickBooksWorkspaceRequest(BaseModel):

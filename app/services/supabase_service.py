@@ -1148,7 +1148,18 @@ class SupabaseService:
 
     @staticmethod
     def _accounts_payable_editable_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
-        allowed_text = {"vendor", "due_date", "account_category", "tax_code", "reference"}
+        allowed_text = {
+            "vendor",
+            "vendor_ref_id",
+            "invoice_date",
+            "due_date",
+            "account_category",
+            "account_ref_id",
+            "tax_code",
+            "tax_code_ref_id",
+            "reference",
+            "currency",
+        }
         cleaned: Dict[str, Any] = {
             key: str(value).strip()
             for key, value in fields.items()
@@ -1197,11 +1208,19 @@ class SupabaseService:
         if document:
             enriched["document_review_status"] = document.get("review_status")
             enriched["vendor_suggestion"] = await self.get_vendor_suggestion(document, user_id)
+            enriched["source_content_type"] = document.get("source_content_type")
         if item.get("attachment_visible") and item.get("source_storage_path"):
             enriched["source_access_url"] = await self.create_signed_url(
                 str(item["source_storage_path"]),
                 expires_in=60 * 60,
             )
+        publication = self.client.table("quickbooks_bill_publications")\
+            .select("id,status,attempt_count,quickbooks_bill_id,quickbooks_attachment_id,attachment_status,failure_details,attempted_at,published_at,updated_at")\
+            .eq("accounts_payable_item_id", item["id"])\
+            .eq("owner_user_id", user_id)\
+            .limit(1)\
+            .execute()
+        enriched["quickbooks_publication"] = publication.data[0] if publication.data else None
         return enriched
 
     async def create_accounts_payable_item_from_document(
@@ -1321,6 +1340,8 @@ class SupabaseService:
                         ("vendor", "vendor"),
                         ("due date", "due_date"),
                         ("account/category", "account_category"),
+                        ("QuickBooks vendor", "vendor_ref_id"),
+                        ("QuickBooks account", "account_ref_id"),
                     )
                     if not str(draft_data.get(key) or "").strip()
                 ]
@@ -1328,11 +1349,9 @@ class SupabaseService:
                     raise ValueError(f"Complete {', '.join(missing)} before marking Ready to publish")
                 if not draft_data.get("total") and not draft_data.get("line_items"):
                     raise ValueError("A bill candidate needs a total or line items before publishing")
-            if next_status == "published" and current.get("status") != "ready_to_publish":
-                raise ValueError("Only Ready to publish items can be marked Published")
-            update["status"] = next_status
             if next_status == "published":
-                update["published_at"] = changed_at
+                raise ValueError("Publish this item through QuickBooks from the Ready to publish state")
+            update["status"] = next_status
             metadata = dict(current.get("metadata") or {})
             history = list(metadata.get("status_history") or [])
             history.append({
@@ -1358,14 +1377,40 @@ class SupabaseService:
         user_id: str,
         reason: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        published: List[Dict[str, Any]] = []
-        for item_id in item_ids:
-            published.append(await self.update_accounts_payable_item(
-                item_id=item_id,
-                user_id=user_id,
-                updates={"status": "published", "reason": reason or "Marked published outside AxLiner"},
-            ))
-        return published
+        raise ValueError("Publish ready items through the QuickBooks publishing endpoint")
+
+    async def mark_accounts_payable_quickbooks_published(
+        self,
+        item_id: str,
+        user_id: str,
+        publication_id: str,
+    ) -> Dict[str, Any]:
+        current = await self.get_accounts_payable_item(item_id, user_id)
+        changed_at = datetime.utcnow().isoformat()
+        metadata = dict(current.get("metadata") or {})
+        history = list(metadata.get("status_history") or [])
+        if current.get("status") != "published":
+            history.append({
+                "from_status": current.get("status"),
+                "to_status": "published",
+                "reason": "Created as an unpaid Bill in QuickBooks Online",
+                "actor": {"user_id": user_id},
+                "changed_at": changed_at,
+                "publication_id": publication_id,
+            })
+        response = self.client.table("accounts_payable_items")\
+            .update({
+                "status": "published",
+                "published_at": changed_at,
+                "updated_at": changed_at,
+                "metadata": {**metadata, "status_history": history, "quickbooks_publication_id": publication_id},
+            })\
+            .eq("id", item_id)\
+            .eq("owner_user_id", user_id)\
+            .execute()
+        if not response.data:
+            raise ValueError("Accounts Payable item not found")
+        return await self._enrich_accounts_payable_item(response.data[0], user_id)
 
     def _source_page_hashes(self, document: Dict[str, Any]) -> set:
         return {

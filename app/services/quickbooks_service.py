@@ -1,8 +1,10 @@
-"""Backend-only QuickBooks Online OAuth and read-only reference-data access."""
+"""Backend-only QuickBooks Online connection, reference data, and reviewed Bill publishing."""
 
 import hashlib
+import json
 import secrets
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -11,6 +13,14 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from app.core.config import settings
 from app.services.supabase_service import get_supabase_service
+
+
+class QuickBooksPublishError(ValueError):
+    """A publication error whose uncertainty determines whether a Bill may be retried."""
+
+    def __init__(self, message: str, indeterminate: bool = False) -> None:
+        super().__init__(message)
+        self.indeterminate = indeterminate
 
 
 class QuickBooksService:
@@ -240,6 +250,43 @@ class QuickBooksService:
             raise ValueError("QuickBooks reference data could not be read")
         return response.json()
 
+    async def _accounting_post(
+        self,
+        connection: Dict[str, Any],
+        endpoint: str,
+        *,
+        json_payload: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        token = await self._access_token(connection)
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                response = await client.post(endpoint, headers=headers, json=json_payload, files=files)
+                if response.status_code == 401:
+                    headers["Authorization"] = f"Bearer {await self._refresh_access_token(connection)}"
+                    response = await client.post(endpoint, headers=headers, json=json_payload, files=files)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise QuickBooksPublishError(
+                "QuickBooks did not confirm the request. Check the connected company before retrying.",
+                indeterminate=True,
+            ) from exc
+        if response.status_code >= 500:
+            raise QuickBooksPublishError(
+                "QuickBooks did not confirm the request. Check the connected company before retrying.",
+                indeterminate=True,
+            )
+        if response.status_code >= 400:
+            detail = "QuickBooks rejected this bill. Check vendor, account, tax, date, and currency selections."
+            try:
+                fault = response.json().get("Fault", {}).get("Error", [])
+                if fault and fault[0].get("Detail"):
+                    detail = str(fault[0]["Detail"])[:240]
+            except (ValueError, AttributeError, TypeError):
+                pass
+            raise QuickBooksPublishError(detail)
+        return response.json()
+
     async def _read_company_info(self, connection: Dict[str, Any]) -> Dict[str, Any]:
         realm_id = str(connection["realm_id"])
         payload = await self._accounting_get(
@@ -340,6 +387,318 @@ class QuickBooksService:
             query = query.eq("resource_type", resource_type)
         response = query.order("display_name").execute()
         return response.data or []
+
+    def _selected_reference(
+        self,
+        connection: Dict[str, Any],
+        owner_user_id: str,
+        resource_type: str,
+        external_id: Optional[str],
+        label: str,
+        required: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        if not external_id:
+            if required:
+                raise ValueError(f"Select a synced QuickBooks {label} before publishing")
+            return None
+        response = self.client.table("quickbooks_reference_data")\
+            .select("external_id,display_name,active,details")\
+            .eq("connection_id", connection["id"])\
+            .eq("owner_user_id", owner_user_id)\
+            .eq("resource_type", resource_type)\
+            .eq("external_id", external_id)\
+            .limit(1)\
+            .execute()
+        if not response.data or not response.data[0].get("active", True):
+            raise ValueError(f"Refresh QuickBooks lists and select an active {label}")
+        return response.data[0]
+
+    @staticmethod
+    def _amount(value: Any) -> Optional[Decimal]:
+        if value is None or value == "":
+            return None
+        try:
+            return Decimal(str(value).replace(",", "").strip()).quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            return None
+
+    def _bill_payload(self, item: Dict[str, Any], connection: Dict[str, Any]) -> Dict[str, Any]:
+        draft = dict(item.get("draft_data") or {})
+        vendor = self._selected_reference(
+            connection, item["owner_user_id"], "vendor", draft.get("vendor_ref_id"), "vendor"
+        )
+        account = self._selected_reference(
+            connection, item["owner_user_id"], "account", draft.get("account_ref_id"), "account"
+        )
+        tax_code = self._selected_reference(
+            connection,
+            item["owner_user_id"],
+            "tax_code",
+            draft.get("tax_code_ref_id"),
+            "tax code",
+            required=False,
+        )
+        assert vendor is not None and account is not None
+        detail_base: Dict[str, Any] = {
+            "AccountRef": {"value": account["external_id"], "name": account["display_name"]},
+            "BillableStatus": "NotBillable",
+        }
+        if tax_code:
+            detail_base["TaxCodeRef"] = {"value": tax_code["external_id"], "name": tax_code["display_name"]}
+        lines: List[Dict[str, Any]] = []
+        for raw in draft.get("line_items") or []:
+            if not isinstance(raw, dict):
+                continue
+            amount = (
+                self._amount(raw.get("line_total"))
+                or self._amount(raw.get("total"))
+                or self._amount(raw.get("amount"))
+            )
+            if amount is None:
+                quantity = self._amount(raw.get("quantity"))
+                unit_price = self._amount(raw.get("unit_price"))
+                amount = quantity * unit_price if quantity is not None and unit_price is not None else None
+            if amount is None:
+                continue
+            line: Dict[str, Any] = {
+                "Amount": float(amount),
+                "DetailType": "AccountBasedExpenseLineDetail",
+                "AccountBasedExpenseLineDetail": dict(detail_base),
+            }
+            description = raw.get("description") or raw.get("item") or raw.get("name")
+            if description:
+                line["Description"] = str(description)[:4000]
+            lines.append(line)
+        if not lines:
+            total = self._amount(draft.get("total"))
+            if total is None:
+                raise ValueError("Add a total or valid line amounts before publishing")
+            lines = [{
+                "Amount": float(total),
+                "Description": str(draft.get("reference") or item.get("source_filename") or "Reviewed invoice")[:4000],
+                "DetailType": "AccountBasedExpenseLineDetail",
+                "AccountBasedExpenseLineDetail": dict(detail_base),
+            }]
+        payload: Dict[str, Any] = {
+            "VendorRef": {"value": vendor["external_id"], "name": vendor["display_name"]},
+            "Line": lines,
+        }
+        if draft.get("invoice_number"):
+            payload["DocNumber"] = str(draft["invoice_number"])[:21]
+        if draft.get("invoice_date"):
+            payload["TxnDate"] = str(draft["invoice_date"])
+        if draft.get("due_date"):
+            payload["DueDate"] = str(draft["due_date"])
+        if draft.get("currency"):
+            payload["CurrencyRef"] = {"value": str(draft["currency"]).upper()}
+        return payload
+
+    @staticmethod
+    def _safe_publication(publication: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {
+            "id",
+            "status",
+            "attempt_count",
+            "quickbooks_bill_id",
+            "quickbooks_attachment_id",
+            "attachment_status",
+            "failure_details",
+            "attempted_at",
+            "published_at",
+            "updated_at",
+        }
+        return {key: value for key, value in publication.items() if key in allowed}
+
+    def _update_publication(self, publication_id: str, update: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.client.table("quickbooks_bill_publications")\
+            .update({**update, "updated_at": self._now().isoformat()})\
+            .eq("id", publication_id)\
+            .execute()
+        if not response.data:
+            raise ValueError("QuickBooks publication record could not be updated")
+        return response.data[0]
+
+    async def _attach_source_to_bill(
+        self,
+        connection: Dict[str, Any],
+        item: Dict[str, Any],
+        bill_id: str,
+    ) -> str:
+        content = await self.supabase.download_file_from_storage(str(item["source_storage_path"]))
+        content_type = str(item.get("source_content_type") or "application/octet-stream")
+        filename = str(item.get("source_filename") or "source-document")
+        metadata = {
+            "AttachableRef": [{"EntityRef": {"type": "Bill", "value": bill_id}}],
+            "Note": "Source document reviewed in AxLiner.",
+        }
+        payload = await self._accounting_post(
+            connection,
+            f"{self._company_base_url}/v3/company/{connection['realm_id']}/upload?minorversion={settings.quickbooks_minor_version}",
+            files={
+                "file_metadata_01": ("attachment.json", json.dumps(metadata), "application/json"),
+                "file_content_01": (filename, content, content_type),
+            },
+        )
+        entries = payload.get("AttachableResponse") or []
+        attachable = entries[0].get("Attachable") if entries and isinstance(entries[0], dict) else payload.get("Attachable")
+        if not attachable or not attachable.get("Id"):
+            raise ValueError("QuickBooks returned no attachment identifier")
+        return str(attachable["Id"])
+
+    async def publish_accounts_payable_bill(self, item_id: str, user_id: str) -> Dict[str, Any]:
+        """Publish one explicitly ready AP invoice as one unpaid QBO Bill."""
+        item = await self.supabase.get_accounts_payable_item(item_id, user_id)
+        if item.get("status") not in {"ready_to_publish", "published"}:
+            raise ValueError("Only Ready to publish invoice items can be sent to QuickBooks")
+        if item.get("status") == "ready_to_publish" and not str(
+            (item.get("draft_data") or {}).get("due_date") or ""
+        ).strip():
+            raise ValueError("Complete the due date before publishing")
+        _, connection = await self._owned_connection(user_id, item.get("workspace_id"), require_connected=True)
+        assert connection is not None
+        existing = self.client.table("quickbooks_bill_publications")\
+            .select("*")\
+            .eq("accounts_payable_item_id", item_id)\
+            .eq("owner_user_id", user_id)\
+            .limit(1)\
+            .execute()
+        publication = existing.data[0] if existing.data else None
+        if item.get("status") == "published" and (
+            not publication or not publication.get("quickbooks_bill_id")
+        ):
+            raise ValueError("This published item has no recorded QuickBooks Bill and cannot be published again")
+        if publication and publication.get("quickbooks_bill_id"):
+            if (
+                item.get("attachment_visible")
+                and publication.get("attachment_status") != "attached"
+            ):
+                try:
+                    attachment_id = await self._attach_source_to_bill(
+                        connection, item, str(publication["quickbooks_bill_id"])
+                    )
+                    publication = self._update_publication(publication["id"], {
+                        "attachment_status": "attached",
+                        "quickbooks_attachment_id": attachment_id,
+                    })
+                except Exception as exc:
+                    publication = self._update_publication(publication["id"], {
+                        "attachment_status": "failed",
+                        "failure_details": list(publication.get("failure_details") or []) + [{
+                            "stage": "attachment",
+                            "message": str(exc)[:240],
+                            "at": self._now().isoformat(),
+                        }],
+                    })
+            item = await self.supabase.mark_accounts_payable_quickbooks_published(
+                item_id, user_id, str(publication["id"])
+            )
+            item["quickbooks_publication"] = self._safe_publication(publication)
+            return item
+        if publication and publication.get("status") in {"publishing", "indeterminate"}:
+            raise ValueError(
+                "This Bill request may already be in QuickBooks. Check the connected company before retrying."
+            )
+        payload = self._bill_payload(item, connection)
+        now = self._now().isoformat()
+        if publication:
+            failures = list(publication.get("failure_details") or [])
+            updated = self.client.table("quickbooks_bill_publications")\
+                .update({
+                    "status": "publishing",
+                    "attempt_count": int(publication.get("attempt_count") or 0) + 1,
+                    "payload_snapshot": payload,
+                    "attempted_at": now,
+                    "status_history": list(publication.get("status_history") or []) + [{"status": "publishing", "at": now}],
+                    "updated_at": now,
+                    "failure_details": failures,
+                })\
+                .eq("id", publication["id"])\
+                .eq("status", "failed")\
+                .execute()
+            if not updated.data:
+                raise ValueError("This Bill is already being published")
+            publication = updated.data[0]
+        else:
+            try:
+                inserted = self.client.table("quickbooks_bill_publications").insert({
+                    "accounts_payable_item_id": item_id,
+                    "document_id": item["document_id"],
+                    "job_id": item["job_id"],
+                    "owner_user_id": user_id,
+                    "workspace_id": item["workspace_id"],
+                    "connection_id": connection["id"],
+                    "idempotency_key": f"quickbooks:bill:ap:{item_id}",
+                    "status": "publishing",
+                    "payload_snapshot": payload,
+                    "attempted_at": now,
+                    "status_history": [{"status": "publishing", "at": now}],
+                    "attachment_status": "pending" if item.get("attachment_visible") else "not_requested",
+                }).execute()
+                publication = inserted.data[0]
+            except Exception:
+                raise ValueError("This Bill is already being published")
+        try:
+            response = await self._accounting_post(
+                connection,
+                f"{self._company_base_url}/v3/company/{connection['realm_id']}/bill?minorversion={settings.quickbooks_minor_version}",
+                json_payload=payload,
+            )
+            bill = response.get("Bill") or {}
+            if not bill.get("Id"):
+                raise QuickBooksPublishError(
+                    "QuickBooks did not return a Bill identifier. Check the company before retrying.",
+                    indeterminate=True,
+                )
+        except QuickBooksPublishError as exc:
+            state = "indeterminate" if exc.indeterminate else "failed"
+            self._update_publication(publication["id"], {
+                "status": state,
+                "failure_details": list(publication.get("failure_details") or []) + [{
+                    "stage": "bill",
+                    "message": str(exc)[:240],
+                    "at": self._now().isoformat(),
+                }],
+                "status_history": list(publication.get("status_history") or []) + [{"status": state, "at": self._now().isoformat()}],
+            })
+            raise ValueError(str(exc))
+        publication = self._update_publication(publication["id"], {
+            "status": "published",
+            "quickbooks_bill_id": str(bill["Id"]),
+            "quickbooks_sync_token": str(bill.get("SyncToken") or ""),
+            "published_at": self._now().isoformat(),
+            "status_history": list(publication.get("status_history") or []) + [{"status": "published", "at": self._now().isoformat()}],
+        })
+        if item.get("attachment_visible"):
+            try:
+                attachment_id = await self._attach_source_to_bill(connection, item, str(bill["Id"]))
+                publication = self._update_publication(publication["id"], {
+                    "quickbooks_attachment_id": attachment_id,
+                    "attachment_status": "attached",
+                })
+            except Exception as exc:
+                publication = self._update_publication(publication["id"], {
+                    "attachment_status": "failed",
+                    "failure_details": list(publication.get("failure_details") or []) + [{
+                        "stage": "attachment",
+                        "message": str(exc)[:240],
+                        "at": self._now().isoformat(),
+                    }],
+                })
+        item = await self.supabase.mark_accounts_payable_quickbooks_published(
+            item_id, user_id, str(publication["id"])
+        )
+        item["quickbooks_publication"] = self._safe_publication(publication)
+        return item
+
+    async def publish_accounts_payable_bills(self, item_ids: List[str], user_id: str) -> Dict[str, Any]:
+        items: List[Dict[str, Any]] = []
+        failures: List[Dict[str, str]] = []
+        for item_id in item_ids:
+            try:
+                items.append(await self.publish_accounts_payable_bill(item_id, user_id))
+            except ValueError as exc:
+                failures.append({"item_id": item_id, "detail": str(exc)})
+        return {"items": items, "failures": failures, "total": len(items)}
 
     async def _safe_status(self, connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not connection:

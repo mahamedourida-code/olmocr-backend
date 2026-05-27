@@ -4,10 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.dependencies import get_current_user
 from app.models.requests import (
+    AccountsPayableBulkPublishRequest,
     AccountsPayableBulkStatusRequest,
     AccountsPayableFromDocumentRequest,
     AccountsPayableUpdateRequest,
 )
+from app.services.quickbooks_service import get_quickbooks_service
 from app.services.supabase_service import get_supabase_service
 
 
@@ -94,3 +96,23 @@ async def bulk_update_accounts_payable_items(
         return {"items": items, "total": len(items)}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{item_id}/publish/quickbooks", response_model=Dict[str, Any])
+async def publish_accounts_payable_item_to_quickbooks(
+    item_id: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        item = await get_quickbooks_service().publish_accounts_payable_bill(item_id, user["user_id"])
+        return {"item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post("/publish/quickbooks", response_model=Dict[str, Any])
+async def publish_accounts_payable_batch_to_quickbooks(
+    request: AccountsPayableBulkPublishRequest,
+    user: dict = Depends(get_current_user),
+):
+    return await get_quickbooks_service().publish_accounts_payable_bills(request.item_ids, user["user_id"])
