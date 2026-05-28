@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from datetime import datetime
 
-from app.api.v1 import jobs, download, websocket, sessions, config, billing, vendor_rules, accounts_payable, integrations, email_intake
+from app.api.v1 import jobs, download, websocket, sessions, config, billing, vendor_rules, accounts_payable, integrations, email_intake, client_intake, workspaces
 
 api_router = APIRouter()
 
@@ -27,3 +27,5 @@ api_router.include_router(vendor_rules.router)
 api_router.include_router(accounts_payable.router)
 api_router.include_router(integrations.router)
 api_router.include_router(email_intake.router)
+api_router.include_router(client_intake.router)
+api_router.include_router(workspaces.router)

@@ -56,6 +56,85 @@ def _image_id_for(img: Dict[str, Any], img_index: int) -> str:
     return str(img.get('id') or f"img_{img_index}")
 
 
+def _bucket_confidence(fill_ratio: float) -> float:
+    """Map a 0..1 row-fill ratio to a confidence score in the 0.6..0.95 range.
+
+    Sparse rows (many empty cells) score lower, dense rows score higher. This is
+    a derived signal — not a fabricated number — so the UI can surface a real
+    per-row indicator while the model layer evolves toward true logprob-based
+    confidence.
+    """
+    if fill_ratio <= 0:
+        return 0.62
+    if fill_ratio < 0.35:
+        return 0.68
+    if fill_ratio < 0.65:
+        return 0.80
+    if fill_ratio < 0.85:
+        return 0.88
+    return 0.94
+
+
+def _row_fill_ratio(values: List[Any]) -> float:
+    if not values:
+        return 0.0
+    filled = 0
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                filled += 1
+        else:
+            filled += 1
+    return filled / len(values)
+
+
+def _compute_row_confidence(structured_data: Any, document_mode: str) -> List[float]:
+    """Compute per-row confidence for handwritten tabular output.
+
+    Returns an empty list when no per-row signal is available — callers should
+    leave the response field as ``None`` in that case so the frontend can
+    gracefully fall back to the document-level score.
+    """
+    if not isinstance(structured_data, dict):
+        return []
+
+    rows: List[List[Any]] = []
+
+    if document_mode == 'notes':
+        entries = structured_data.get('entries') or structured_data.get('rows') or []
+        for entry in entries:
+            if isinstance(entry, dict):
+                rows.append(list(entry.values()))
+            elif isinstance(entry, list):
+                rows.append(entry)
+            elif isinstance(entry, str) and entry.strip():
+                rows.append([entry])
+    elif document_mode in ('invoice', 'receipt'):
+        line_items = structured_data.get('line_items') or []
+        for line in line_items:
+            if isinstance(line, dict):
+                rows.append(list(line.values()))
+    elif document_mode == 'bank_statement':
+        transactions = structured_data.get('transactions') or []
+        for txn in transactions:
+            if isinstance(txn, dict):
+                rows.append(list(txn.values()))
+    else:
+        csv_blob = structured_data.get('csv')
+        if isinstance(csv_blob, str) and csv_blob.strip():
+            for line in csv_blob.splitlines():
+                if not line.strip():
+                    continue
+                rows.append([cell.strip() for cell in line.split(',')])
+
+    if not rows:
+        return []
+
+    return [round(_bucket_confidence(_row_fill_ratio(row)), 3) for row in rows]
+
+
 def _parse_job_metadata(job_record: Dict[str, Any]) -> Dict[str, Any]:
     metadata = job_record.get('processing_metadata') if job_record else {}
     if isinstance(metadata, dict):
@@ -460,6 +539,22 @@ async def process_single_image_simple(
                 "_classification": classification_data,
             }
 
+        # P1 — Handwritten specialist signals.
+        # is_handwritten: derived from the resolved document_mode. Notes mode is
+        # always handwritten in the current product flow; future backends can
+        # override this by emitting an explicit signal on classification_data.
+        classification_handwritten = bool(classification_data.get("is_handwritten")) if classification_data else False
+        is_handwritten = bool(wants_notes or classification_handwritten)
+
+        # row_confidence: per-row sparseness heuristic for tabular handwritten
+        # output. Real derived signal — fill ratio across the row maps to a
+        # confidence bucket. Set to None when we don't have row-structured data
+        # so the frontend gracefully falls back to the document-level score.
+        row_confidence: Any = None
+        if is_handwritten:
+            computed_rows = _compute_row_confidence(structured_data, document_mode)
+            row_confidence = computed_rows if computed_rows else None
+
         file_record = {
             'file_id': file_id,
             'job_id': job_id,
@@ -482,6 +577,8 @@ async def process_single_image_simple(
             'requires_review': requires_review,
             'review_flags': review_flags,
             'confidence_score': 72 if requires_review else 92,
+            'is_handwritten': is_handwritten,
+            'row_confidence': row_confidence,
             'source_page': source_page,
             'source_page_count': source_page_count,
             'expires_at': (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),

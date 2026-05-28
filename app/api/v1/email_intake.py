@@ -409,9 +409,10 @@ async def list_email_intake_messages(
     """Return inbound imports for an owned workspace without exposing provider secrets."""
     try:
         messages = await get_supabase_service().list_owned_email_intake_messages(
-            user["user_id"],
-            workspace_id,
-            limit,
+            user_id=user["user_id"],
+            email=user.get("email"),
+            workspace_id=workspace_id,
+            limit=limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))

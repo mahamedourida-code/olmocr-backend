@@ -659,6 +659,8 @@ async def _finalize_storage_batch_async(
                 document_mode=file_data.get('document_mode'),
                 requires_review=file_data.get('requires_review'),
                 confidence_score=file_data.get('confidence_score'),
+                is_handwritten=file_data.get('is_handwritten'),
+                row_confidence=file_data.get('row_confidence'),
                 review_flags=file_data.get('review_flags') or []
             )
             for file_data in generated_files
@@ -1376,6 +1378,8 @@ async def _process_batch_images_direct_async(job_id: str, images: List[Dict[str,
                 document_mode=file_data.get('document_mode'),
                 requires_review=file_data.get('requires_review'),
                 confidence_score=file_data.get('confidence_score'),
+                is_handwritten=file_data.get('is_handwritten'),
+                row_confidence=file_data.get('row_confidence'),
                 review_flags=file_data.get('review_flags') or []
             ))
 

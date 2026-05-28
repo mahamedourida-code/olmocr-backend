@@ -149,12 +149,25 @@ async def require_owned_durable_job(
     job_id: str,
     session: SessionMetadata,
     user: Optional[dict],
+    allowed_roles: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Load a durable job and enforce the same owner/session rule for review routes."""
+    """Load a durable job and authorize workspace roles or its anonymous session."""
     supabase_job = await supabase_service.get_job(job_id)
     if not supabase_job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+    workspace_id = metadata.get("workspace_id")
+    if user and workspace_id:
+        try:
+            await supabase_service.require_workspace_role(
+                user["user_id"],
+                user.get("email"),
+                str(workspace_id),
+                allowed_roles or ["owner", "reviewer"],
+            )
+            return supabase_job
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     stored_user_id = str(supabase_job.get("user_id") or "")
     owner_user_id = metadata.get("owner_user_id") or (
         stored_user_id if not stored_user_id.startswith("session:") else ""
@@ -185,20 +198,67 @@ def verify_durable_document_access(
     )
 
 
+async def require_durable_document_access(
+    supabase_service,
+    document: Dict[str, Any],
+    user: Optional[dict],
+    session_id: str,
+    allowed_roles: Optional[List[str]] = None,
+) -> None:
+    workspace_id = document.get("workspace_id")
+    if user and workspace_id:
+        try:
+            await supabase_service.require_workspace_role(
+                user["user_id"],
+                user.get("email"),
+                str(workspace_id),
+                allowed_roles or ["owner", "reviewer"],
+            )
+            return
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    verify_durable_document_access(document, user, session_id)
+
+
 async def require_owned_durable_document(
     supabase_service,
     job_id: str,
     document_id: str,
     session: SessionMetadata,
     user: Optional[dict],
+    allowed_roles: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Load an owned document only after validating job and document ownership."""
-    job = await require_owned_durable_job(supabase_service, job_id, session, user)
+    """Load an accessible document after validating its job and workspace role."""
+    job = await require_owned_durable_job(supabase_service, job_id, session, user, allowed_roles)
     document = await supabase_service.get_job_document(job_id, document_id)
     if not document:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    verify_durable_document_access(document, user, session.session_id)
+    await require_durable_document_access(supabase_service, document, user, session.session_id, allowed_roles)
     return job, document
+
+
+async def audit_document_role_action(
+    supabase_service,
+    document: Dict[str, Any],
+    user: Optional[dict],
+    event_type: str,
+) -> None:
+    if not user or not document.get("workspace_id"):
+        return
+    role = await supabase_service.require_workspace_role(
+        user["user_id"],
+        user.get("email"),
+        str(document["workspace_id"]),
+        ["owner", "reviewer"],
+    )
+    await supabase_service.record_workspace_audit(
+        str(document["workspace_id"]),
+        user["user_id"],
+        role,
+        event_type,
+        "document",
+        str(document["id"]),
+    )
 
 
 def require_stored_content_deletable(job: Dict[str, Any]) -> None:
@@ -1116,6 +1176,12 @@ async def get_job_status(
     # Get job data from Redis first. Redis is the fast cache, not the
     # authorization source; if Redis misses, rebuild from Supabase metadata.
     job_data = await redis_service.get_job(job_id)
+    authorization_service = get_supabase_service()
+    authorization_job = await authorization_service.get_job(job_id)
+    workspace_authorized = False
+    if authorization_job and user and _parse_metadata(authorization_job.get("processing_metadata")).get("workspace_id"):
+        await require_owned_durable_job(authorization_service, job_id, session, user)
+        workspace_authorized = True
     
     if not job_data:
         supabase_service = get_supabase_service()
@@ -1153,7 +1219,8 @@ async def get_job_status(
                 "updated_at": supabase_job.get("updated_at") or datetime.utcnow().isoformat(),
                 "completed_at": metadata.get("completed_at")
             }
-            verify_job_data_access(job_data, user, session.session_id)
+            if not workspace_authorized:
+                verify_job_data_access(job_data, user, session.session_id)
         elif durable_files:
             first_file = durable_files[0]
             job_data = {
@@ -1171,14 +1238,16 @@ async def get_job_status(
                 "updated_at": first_file.get("updated_at") or datetime.utcnow().isoformat(),
                 "completed_at": first_file.get("completed_at") or first_file.get("created_at")
             }
-            verify_job_data_access(job_data, user, session.session_id)
+            if not workspace_authorized:
+                verify_job_data_access(job_data, user, session.session_id)
         else:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Job not found"
             )
     else:
-        verify_job_data_access(job_data, user, session.session_id)
+        if not workspace_authorized:
+            verify_job_data_access(job_data, user, session.session_id)
     
     # Build progress info
     progress = None
@@ -1239,6 +1308,8 @@ async def get_job_status(
                         document_mode=file_info.get('document_mode'),
                         requires_review=file_info.get('requires_review'),
                         confidence_score=file_info.get('confidence_score'),
+                        is_handwritten=file_info.get('is_handwritten'),
+                        row_confidence=file_info.get('row_confidence'),
                         review_flags=file_info.get('review_flags') or [],
                         created_at=file_created_at
                     ))
@@ -1349,34 +1420,14 @@ async def get_job_documents(
 ):
     """Return durable logical documents and extraction states for an owned batch."""
     supabase_service = get_supabase_service()
-    supabase_job = await supabase_service.get_job(job_id)
-    if not supabase_job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found",
-        )
-
-    metadata = _parse_metadata(supabase_job.get("processing_metadata"))
-    stored_user_id = str(supabase_job.get("user_id") or "")
-    owner_user_id = metadata.get("owner_user_id") or (
-        stored_user_id if not stored_user_id.startswith("session:") else ""
-    )
-    owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
-    verify_job_data_access(
-        {
-            "job_id": job_id,
-            "user_id": owner_user_id or "",
-            "session_id": owner_session_id or "",
-        },
-        user,
-        session.session_id,
-    )
+    supabase_job = await require_owned_durable_job(supabase_service, job_id, session, user)
 
     documents = await supabase_service.get_job_documents(job_id)
     preview_expires_in = 60 * 60
     for document in documents:
-        verify_durable_document_access(document, user, session.session_id)
-        if user:
+        await require_durable_document_access(supabase_service, document, user, session.session_id)
+        is_owner = bool(user and str(document.get("owner_user_id")) == str(user["user_id"]))
+        if is_owner:
             document["vendor_suggestion"] = await supabase_service.get_vendor_suggestion(document, user["user_id"])
             document["quickbooks_receipt_publication"] = await supabase_service.get_quickbooks_receipt_publication(
                 document["id"], user["user_id"]
@@ -1436,7 +1487,7 @@ async def get_document_review(
     document = await supabase_service.get_document_review(job_id, document_id)
     if not document:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    if user:
+    if user and str(document.get("owner_user_id")) == str(user["user_id"]):
         document["vendor_suggestion"] = await supabase_service.get_vendor_suggestion(document, user["user_id"])
         document["quickbooks_receipt_publication"] = await supabase_service.get_quickbooks_receipt_publication(
             document_id, user["user_id"]
@@ -1454,7 +1505,7 @@ async def update_document_review_value(
 ):
     """Persist one corrected structured value or grid cell for an owned document."""
     supabase_service = get_supabase_service()
-    await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
+    _, durable_document = await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
     actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
     try:
         result = await supabase_service.apply_document_review_change(
@@ -1466,6 +1517,7 @@ async def update_document_review_value(
             actor=actor,
             base_review_grid=request.base_review_grid,
         )
+        await audit_document_role_action(supabase_service, durable_document, user, "document_review_edited")
         return {"job_id": job_id, "document_id": document_id, **result}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -1481,7 +1533,7 @@ async def update_document_review_status(
 ):
     """Confirm Ready or persist another supported document review state."""
     supabase_service = get_supabase_service()
-    await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
+    _, durable_document = await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
     actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
     try:
         document = await supabase_service.set_document_review_status(
@@ -1491,6 +1543,7 @@ async def update_document_review_status(
             actor=actor,
             reason=request.reason,
         )
+        await audit_document_role_action(supabase_service, durable_document, user, "document_review_status_changed")
         return {"job_id": job_id, "document": document}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -1506,7 +1559,7 @@ async def save_document_vendor_rule(
 ):
     """Store explicit vendor memory only from a confirmed owned invoice or receipt."""
     supabase_service = get_supabase_service()
-    await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
+    await require_owned_durable_document(supabase_service, job_id, document_id, session, user, ["owner"])
     try:
         rule = await supabase_service.save_vendor_rule_from_document(
             job_id=job_id,
@@ -1532,7 +1585,7 @@ async def publish_receipt_to_quickbooks(
 ):
     """Publish one explicitly reviewed receipt as a paid Purchase or unpaid Bill."""
     supabase_service = get_supabase_service()
-    await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
+    await require_owned_durable_document(supabase_service, job_id, document_id, session, user, ["owner"])
     try:
         document = await get_quickbooks_service().publish_reviewed_receipt(
             job_id=job_id,
@@ -1555,7 +1608,7 @@ async def override_document_duplicate_warning(
 ):
     """Acknowledge a duplicate warning while retaining an auditable document."""
     supabase_service = get_supabase_service()
-    await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
+    _, durable_document = await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
     actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
     try:
         document = await supabase_service.override_document_duplicate_warning(
@@ -1565,6 +1618,7 @@ async def override_document_duplicate_warning(
             actor=actor,
             reason=request.reason,
         )
+        await audit_document_role_action(supabase_service, durable_document, user, "duplicate_warning_overridden")
         return {"job_id": job_id, "document": document}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -1584,7 +1638,7 @@ async def export_reviewed_document(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported export format")
 
     supabase_service = get_supabase_service()
-    await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
+    _, durable_document = await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
     document = await supabase_service.refresh_document_duplicate_warnings(job_id, document_id)
     if supabase_service.active_duplicate_warnings(document):
         raise HTTPException(
@@ -1602,6 +1656,7 @@ async def export_reviewed_document(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Document has no extracted data to export")
 
     rendered = ExcelService().export_reviewed_document(document, export_format)
+    await audit_document_role_action(supabase_service, durable_document, user, "document_exported")
     return StreamingResponse(
         io.BytesIO(rendered["content"]),
         media_type=rendered["content_type"],
@@ -1629,7 +1684,7 @@ async def export_reviewed_batch(
     await require_owned_durable_job(supabase_service, job_id, session, user)
     documents = await supabase_service.get_job_documents(job_id)
     for document in documents:
-        verify_durable_document_access(document, user, session.session_id)
+        await require_durable_document_access(supabase_service, document, user, session.session_id)
     documents = [
         await supabase_service.refresh_document_duplicate_warnings(job_id, document["id"])
         for document in documents
@@ -1671,6 +1726,8 @@ async def export_reviewed_batch(
             archive.writestr(filename, rendered["content"])
 
     buffer.seek(0)
+    for document in documents:
+        await audit_document_role_action(supabase_service, document, user, "batch_document_exported")
     archive_name = f"reviewed_batch_{job_id[:8]}.zip"
     return StreamingResponse(
         buffer,
@@ -1693,7 +1750,7 @@ async def delete_stored_document(
 ):
     """Permanently erase one owned financial document and its generated content."""
     supabase_service = get_supabase_service()
-    job, _ = await require_owned_durable_document(supabase_service, job_id, document_id, session, user)
+    job, _ = await require_owned_durable_document(supabase_service, job_id, document_id, session, user, ["owner"])
     require_stored_content_deletable(job)
     actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
     try:
@@ -1715,11 +1772,11 @@ async def delete_stored_batch_documents(
 ):
     """Permanently erase every stored financial document in an owned batch."""
     supabase_service = get_supabase_service()
-    job = await require_owned_durable_job(supabase_service, job_id, session, user)
+    job = await require_owned_durable_job(supabase_service, job_id, session, user, ["owner"])
     require_stored_content_deletable(job)
     documents = await supabase_service.get_job_documents(job_id)
     for document in documents:
-        verify_durable_document_access(document, user, session.session_id)
+        await require_durable_document_access(supabase_service, document, user, session.session_id, ["owner"])
     actor = {"user_id": user["user_id"]} if user else {"session_id": session.session_id}
     try:
         result = await supabase_service.delete_batch_content(job_id, actor)
@@ -1741,26 +1798,9 @@ async def override_job_document_mode(
 ):
     """Audit a manual auto-detection override and rerun the selected extractor."""
     supabase_service = get_supabase_service()
-    supabase_job = await supabase_service.get_job(job_id)
-    if not supabase_job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    metadata = _parse_metadata(supabase_job.get("processing_metadata"))
-    stored_user_id = str(supabase_job.get("user_id") or "")
-    owner_user_id = metadata.get("owner_user_id") or (
-        stored_user_id if not stored_user_id.startswith("session:") else ""
+    _, document = await require_owned_durable_document(
+        supabase_service, job_id, document_id, session, user, ["owner"]
     )
-    owner_session_id = metadata.get("owner_session_id") or metadata.get("session_id", "")
-    verify_job_data_access(
-        {"job_id": job_id, "user_id": owner_user_id or "", "session_id": owner_session_id or ""},
-        user,
-        session.session_id,
-    )
-
-    document = await supabase_service.get_job_document(job_id, document_id)
-    if not document:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
-    verify_durable_document_access(document, user, session.session_id)
 
     units = document.get("extractions") or []
     if not units:

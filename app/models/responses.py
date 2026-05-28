@@ -40,6 +40,8 @@ class ProcessedFile(BaseModel):
     document_mode: Optional[DocumentMode] = Field(None, description="Document mode used for extraction")
     requires_review: Optional[bool] = Field(None, description="Whether this file has review flags")
     confidence_score: Optional[float] = Field(None, description="Approximate confidence score for UI review")
+    is_handwritten: Optional[bool] = Field(None, description="True when the source was handwritten (specialist mode)")
+    row_confidence: Optional[List[float]] = Field(None, description="Per-row confidence scores (0-1) for tabular handwritten output")
     review_flags: List[Dict[str, Any]] = Field(default_factory=list, description="Areas that should be checked")
     created_at: datetime = Field(..., description="File creation timestamp")
     

@@ -11,7 +11,7 @@ import re
 import hashlib
 import secrets
 from typing import Optional, Dict, Any, List
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
@@ -1006,6 +1006,362 @@ class SupabaseService:
             .execute()
         return str(fallback.data[0]["id"]) if fallback.data else None
 
+    @staticmethod
+    def _normalize_member_email(email: Optional[str]) -> str:
+        return str(email or "").strip().lower()
+
+    async def _ensure_owner_membership(
+        self,
+        workspace_id: str,
+        user_id: str,
+        email: Optional[str],
+    ) -> None:
+        member_email = self._normalize_member_email(email) or f"{user_id}@owner.local"
+        existing = self.client.table("workspace_memberships")\
+            .select("id")\
+            .eq("workspace_id", workspace_id)\
+            .eq("user_id", user_id)\
+            .eq("role", "owner")\
+            .limit(1)\
+            .execute()
+        if existing.data:
+            self.client.table("workspace_memberships").update({
+                "member_email": member_email,
+                "status": "active",
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("id", existing.data[0]["id"]).execute()
+            return
+        self.client.table("workspace_memberships").upsert({
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "member_email": member_email,
+            "role": "owner",
+            "status": "active",
+            "invited_by_user_id": user_id,
+            "updated_at": datetime.utcnow().isoformat(),
+        }, on_conflict="workspace_id,member_email").execute()
+
+    async def _claim_reviewer_memberships(self, user_id: str, email: Optional[str]) -> None:
+        member_email = self._normalize_member_email(email)
+        if not member_email:
+            return
+        self.client.table("workspace_memberships").update({
+            "user_id": user_id,
+            "status": "active",
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("member_email", member_email).eq("role", "reviewer").in_("status", ["pending", "active"]).execute()
+
+    async def require_workspace_role(
+        self,
+        user_id: str,
+        email: Optional[str],
+        workspace_id: str,
+        allowed_roles: Optional[List[str]] = None,
+    ) -> str:
+        """Authorize a workspace operation from durable ownership or membership state."""
+        allowed = set(allowed_roles or ["owner", "reviewer"])
+        workspace = self.client.table("workspaces")\
+            .select("id,owner_user_id")\
+            .eq("id", workspace_id)\
+            .limit(1)\
+            .execute()
+        if not workspace.data:
+            raise ValueError("Workspace not found or access denied")
+        if str(workspace.data[0].get("owner_user_id")) == str(user_id):
+            if "owner" not in allowed:
+                raise ValueError("This action is unavailable for your workspace role")
+            await self._ensure_owner_membership(workspace_id, user_id, email)
+            return "owner"
+
+        await self._claim_reviewer_memberships(user_id, email)
+        membership = self.client.table("workspace_memberships")\
+            .select("role,status")\
+            .eq("workspace_id", workspace_id)\
+            .eq("user_id", user_id)\
+            .eq("status", "active")\
+            .limit(1)\
+            .execute()
+        role = str(membership.data[0]["role"]) if membership.data else ""
+        if role not in allowed:
+            raise ValueError("Workspace not found or access denied")
+        return role
+
+    async def list_accessible_workspaces(self, user_id: str, email: Optional[str]) -> Dict[str, Any]:
+        """Return owned and reviewer workspaces through the backend authorization layer."""
+        await self._claim_reviewer_memberships(user_id, email)
+        owned = self.client.table("workspaces")\
+            .select("*")\
+            .eq("owner_user_id", user_id)\
+            .order("created_at")\
+            .execute()
+        records: Dict[str, Dict[str, Any]] = {}
+        for workspace in owned.data or []:
+            workspace_id = str(workspace["id"])
+            await self._ensure_owner_membership(workspace_id, user_id, email)
+            records[workspace_id] = {**workspace, "role": "owner"}
+
+        memberships = self.client.table("workspace_memberships")\
+            .select("workspace_id,role")\
+            .eq("user_id", user_id)\
+            .eq("status", "active")\
+            .execute()
+        member_workspace_ids = [
+            str(row["workspace_id"])
+            for row in memberships.data or []
+            if str(row.get("role")) == "reviewer" and str(row["workspace_id"]) not in records
+        ]
+        if member_workspace_ids:
+            member_workspaces = self.client.table("workspaces")\
+                .select("*")\
+                .in_("id", member_workspace_ids)\
+                .order("created_at")\
+                .execute()
+            for workspace in member_workspaces.data or []:
+                records[str(workspace["id"])] = {**workspace, "role": "reviewer"}
+
+        preference = self.client.table("workspace_preferences")\
+            .select("active_workspace_id")\
+            .eq("user_id", user_id)\
+            .limit(1)\
+            .execute()
+        active_id = str(preference.data[0]["active_workspace_id"]) if preference.data else None
+        if active_id not in records:
+            active_id = next(iter(records), None)
+        return {"workspaces": list(records.values()), "active_workspace_id": active_id}
+
+    async def create_owned_workspace(self, user_id: str, email: Optional[str], name: str) -> Dict[str, Any]:
+        cleaned_name = str(name or "").strip()[:60]
+        if len(cleaned_name) < 2:
+            raise ValueError("Workspace name is required")
+        created = self.client.table("workspaces").insert({
+            "owner_user_id": user_id,
+            "name": cleaned_name,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).execute()
+        if not created.data:
+            raise ValueError("Workspace could not be created")
+        workspace = created.data[0]
+        await self._ensure_owner_membership(str(workspace["id"]), user_id, email)
+        await self.select_accessible_workspace(user_id, email, str(workspace["id"]))
+        return {**workspace, "role": "owner"}
+
+    async def select_accessible_workspace(self, user_id: str, email: Optional[str], workspace_id: str) -> Dict[str, Any]:
+        role = await self.require_workspace_role(user_id, email, workspace_id)
+        self.client.table("workspace_preferences").upsert({
+            "user_id": user_id,
+            "active_workspace_id": workspace_id,
+            "updated_at": datetime.utcnow().isoformat(),
+        }, on_conflict="user_id").execute()
+        workspace = self.client.table("workspaces").select("*").eq("id", workspace_id).limit(1).execute()
+        return {**workspace.data[0], "role": role}
+
+    async def list_workspace_members(self, user_id: str, email: Optional[str], workspace_id: str) -> List[Dict[str, Any]]:
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner"])
+        response = self.client.table("workspace_memberships")\
+            .select("id,workspace_id,member_email,role,status,created_at,updated_at")\
+            .eq("workspace_id", workspace_id)\
+            .order("created_at")\
+            .execute()
+        return response.data or []
+
+    async def invite_workspace_reviewer(
+        self,
+        user_id: str,
+        email: Optional[str],
+        workspace_id: str,
+        reviewer_email: str,
+    ) -> Dict[str, Any]:
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner"])
+        normalized = self._normalize_member_email(reviewer_email)
+        if not normalized or "@" not in normalized:
+            raise ValueError("Enter a valid reviewer email address")
+        if normalized == self._normalize_member_email(email):
+            raise ValueError("The workspace owner already has access")
+        response = self.client.table("workspace_memberships").upsert({
+            "workspace_id": workspace_id,
+            "member_email": normalized,
+            "role": "reviewer",
+            "status": "pending",
+            "invited_by_user_id": user_id,
+            "updated_at": datetime.utcnow().isoformat(),
+        }, on_conflict="workspace_id,member_email").execute()
+        member = (response.data or [{}])[0]
+        await self.record_workspace_audit(workspace_id, user_id, "owner", "reviewer_invited", "membership", member.get("id"), {"role": "reviewer"})
+        return member
+
+    async def revoke_workspace_member(
+        self,
+        user_id: str,
+        email: Optional[str],
+        workspace_id: str,
+        membership_id: str,
+    ) -> None:
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner"])
+        membership = self.client.table("workspace_memberships")\
+            .select("id,role")\
+            .eq("id", membership_id)\
+            .eq("workspace_id", workspace_id)\
+            .limit(1)\
+            .execute()
+        if not membership.data or membership.data[0].get("role") == "owner":
+            raise ValueError("Reviewer membership not found")
+        self.client.table("workspace_memberships").update({
+            "status": "revoked",
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", membership_id).execute()
+        await self.record_workspace_audit(workspace_id, user_id, "owner", "reviewer_revoked", "membership", membership_id, {"role": "reviewer"})
+
+    async def record_workspace_audit(
+        self,
+        workspace_id: Optional[str],
+        actor_user_id: Optional[str],
+        actor_role: Optional[str],
+        event_type: str,
+        entity_type: str,
+        entity_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not workspace_id:
+            return
+        self.client.table("workspace_audit_events").insert({
+            "workspace_id": workspace_id,
+            "actor_user_id": actor_user_id,
+            "actor_role": actor_role,
+            "event_type": event_type,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "metadata": metadata or {},
+        }).execute()
+
+    @staticmethod
+    def _client_link_hash(token: str) -> str:
+        return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+    async def create_client_upload_link(
+        self,
+        user_id: str,
+        email: Optional[str],
+        workspace_id: str,
+        label: str,
+        expires_in_hours: int,
+        max_submissions: int,
+    ) -> Dict[str, Any]:
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner"])
+        raw_token = secrets.token_urlsafe(32)
+        expires_at = datetime.utcnow() + timedelta(hours=max(1, min(expires_in_hours, 720)))
+        response = self.client.table("client_upload_links").insert({
+            "workspace_id": workspace_id,
+            "owner_user_id": user_id,
+            "created_by_user_id": user_id,
+            "label": str(label or "Client upload").strip()[:80] or "Client upload",
+            "token_hash": self._client_link_hash(raw_token),
+            "expires_at": expires_at.isoformat(),
+            "max_submissions": max(1, min(max_submissions, 250)),
+            "updated_at": datetime.utcnow().isoformat(),
+        }).execute()
+        if not response.data:
+            raise ValueError("Upload link could not be created")
+        link = response.data[0]
+        await self.record_workspace_audit(workspace_id, user_id, "owner", "upload_link_created", "upload_link", link["id"], {"expires_at": link["expires_at"]})
+        return {**link, "token": raw_token}
+
+    async def list_client_upload_links(self, user_id: str, email: Optional[str], workspace_id: str) -> List[Dict[str, Any]]:
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner"])
+        response = self.client.table("client_upload_links")\
+            .select("id,workspace_id,label,expires_at,max_submissions,submission_count,enabled,revoked_at,created_at")\
+            .eq("workspace_id", workspace_id)\
+            .order("created_at", desc=True)\
+            .execute()
+        return response.data or []
+
+    async def revoke_client_upload_link(self, user_id: str, email: Optional[str], workspace_id: str, link_id: str) -> None:
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner"])
+        updated = self.client.table("client_upload_links").update({
+            "enabled": False,
+            "revoked_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", link_id).eq("workspace_id", workspace_id).execute()
+        if not updated.data:
+            raise ValueError("Upload link not found")
+        await self.record_workspace_audit(workspace_id, user_id, "owner", "upload_link_revoked", "upload_link", link_id)
+
+    async def get_public_client_upload_link(self, token: str) -> Optional[Dict[str, Any]]:
+        response = self.client.table("client_upload_links")\
+            .select("id,workspace_id,owner_user_id,label,expires_at,max_submissions,submission_count,enabled,revoked_at")\
+            .eq("token_hash", self._client_link_hash(token))\
+            .limit(1)\
+            .execute()
+        if not response.data:
+            return None
+        link = response.data[0]
+        if not link.get("enabled") or link.get("revoked_at") or datetime.fromisoformat(str(link["expires_at"]).replace("Z", "+00:00")).replace(tzinfo=None) <= datetime.utcnow():
+            return None
+        if int(link.get("submission_count") or 0) >= int(link.get("max_submissions") or 0):
+            return None
+        workspace = self.client.table("workspaces").select("name").eq("id", link["workspace_id"]).limit(1).execute()
+        link["workspace_name"] = workspace.data[0]["name"] if workspace.data else "Workspace"
+        return link
+
+    async def claim_client_upload_link(self, token: str) -> Optional[Dict[str, Any]]:
+        response = self.client.rpc("claim_client_upload_link", {"p_token_hash": self._client_link_hash(token)}).execute()
+        return response.data[0] if response.data else None
+
+    async def create_client_upload_submission(self, link: Dict[str, Any], file_count: int) -> Dict[str, Any]:
+        response = self.client.table("client_upload_submissions").insert({
+            "link_id": link["id"],
+            "workspace_id": link["workspace_id"],
+            "owner_user_id": link["owner_user_id"],
+            "status": "received",
+            "file_count": max(0, file_count),
+            "expires_at": (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
+        }).execute()
+        if not response.data:
+            raise ValueError("Client submission could not be recorded")
+        return response.data[0]
+
+    async def update_client_upload_submission(self, submission_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        response = self.client.table("client_upload_submissions").update({
+            **updates,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", submission_id).execute()
+        if not response.data:
+            raise ValueError("Client submission not found")
+        return response.data[0]
+
+    async def list_client_upload_submissions(
+        self,
+        user_id: str,
+        email: Optional[str],
+        workspace_id: str,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner", "reviewer"])
+        response = self.client.table("client_upload_submissions")\
+            .select("*")\
+            .eq("workspace_id", workspace_id)\
+            .order("created_at", desc=True)\
+            .limit(max(1, min(limit, 100)))\
+            .execute()
+        submissions = response.data or []
+        for submission in submissions:
+            job_id = submission.get("job_id")
+            if not job_id:
+                submission["documents"] = []
+                continue
+            job = await self.get_job(str(job_id))
+            documents = await self.get_job_documents(str(job_id))
+            submission["job_status"] = job.get("status") if job else None
+            submission["documents"] = [
+                {
+                    "id": document.get("id"),
+                    "original_filename": document.get("original_filename"),
+                    "status": document.get("status"),
+                    "review_status": document.get("review_status"),
+                }
+                for document in documents
+            ]
+        return submissions
+
     async def get_or_create_email_intake(
         self,
         user_id: str,
@@ -1083,16 +1439,17 @@ class SupabaseService:
     async def list_owned_email_intake_messages(
         self,
         user_id: str,
+        email: Optional[str] = None,
         workspace_id: Optional[str] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
-        resolved_workspace_id = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        resolved_workspace_id = workspace_id or await self.resolve_owned_workspace_id(user_id)
         if not resolved_workspace_id:
             return []
+        await self.require_workspace_role(user_id, email, resolved_workspace_id, ["owner", "reviewer"])
         response = self.client.table("email_intake_messages")\
             .select("*")\
             .eq("workspace_id", resolved_workspace_id)\
-            .eq("owner_user_id", user_id)\
             .order("received_at", desc=True)\
             .limit(max(1, min(limit, 100)))\
             .execute()
@@ -1214,6 +1571,7 @@ class SupabaseService:
             "applies_to": identity["applies_to"],
             "suggested_fields": clean_fields,
             "enabled": True,
+            "auto_mode": "suggest",
             "source_document_id": document_id,
             "approved_at": changed_at,
             "updated_at": changed_at,
@@ -1256,6 +1614,11 @@ class SupabaseService:
             update["suggested_fields"] = clean_fields
         if updates.get("enabled") is not None:
             update["enabled"] = bool(updates["enabled"])
+        if updates.get("auto_mode") is not None:
+            mode = str(updates["auto_mode"])
+            if mode not in {"suggest", "auto_fill", "auto_ready"}:
+                raise ValueError("auto_mode must be suggest, auto_fill, or auto_ready")
+            update["auto_mode"] = mode
         updated = self.client.table("vendor_rules")\
             .update(update)\
             .eq("id", rule_id)\
@@ -1363,7 +1726,15 @@ class SupabaseService:
         document_id: str,
         user_id: str,
     ) -> Dict[str, Any]:
-        """Create a draft-bill queue record from a confirmed invoice."""
+        """Create a draft-bill queue record from a confirmed invoice.
+
+        P3 — Auto-apply: if a vendor rule with ``auto_mode`` in
+        ``{auto_fill, auto_ready}`` matches this document's vendor, pre-fill
+        the draft with the rule's saved fields and (for ``auto_ready``) move
+        the item straight to ``ready_to_publish``. The applied rule is stamped
+        on ``metadata.auto_applied_rule`` so the review UI can show the
+        "Pre-filled by vendor rule" notice and offer a one-click override.
+        """
         document = await self.get_job_document(job_id, document_id)
         if not document or document.get("owner_user_id") != user_id:
             raise ValueError("Document not found")
@@ -1385,13 +1756,50 @@ class SupabaseService:
         if existing.data:
             return await self._enrich_accounts_payable_item(existing.data[0], user_id)
         changed_at = datetime.utcnow().isoformat()
+        draft_data = self._accounts_payable_draft_from_document(document)
+
+        # P3 — apply vendor rule pre-fill
+        applied_rule_meta: Optional[Dict[str, Any]] = None
+        initial_status = "needs_coding"
+        rule = await self.get_vendor_suggestion(document, user_id)
+        if rule and rule.get("enabled"):
+            auto_mode = rule.get("auto_mode") or "suggest"
+            if auto_mode in {"auto_fill", "auto_ready"}:
+                suggested = rule.get("suggested_fields") or {}
+                # Map vendor rule fields onto AP draft fields. We never overwrite
+                # values the extractor already produced — the rule fills gaps.
+                rule_field_map = [
+                    ("vendor_ref_id", "vendor_ref_id"),
+                    ("account_ref_id", "account_ref_id"),
+                    ("category_account", "account_category"),
+                    ("tax_code", "tax_code"),
+                    ("tax_code_ref_id", "tax_code_ref_id"),
+                    ("currency", "currency"),
+                ]
+                applied_fields: List[str] = []
+                for source_key, dest_key in rule_field_map:
+                    value = suggested.get(source_key)
+                    if value and not draft_data.get(dest_key):
+                        draft_data[dest_key] = str(value).strip()
+                        applied_fields.append(dest_key)
+                if applied_fields:
+                    applied_rule_meta = {
+                        "rule_id": rule.get("id"),
+                        "rule_name": rule.get("display_name"),
+                        "mode": auto_mode,
+                        "applied_fields": applied_fields,
+                        "applied_at": changed_at,
+                    }
+                    if auto_mode == "auto_ready":
+                        initial_status = "ready_to_publish"
+
         item = {
             "owner_user_id": user_id,
             "workspace_id": workspace_id,
             "document_id": document_id,
             "job_id": job_id,
-            "status": "needs_coding",
-            "draft_data": self._accounts_payable_draft_from_document(document),
+            "status": initial_status,
+            "draft_data": draft_data,
             "attachment_visible": True,
             "source_filename": document["original_filename"],
             "source_storage_path": document["source_storage_path"],
@@ -1399,10 +1807,12 @@ class SupabaseService:
                 "entered_from_review_status": document.get("review_status"),
                 "status_history": [{
                     "from_status": None,
-                    "to_status": "needs_coding",
+                    "to_status": initial_status,
                     "actor": {"user_id": user_id},
                     "changed_at": changed_at,
+                    **({"reason": "auto_applied_vendor_rule"} if applied_rule_meta else {}),
                 }],
+                **({"auto_applied_rule": applied_rule_meta} if applied_rule_meta else {}),
             },
             "published_at": None,
             "updated_at": changed_at,
@@ -1463,6 +1873,11 @@ class SupabaseService:
             update["draft_data"] = draft_data
         if updates.get("attachment_visible") is not None:
             update["attachment_visible"] = bool(updates["attachment_visible"])
+        # P3 — reviewer is overriding the vendor-rule pre-fill.
+        if updates.get("acknowledge_auto_applied"):
+            existing_metadata = dict(current.get("metadata") or {})
+            if existing_metadata.pop("auto_applied_rule", None) is not None:
+                update["metadata"] = existing_metadata
         next_status = updates.get("status")
         if next_status:
             if current.get("status") == "published" and next_status != "published":

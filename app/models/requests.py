@@ -5,6 +5,12 @@ from app.core.config import settings
 DocumentMode = Literal["auto", "table", "invoice", "receipt", "bank_statement", "notes", "invoice_receipt"]
 RoutableDocumentMode = Literal["table", "invoice", "receipt", "bank_statement", "notes"]
 
+# P3 — vendor rule auto-application modes.
+# - suggest:    surface the rule as a suggestion; user fills the draft (legacy)
+# - auto_fill:  pre-fill the draft from the rule, user must still confirm
+# - auto_ready: pre-fill and mark the AP item Ready to publish automatically
+VendorRuleAutoMode = Literal["suggest", "auto_fill", "auto_ready"]
+
 
 class ImageData(BaseModel):
     """Model for individual image data in requests."""
@@ -158,6 +164,10 @@ class VendorRuleUpdateRequest(BaseModel):
     display_name: Optional[str] = Field(None, min_length=1, max_length=160)
     suggested_fields: Optional[VendorRuleFields] = None
     enabled: Optional[bool] = None
+    auto_mode: Optional[VendorRuleAutoMode] = Field(
+        None,
+        description="How the rule is applied to new documents from this vendor (suggest / auto_fill / auto_ready)",
+    )
 
 
 AccountsPayableStatus = Literal["needs_coding", "needs_review", "ready_to_publish", "published", "failed"]
@@ -193,6 +203,10 @@ class AccountsPayableUpdateRequest(BaseModel):
     attachment_visible: Optional[bool] = None
     status: Optional[AccountsPayableStatus] = None
     reason: Optional[str] = Field(None, max_length=240)
+    acknowledge_auto_applied: Optional[bool] = Field(
+        None,
+        description="Set true when the reviewer overrides a vendor-rule pre-fill; the auto_applied_rule metadata is cleared on the item.",
+    )
 
 
 class AccountsPayableBulkStatusRequest(BaseModel):
@@ -213,6 +227,27 @@ class QuickBooksWorkspaceRequest(BaseModel):
     """Target the user's currently selected workspace for an integration action."""
 
     workspace_id: Optional[str] = Field(None, description="Owned workspace; defaults to the active workspace")
+
+
+class WorkspaceCreateRequest(BaseModel):
+    """Create one owned workspace."""
+
+    name: str = Field(..., min_length=2, max_length=60)
+
+
+class WorkspaceReviewerRequest(BaseModel):
+    """Invite a minimal review-only workspace member."""
+
+    email: str = Field(..., min_length=3, max_length=320)
+
+
+class ClientUploadLinkRequest(BaseModel):
+    """Issue an expiring client submission link for an owned workspace."""
+
+    workspace_id: str = Field(..., min_length=1)
+    label: str = Field("Client upload", min_length=1, max_length=80)
+    expires_in_hours: int = Field(168, ge=1, le=720)
+    max_submissions: int = Field(25, ge=1, le=250)
 
 
 ReceiptPublishingDestination = Literal["expense", "bill"]

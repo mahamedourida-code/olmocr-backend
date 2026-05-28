@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for backend-lively-hill-7043 on 2026-05-21T01:29:22+01:00
+# fly.toml app configuration file generated for backend-lively-hill-7043 on 2026-05-27T06:39:47+01:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -50,6 +50,9 @@ primary_region = 'arn'
   PRO_MAX_FILES_PER_BATCH = '30'
   QUEUE_ADMISSION_MAX_ACTIVE_JOBS = '100'
   QUEUE_ADMISSION_MAX_QUEUED_JOBS = '50'
+  QUICKBOOKS_ENVIRONMENT = 'production'
+  QUICKBOOKS_MINOR_VERSION = '75'
+  QUICKBOOKS_REDIRECT_URI = 'https://backend-lively-hill-7043.fly.dev/api/v1/integrations/quickbooks/callback'
   RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY = '9'
   RATE_LIMIT_ANONYMOUS_JOBS_PER_MINUTE = '3'
   RATE_LIMIT_ANONYMOUS_RUNS_PER_DAY = '3'
@@ -68,9 +71,6 @@ primary_region = 'arn'
   SUPABASE_STORAGE_BUCKET = 'jobs'
   TEMP_STORAGE_PATH = '/app/temp_storage'
   WORKER_CONCURRENCY = '4'
-  QUICKBOOKS_ENVIRONMENT = 'production'
-  QUICKBOOKS_MINOR_VERSION = '75'
-  QUICKBOOKS_REDIRECT_URI = 'https://backend-lively-hill-7043.fly.dev/api/v1/integrations/quickbooks/callback'
 
 [processes]
   app = 'python start.py'
@@ -97,6 +97,13 @@ primary_region = 'arn'
     path = '/docs'
 
 [[vm]]
-  memory = '4gb'
-  cpus = 2
-  memory_mb = 4096
+  processes = ['app']
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
+
+[[vm]]
+  processes = ['worker']
+  memory = '256mb'
+  cpu_kind = 'shared'
+  cpus = 1
