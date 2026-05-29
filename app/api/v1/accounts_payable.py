@@ -6,6 +6,8 @@ from app.core.dependencies import get_current_user
 from app.models.requests import (
     AccountsPayableBulkPublishRequest,
     AccountsPayableBulkStatusRequest,
+    AccountsPayableDiscardRequest,
+    AccountsPayableDuplicateDismissRequest,
     AccountsPayableFromDocumentRequest,
     AccountsPayableUpdateRequest,
 )
@@ -20,6 +22,7 @@ router = APIRouter(prefix="/accounts-payable", tags=["Accounts Payable"])
 async def list_accounts_payable_items(
     workspace_id: Optional[str] = Query(None),
     item_status: Optional[str] = Query(None, alias="status"),
+    duplicates_only: bool = Query(False, description="Return only items with an active duplicate warning"),
     user: dict = Depends(get_current_user),
 ):
     service = get_supabase_service()
@@ -28,6 +31,7 @@ async def list_accounts_payable_items(
             user_id=user["user_id"],
             workspace_id=workspace_id,
             ap_status=item_status,
+            duplicates_only=duplicates_only,
         )
         return {"items": items, "total": len(items)}
     except ValueError as exc:
@@ -94,6 +98,43 @@ async def bulk_update_accounts_payable_items(
             reason=request.reason,
         )
         return {"items": items, "total": len(items)}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{item_id}/duplicate/dismiss", response_model=Dict[str, Any])
+async def dismiss_accounts_payable_duplicate_warning(
+    item_id: str,
+    request: AccountsPayableDuplicateDismissRequest,
+    user: dict = Depends(get_current_user),
+):
+    service = get_supabase_service()
+    try:
+        item = await service.dismiss_ap_duplicate_warning(
+            item_id=item_id,
+            user_id=user["user_id"],
+            warning_id=request.warning_id,
+            reason=request.reason,
+        )
+        return {"item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{item_id}/discard", response_model=Dict[str, Any])
+async def discard_accounts_payable_item(
+    item_id: str,
+    request: AccountsPayableDiscardRequest,
+    user: dict = Depends(get_current_user),
+):
+    service = get_supabase_service()
+    try:
+        item = await service.discard_accounts_payable_item(
+            item_id=item_id,
+            user_id=user["user_id"],
+            reason=request.reason,
+        )
+        return {"item": item}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 

@@ -1718,7 +1718,175 @@ class SupabaseService:
             .limit(1)\
             .execute()
         enriched["quickbooks_publication"] = publication.data[0] if publication.data else None
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        enriched["duplicate_warnings"] = list(metadata.get("ap_duplicate_warnings") or [])
         return enriched
+
+    # ── P4 — AP cross-batch duplicate detection ────────────────────────────
+
+    AP_DUPLICATE_WINDOW_DAYS = 90
+
+    def _ap_duplicate_signature(self, draft_data: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """Return the (vendor, amount, date) triple used to fingerprint an AP item.
+
+        We use vendor + amount + date instead of the document-level
+        vendor + invoice_number signature because invoice numbers vary
+        between vendor format revisions (one off character → no match in
+        QuickBooks). The triple is what Reddit bookkeeping threads cite as
+        the only reliable duplicate signal at this layer.
+        """
+        if not isinstance(draft_data, dict):
+            return None
+        vendor = self._normalize_duplicate_text(draft_data.get("vendor"))
+        amount = self._normalize_duplicate_amount(draft_data.get("total"))
+        invoice_date = self._normalize_duplicate_text(draft_data.get("invoice_date"))
+        if not vendor or not amount or not invoice_date:
+            return None
+        return {"vendor": vendor, "amount": amount, "date": invoice_date}
+
+    async def _find_ap_duplicate_peers(
+        self,
+        item: Dict[str, Any],
+        user_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Pull recent AP peers from the same workspace within the dedup window."""
+        workspace_id = item.get("workspace_id")
+        if not workspace_id:
+            return []
+        cutoff = (datetime.utcnow() - timedelta(days=self.AP_DUPLICATE_WINDOW_DAYS)).isoformat()
+        response = self.client.table("accounts_payable_items")\
+            .select("id,workspace_id,document_id,job_id,status,draft_data,source_filename,created_at,metadata")\
+            .eq("owner_user_id", user_id)\
+            .eq("workspace_id", workspace_id)\
+            .gte("created_at", cutoff)\
+            .neq("id", item["id"])\
+            .execute()
+        return [row for row in (response.data or []) if row.get("status") != "discarded"]
+
+    async def _refresh_ap_duplicate_warnings(
+        self,
+        item: Dict[str, Any],
+        user_id: str,
+    ) -> Dict[str, Any]:
+        """Recompute and persist ap_duplicate_warnings for one AP item."""
+        signature = self._ap_duplicate_signature(item.get("draft_data") or {})
+        metadata = dict(item.get("metadata") or {})
+        dismiss_history = [
+            entry for entry in (metadata.get("duplicate_dismiss_history") or [])
+            if isinstance(entry, dict)
+        ]
+        dismissed_ids = {
+            str(entry.get("warning_id")) for entry in dismiss_history if entry.get("warning_id")
+        }
+        warnings: List[Dict[str, Any]] = []
+        if signature:
+            peers = await self._find_ap_duplicate_peers(item, user_id)
+            for peer in peers:
+                peer_sig = self._ap_duplicate_signature(peer.get("draft_data") or {})
+                if not peer_sig:
+                    continue
+                if (
+                    peer_sig["vendor"] != signature["vendor"]
+                    or peer_sig["amount"] != signature["amount"]
+                    or peer_sig["date"] != signature["date"]
+                ):
+                    continue
+                warning_id = f"ap_vendor_amount_date:{peer['id']}"
+                warnings.append({
+                    "id": warning_id,
+                    "type": "vendor_amount_date",
+                    "code": "ap_duplicate_triple",
+                    "message": "Vendor, amount, and invoice date match an existing draft bill from the last 90 days.",
+                    "matched_item_id": peer["id"],
+                    "matched_document_id": peer.get("document_id"),
+                    "matched_job_id": peer.get("job_id"),
+                    "matched_status": peer.get("status"),
+                    "matched_filename": peer.get("source_filename"),
+                    "matched_created_at": peer.get("created_at"),
+                    "fields": signature,
+                    "dismissed": warning_id in dismissed_ids,
+                    "detected_at": datetime.utcnow().isoformat(),
+                })
+        metadata["ap_duplicate_warnings"] = warnings
+        metadata["ap_duplicate_checked_at"] = datetime.utcnow().isoformat()
+        if dismiss_history:
+            metadata["duplicate_dismiss_history"] = dismiss_history
+        update_response = self.client.table("accounts_payable_items").update({
+            "metadata": metadata,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", item["id"]).eq("owner_user_id", user_id).execute()
+        refreshed = update_response.data[0] if update_response.data else {**item, "metadata": metadata}
+        return refreshed
+
+    async def dismiss_ap_duplicate_warning(
+        self,
+        item_id: str,
+        user_id: str,
+        warning_id: str,
+        reason: Optional[str],
+    ) -> Dict[str, Any]:
+        """Record a reviewer-supplied dismissal of a duplicate warning."""
+        current = await self.get_accounts_payable_item(item_id, user_id)
+        if current.get("status") == "published":
+            raise ValueError("Published items cannot be edited")
+        metadata = dict(current.get("metadata") or {})
+        warnings = list(metadata.get("ap_duplicate_warnings") or [])
+        warning = next((row for row in warnings if str(row.get("id")) == warning_id), None)
+        if not warning:
+            raise ValueError("Duplicate warning not found")
+        changed_at = datetime.utcnow().isoformat()
+        history = list(metadata.get("duplicate_dismiss_history") or [])
+        history.append({
+            "warning_id": warning_id,
+            "reason": (reason or "").strip(),
+            "actor": {"user_id": user_id},
+            "dismissed_at": changed_at,
+        })
+        metadata["duplicate_dismiss_history"] = history
+        metadata["ap_duplicate_warnings"] = [
+            {**row, "dismissed": True} if str(row.get("id")) == warning_id else row
+            for row in warnings
+        ]
+        update_response = self.client.table("accounts_payable_items").update({
+            "metadata": metadata,
+            "updated_at": changed_at,
+        }).eq("id", item_id).eq("owner_user_id", user_id).execute()
+        if not update_response.data:
+            raise Exception("Supabase returned no AP item after dismiss")
+        return await self._enrich_accounts_payable_item(update_response.data[0], user_id)
+
+    async def discard_accounts_payable_item(
+        self,
+        item_id: str,
+        user_id: str,
+        reason: Optional[str],
+    ) -> Dict[str, Any]:
+        """Mark the AP item as discarded (the reviewer confirmed it is a duplicate)."""
+        current = await self.get_accounts_payable_item(item_id, user_id)
+        if current.get("status") == "published":
+            raise ValueError("Published items cannot be discarded")
+        if current.get("status") == "discarded":
+            return current
+        changed_at = datetime.utcnow().isoformat()
+        metadata = dict(current.get("metadata") or {})
+        history = list(metadata.get("status_history") or [])
+        history.append({
+            "from_status": current.get("status"),
+            "to_status": "discarded",
+            "reason": (reason or "duplicate_confirmed").strip(),
+            "actor": {"user_id": user_id},
+            "changed_at": changed_at,
+        })
+        metadata["status_history"] = history
+        metadata["discarded_at"] = changed_at
+        update_response = self.client.table("accounts_payable_items").update({
+            "status": "discarded",
+            "metadata": metadata,
+            "updated_at": changed_at,
+        }).eq("id", item_id).eq("owner_user_id", user_id).execute()
+        if not update_response.data:
+            raise Exception("Supabase returned no AP item after discard")
+        return await self._enrich_accounts_payable_item(update_response.data[0], user_id)
 
     async def create_accounts_payable_item_from_document(
         self,
@@ -1820,13 +1988,17 @@ class SupabaseService:
         response = self.client.table("accounts_payable_items").insert(item).execute()
         if not response.data:
             raise Exception("Supabase returned no Accounts Payable item")
-        return await self._enrich_accounts_payable_item(response.data[0], user_id)
+        created = response.data[0]
+        # P4 — compute cross-batch duplicate warnings against the same workspace
+        created = await self._refresh_ap_duplicate_warnings(created, user_id)
+        return await self._enrich_accounts_payable_item(created, user_id)
 
     async def list_accounts_payable_items(
         self,
         user_id: str,
         workspace_id: Optional[str] = None,
         ap_status: Optional[str] = None,
+        duplicates_only: bool = False,
     ) -> List[Dict[str, Any]]:
         resolved_workspace_id = await self.resolve_owned_workspace_id(user_id, workspace_id)
         if not resolved_workspace_id:
@@ -1838,10 +2010,20 @@ class SupabaseService:
         if ap_status:
             query = query.eq("status", ap_status)
         response = query.order("updated_at", desc=True).execute()
-        return [
+        enriched = [
             await self._enrich_accounts_payable_item(item, user_id)
             for item in (response.data or [])
         ]
+        # P4 — virtual "duplicates" filter: only return items with an active warning.
+        if duplicates_only:
+            enriched = [
+                item for item in enriched
+                if any(
+                    not warning.get("dismissed")
+                    for warning in (item.get("duplicate_warnings") or [])
+                )
+            ]
+        return enriched
 
     async def get_accounts_payable_item(self, item_id: str, user_id: str) -> Dict[str, Any]:
         response = self.client.table("accounts_payable_items")\

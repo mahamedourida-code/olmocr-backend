@@ -170,7 +170,7 @@ class VendorRuleUpdateRequest(BaseModel):
     )
 
 
-AccountsPayableStatus = Literal["needs_coding", "needs_review", "ready_to_publish", "published", "failed"]
+AccountsPayableStatus = Literal["needs_coding", "needs_review", "ready_to_publish", "published", "failed", "discarded"]
 
 
 class AccountsPayableFromDocumentRequest(BaseModel):
@@ -207,6 +207,19 @@ class AccountsPayableUpdateRequest(BaseModel):
         None,
         description="Set true when the reviewer overrides a vendor-rule pre-fill; the auto_applied_rule metadata is cleared on the item.",
     )
+
+
+class AccountsPayableDuplicateDismissRequest(BaseModel):
+    """Dismiss a single duplicate warning on an AP item with a reviewer reason."""
+
+    warning_id: str = Field(..., min_length=1, description="ID of the duplicate warning to dismiss")
+    reason: Optional[str] = Field(None, max_length=240, description="Short justification (e.g. 'legitimate second invoice')")
+
+
+class AccountsPayableDiscardRequest(BaseModel):
+    """Discard a draft AP item after confirming it is a duplicate."""
+
+    reason: Optional[str] = Field(None, max_length=240, description="Short note explaining why the item was discarded")
 
 
 class AccountsPayableBulkStatusRequest(BaseModel):
