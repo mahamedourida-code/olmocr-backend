@@ -1389,6 +1389,95 @@ class SupabaseService:
             ]
         return submissions
 
+    async def client_analytics(
+        self,
+        user_id: str,
+        email: Optional[str],
+        workspace_id: str,
+        late_threshold_days: int = 14,
+    ) -> List[Dict[str, Any]]:
+        """P11 — per-client (per intake link) practice-management metrics.
+
+        A "client" is one intake link; its label is the client name. Metrics
+        aggregate that link's submissions: documents this month, extraction
+        success rate, average turnaround, last submission, and a Late flag.
+        """
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner", "reviewer"])
+        links = self.client.table("client_upload_links")\
+            .select("id,label,created_at,enabled,revoked_at")\
+            .eq("workspace_id", workspace_id)\
+            .order("created_at", desc=True)\
+            .execute().data or []
+        submissions = self.client.table("client_upload_submissions")\
+            .select("id,link_id,status,file_count,job_id,created_at,updated_at")\
+            .eq("workspace_id", workspace_id)\
+            .order("created_at", desc=True)\
+            .limit(1000)\
+            .execute().data or []
+
+        now = datetime.utcnow()
+        month_start = datetime(now.year, now.month, 1)
+        by_link: Dict[str, List[Dict[str, Any]]] = {}
+        for sub in submissions:
+            by_link.setdefault(str(sub.get("link_id")), []).append(sub)
+
+        def _parse(value: Any) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                return None
+
+        rows: List[Dict[str, Any]] = []
+        for link in links:
+            link_id = str(link.get("id"))
+            link_subs = by_link.get(link_id, [])
+            docs_this_month = 0
+            total_docs = 0
+            completed_docs = 0
+            turnarounds: List[float] = []
+            last_submission: Optional[datetime] = None
+            job_ids: List[str] = []
+            for sub in link_subs:
+                created = _parse(sub.get("created_at"))
+                files = int(sub.get("file_count") or 0)
+                total_docs += files
+                status = str(sub.get("status") or "")
+                if status in {"queued", "completed", "partially_completed"}:
+                    completed_docs += files
+                if created:
+                    if created >= month_start:
+                        docs_this_month += files
+                    if not last_submission or created > last_submission:
+                        last_submission = created
+                    updated = _parse(sub.get("updated_at"))
+                    if updated and updated >= created:
+                        turnarounds.append((updated - created).total_seconds() / 3600.0)
+                if sub.get("job_id"):
+                    job_ids.append(str(sub["job_id"]))
+
+            success_rate = round((completed_docs / total_docs) * 100) if total_docs else None
+            avg_turnaround = round(sum(turnarounds) / len(turnarounds), 1) if turnarounds else None
+            days_since = (now - last_submission).days if last_submission else None
+            is_late = bool(last_submission and days_since is not None and days_since >= late_threshold_days)
+            # A link that never received anything is "awaiting first upload", not late.
+            rows.append({
+                "link_id": link_id,
+                "name": link.get("label") or "Client",
+                "documents_this_month": docs_this_month,
+                "total_documents": total_docs,
+                "success_rate": success_rate,
+                "avg_turnaround_hours": avg_turnaround,
+                "last_submission_at": last_submission.isoformat() if last_submission else None,
+                "days_since_last": days_since,
+                "is_late": is_late,
+                "never_submitted": last_submission is None,
+                "enabled": bool(link.get("enabled")) and not link.get("revoked_at"),
+                "job_ids": job_ids,
+            })
+        return rows
+
     @staticmethod
     def _client_document_stage(job_status: Optional[str], review_status: Optional[str]) -> str:
         """Collapse internal job + review state into a client-facing stage.

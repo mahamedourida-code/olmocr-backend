@@ -79,6 +79,21 @@ async def list_client_submissions(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
 
+@router.get("/analytics", response_model=Dict[str, Any])
+async def client_analytics(
+    workspace_id: str = Query(...),
+    late_days: int = Query(14, ge=1, le=180),
+    user: dict = Depends(get_current_user),
+):
+    try:
+        clients = await get_supabase_service().client_analytics(
+            user["user_id"], user.get("email"), workspace_id, late_days,
+        )
+        return {"clients": clients, "total": len(clients)}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
 @router.get("/public/{token}", response_model=Dict[str, Any])
 async def public_upload_context(token: str):
     link = await get_supabase_service().get_public_client_upload_link(token)
