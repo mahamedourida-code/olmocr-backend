@@ -1362,6 +1362,92 @@ class SupabaseService:
             ]
         return submissions
 
+    @staticmethod
+    def _client_document_stage(job_status: Optional[str], review_status: Optional[str]) -> str:
+        """Collapse internal job + review state into a client-facing stage.
+
+        Stages (in order): received → processing → reviewed → done.
+        - published review_status            → done
+        - ready review_status                → reviewed
+        - job completed but not yet ready     → processing (in the bookkeeper's queue)
+        - job processing / queued             → processing
+        - nothing started                     → received
+        """
+        if review_status == "published":
+            return "done"
+        if review_status == "ready":
+            return "reviewed"
+        if job_status in {"processing", "queued"}:
+            return "processing"
+        if job_status in {"completed", "partially_completed"}:
+            # Extracted and waiting in the review board.
+            return "processing"
+        return "received"
+
+    async def get_public_client_status(self, token: str) -> Optional[Dict[str, Any]]:
+        """Public, no-auth status view for an intake link's submissions.
+
+        Unlike the upload endpoint, this resolves the link even when it is
+        expired or at its submission cap — a client still needs to see the
+        status of what they already sent. Only non-sensitive fields are
+        returned (filenames, dates, derived stages) — never tokens, storage
+        paths, or extracted data.
+        """
+        link_response = self.client.table("client_upload_links")\
+            .select("id,workspace_id,label,enabled,revoked_at")\
+            .eq("token_hash", self._client_link_hash(token))\
+            .limit(1)\
+            .execute()
+        if not link_response.data:
+            return None
+        link = link_response.data[0]
+        if link.get("revoked_at"):
+            return None
+
+        workspace = self.client.table("workspaces").select("name").eq("id", link["workspace_id"]).limit(1).execute()
+        workspace_name = workspace.data[0]["name"] if workspace.data else "Workspace"
+
+        submissions_response = self.client.table("client_upload_submissions")\
+            .select("id,status,file_count,job_id,created_at,updated_at")\
+            .eq("link_id", link["id"])\
+            .order("created_at", desc=True)\
+            .limit(50)\
+            .execute()
+
+        submissions: List[Dict[str, Any]] = []
+        for submission in (submissions_response.data or []):
+            job_id = submission.get("job_id")
+            documents: List[Dict[str, Any]] = []
+            job_status = None
+            if job_id:
+                job = await self.get_job(str(job_id))
+                job_status = job.get("status") if job else None
+                for document in await self.get_job_documents(str(job_id)):
+                    if document.get("review_status") == "deleted":
+                        continue
+                    documents.append({
+                        "filename": document.get("original_filename"),
+                        "stage": self._client_document_stage(job_status, document.get("review_status")),
+                    })
+            if not documents:
+                # No per-document rows yet — represent the submission as one line.
+                documents.append({
+                    "filename": f"{submission.get('file_count') or 0} file(s)",
+                    "stage": self._client_document_stage(job_status, None) if job_id else "received",
+                })
+            submissions.append({
+                "id": submission["id"],
+                "submitted_at": submission.get("created_at"),
+                "file_count": submission.get("file_count"),
+                "documents": documents,
+            })
+
+        return {
+            "label": link.get("label") or "Your documents",
+            "workspace_name": workspace_name,
+            "submissions": submissions,
+        }
+
     async def get_or_create_email_intake(
         self,
         user_id: str,

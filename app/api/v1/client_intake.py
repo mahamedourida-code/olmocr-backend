@@ -91,6 +91,14 @@ async def public_upload_context(token: str):
     }
 
 
+@router.get("/public/{token}/status", response_model=Dict[str, Any])
+async def public_upload_status(token: str):
+    status_view = await get_supabase_service().get_public_client_status(token)
+    if not status_view:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This status link is unavailable")
+    return status_view
+
+
 @router.post("/public/{token}/upload", response_model=Dict[str, Any])
 async def submit_client_files(
     token: str,
