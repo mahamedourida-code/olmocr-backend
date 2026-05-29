@@ -209,6 +209,19 @@ class AccountsPayableUpdateRequest(BaseModel):
     )
 
 
+class PurchaseOrderImportRequest(BaseModel):
+    """Import open purchase orders from pasted/uploaded CSV text."""
+
+    workspace_id: Optional[str] = Field(None)
+    csv_text: str = Field(..., min_length=1, max_length=2_000_000)
+
+
+class PurchaseOrderMatchRequest(BaseModel):
+    """Link (or clear) a purchase order on an AP item."""
+
+    po_id: Optional[str] = Field(None, description="Purchase order id to match; null to unmatch")
+
+
 class AccountsPayableDuplicateDismissRequest(BaseModel):
     """Dismiss a single duplicate warning on an AP item with a reviewer reason."""
 

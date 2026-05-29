@@ -1833,7 +1833,122 @@ class SupabaseService:
         enriched["quickbooks_publication"] = publication.data[0] if publication.data else None
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         enriched["duplicate_warnings"] = list(metadata.get("ap_duplicate_warnings") or [])
+        enriched["matched_po"], enriched["po_match_status"] = self._resolve_matched_po(item)
         return enriched
+
+    # ── P9 — Purchase order matching ───────────────────────────────────────
+
+    def _resolve_matched_po(self, item: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], str]:
+        """Return (matched PO row, status) where status is matched/exceeds/unmatched."""
+        po_id = item.get("matched_po_id")
+        if not po_id:
+            return None, "unmatched"
+        response = self.client.table("purchase_orders")\
+            .select("id,po_number,po_date,total,remaining_amount,currency,status,vendor_name")\
+            .eq("id", po_id)\
+            .limit(1)\
+            .execute()
+        if not response.data:
+            return None, "unmatched"
+        po = response.data[0]
+        invoice_total = self._normalize_duplicate_amount((item.get("draft_data") or {}).get("total"))
+        try:
+            po_total = Decimal(str(po.get("total") or "0"))
+            inv = Decimal(invoice_total) if invoice_total else None
+        except (InvalidOperation, ValueError):
+            inv = None
+            po_total = Decimal("0")
+        status = "matched"
+        over_by = None
+        if inv is not None and inv > po_total:
+            status = "exceeds"
+            over_by = str((inv - po_total).quantize(Decimal("0.01")))
+        return {**po, "over_by": over_by}, status
+
+    @staticmethod
+    def _po_total(value: Any) -> Decimal:
+        try:
+            return Decimal(str(value).replace(",", "").strip() or "0").quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            return Decimal("0")
+
+    async def import_purchase_orders_csv(self, user_id: str, workspace_id: Optional[str], rows: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Upsert POs from parsed CSV rows. Expected columns: po_number, vendor, date, total, remaining, currency."""
+        resolved = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved:
+            raise ValueError("Select a workspace before importing purchase orders")
+        now = datetime.utcnow().isoformat()
+        records = []
+        for raw in rows:
+            lowered = {str(k).strip().lower(): (v or "").strip() for k, v in raw.items() if k}
+            po_number = lowered.get("po_number") or lowered.get("po") or lowered.get("number")
+            if not po_number:
+                continue
+            vendor_name = lowered.get("vendor") or lowered.get("vendor_name") or lowered.get("supplier") or ""
+            total = self._po_total(lowered.get("total") or lowered.get("amount"))
+            remaining_raw = lowered.get("remaining") or lowered.get("remaining_amount")
+            remaining = self._po_total(remaining_raw) if remaining_raw else total
+            records.append({
+                "workspace_id": resolved,
+                "owner_user_id": user_id,
+                "vendor_key": self._normalize_duplicate_text(vendor_name) or None,
+                "vendor_name": vendor_name or None,
+                "po_number": po_number,
+                "po_date": lowered.get("date") or lowered.get("po_date") or None,
+                "total": float(total),
+                "remaining_amount": float(remaining),
+                "currency": (lowered.get("currency") or "").upper() or None,
+                "status": "open",
+                "source": "csv",
+                "updated_at": now,
+            })
+        if not records:
+            raise ValueError("No valid PO rows found. Include a po_number column.")
+        self.client.table("purchase_orders").upsert(records, on_conflict="workspace_id,po_number").execute()
+        return {"imported": len(records)}
+
+    async def list_open_purchase_orders(
+        self,
+        user_id: str,
+        workspace_id: Optional[str],
+        vendor_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        resolved = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved:
+            return []
+        query = self.client.table("purchase_orders")\
+            .select("id,po_number,po_date,total,remaining_amount,currency,status,vendor_name,vendor_key")\
+            .eq("owner_user_id", user_id)\
+            .eq("workspace_id", resolved)\
+            .eq("status", "open")
+        rows = query.order("po_date", desc=True).limit(200).execute().data or []
+        if vendor_name:
+            vendor_key = self._normalize_duplicate_text(vendor_name)
+            if vendor_key:
+                matched = [r for r in rows if r.get("vendor_key") == vendor_key]
+                # Prefer vendor matches, but fall back to all open POs so the
+                # reviewer can still pick when the name differs slightly.
+                return matched or rows
+        return rows
+
+    async def match_purchase_order(self, item_id: str, user_id: str, po_id: Optional[str]) -> Dict[str, Any]:
+        item = await self.get_accounts_payable_item(item_id, user_id)
+        if item.get("status") == "published":
+            raise ValueError("Published items cannot be re-matched")
+        if po_id:
+            po = self.client.table("purchase_orders")\
+                .select("id,owner_user_id")\
+                .eq("id", po_id)\
+                .limit(1)\
+                .execute()
+            if not po.data or po.data[0].get("owner_user_id") != user_id:
+                raise ValueError("Purchase order not found")
+        self.client.table("accounts_payable_items")\
+            .update({"matched_po_id": po_id, "updated_at": datetime.utcnow().isoformat()})\
+            .eq("id", item_id)\
+            .eq("owner_user_id", user_id)\
+            .execute()
+        return await self.get_accounts_payable_item(item_id, user_id)
 
     # ── P4 — AP cross-batch duplicate detection ────────────────────────────
 

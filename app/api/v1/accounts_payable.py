@@ -1,4 +1,6 @@
-from typing import Any, Dict, Optional
+import csv
+import io
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
@@ -10,6 +12,8 @@ from app.models.requests import (
     AccountsPayableDuplicateDismissRequest,
     AccountsPayableFromDocumentRequest,
     AccountsPayableUpdateRequest,
+    PurchaseOrderImportRequest,
+    PurchaseOrderMatchRequest,
 )
 from app.services.quickbooks_service import get_quickbooks_service
 from app.services.supabase_service import get_supabase_service
@@ -143,6 +147,47 @@ async def discard_accounts_payable_item(
             user_id=user["user_id"],
             reason=request.reason,
         )
+        return {"item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+# ── P9 — Purchase order matching ─────────────────────────────────────────────
+
+@router.get("/purchase-orders", response_model=Dict[str, Any])
+async def list_purchase_orders(
+    workspace_id: Optional[str] = Query(None),
+    vendor: Optional[str] = Query(None, description="Filter open POs to this vendor name"),
+    user: dict = Depends(get_current_user),
+):
+    pos = await get_supabase_service().list_open_purchase_orders(user["user_id"], workspace_id, vendor)
+    return {"purchase_orders": pos, "total": len(pos)}
+
+
+@router.post("/purchase-orders/import", response_model=Dict[str, Any])
+async def import_purchase_orders(
+    request: PurchaseOrderImportRequest,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        reader = csv.DictReader(io.StringIO(request.csv_text))
+        rows: List[Dict[str, str]] = [dict(row) for row in reader]
+        result = await get_supabase_service().import_purchase_orders_csv(
+            user["user_id"], request.workspace_id, rows,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{item_id}/match-po", response_model=Dict[str, Any])
+async def match_purchase_order(
+    item_id: str,
+    request: PurchaseOrderMatchRequest,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        item = await get_supabase_service().match_purchase_order(item_id, user["user_id"], request.po_id)
         return {"item": item}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
