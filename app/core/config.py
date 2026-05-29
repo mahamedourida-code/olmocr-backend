@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     quickbooks_environment: str = Field("sandbox", env="QUICKBOOKS_ENVIRONMENT")
     quickbooks_minor_version: str = Field("75", env="QUICKBOOKS_MINOR_VERSION")
 
+    # P8 — Xero Accounting Integration
+    # Set via Fly secrets; see manual_setup_requirements.md → "Prompt P8".
+    xero_client_id: str = Field("", env="XERO_CLIENT_ID")
+    xero_client_secret: str = Field("", env="XERO_CLIENT_SECRET")
+    xero_redirect_uri: str = Field("", env="XERO_REDIRECT_URI")
+    xero_token_encryption_key: str = Field("", env="XERO_TOKEN_ENCRYPTION_KEY")
+
     # P6 — Connected Sources (Google Drive / Dropbox watch folders)
     # Set via Fly secrets; see manual_setup_requirements.md → "Prompt P6".
     google_drive_client_id: str = Field("", env="GOOGLE_DRIVE_CLIENT_ID")

@@ -13,9 +13,18 @@ from app.models.requests import (
 )
 from app.services.quickbooks_service import get_quickbooks_service
 from app.services.supabase_service import get_supabase_service
+from app.services.xero_service import get_xero_service
 
 
 router = APIRouter(prefix="/accounts-payable", tags=["Accounts Payable"])
+
+
+async def _publisher_for(item_id: str, user_id: str):
+    """Pick the accounting connector that matches the item's workspace destination."""
+    service = get_supabase_service()
+    item = await service.get_accounts_payable_item(item_id, user_id)
+    destination = await service.get_accounting_destination(user_id, item.get("workspace_id"))
+    return get_xero_service() if destination == "xero" else get_quickbooks_service()
 
 
 @router.get("", response_model=Dict[str, Any])
@@ -144,8 +153,10 @@ async def publish_accounts_payable_item_to_quickbooks(
     item_id: str,
     user: dict = Depends(get_current_user),
 ):
+    """Publish one item to its workspace's accounting destination (QuickBooks or Xero)."""
     try:
-        item = await get_quickbooks_service().publish_accounts_payable_bill(item_id, user["user_id"])
+        publisher = await _publisher_for(item_id, user["user_id"])
+        item = await publisher.publish_accounts_payable_bill(item_id, user["user_id"])
         return {"item": item}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
@@ -156,4 +167,8 @@ async def publish_accounts_payable_batch_to_quickbooks(
     request: AccountsPayableBulkPublishRequest,
     user: dict = Depends(get_current_user),
 ):
-    return await get_quickbooks_service().publish_accounts_payable_bills(request.item_ids, user["user_id"])
+    """Bulk publish to the destination of the batch's workspace (read from the first item)."""
+    if not request.item_ids:
+        return {"items": [], "failures": [], "total": 0}
+    publisher = await _publisher_for(request.item_ids[0], user["user_id"])
+    return await publisher.publish_accounts_payable_bills(request.item_ids, user["user_id"])

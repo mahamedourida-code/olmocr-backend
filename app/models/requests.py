@@ -272,6 +272,16 @@ class QuickBooksWorkspaceRequest(BaseModel):
     workspace_id: Optional[str] = Field(None, description="Owned workspace; defaults to the active workspace")
 
 
+AccountingDestination = Literal["quickbooks", "xero"]
+
+
+class AccountingDestinationRequest(BaseModel):
+    """Set the per-workspace accounting destination for the AP coding form."""
+
+    workspace_id: Optional[str] = Field(None, description="Owned workspace; defaults to the active workspace")
+    destination: AccountingDestination
+
+
 class WorkspaceCreateRequest(BaseModel):
     """Create one owned workspace."""
 

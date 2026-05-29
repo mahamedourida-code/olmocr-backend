@@ -970,6 +970,33 @@ class SupabaseService:
             return "invoice" if payload.get("invoice_number") else "receipt"
         return str(mode)
 
+    async def get_accounting_destination(self, user_id: str, workspace_id: Optional[str] = None) -> str:
+        """P8 — read the per-workspace accounting destination (quickbooks/xero)."""
+        resolved = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved:
+            return "quickbooks"
+        response = self.client.table("workspaces")\
+            .select("accounting_destination")\
+            .eq("id", resolved)\
+            .limit(1)\
+            .execute()
+        if response.data and response.data[0].get("accounting_destination"):
+            return str(response.data[0]["accounting_destination"])
+        return "quickbooks"
+
+    async def set_accounting_destination(self, user_id: str, workspace_id: Optional[str], destination: str) -> str:
+        if destination not in {"quickbooks", "xero"}:
+            raise ValueError("destination must be quickbooks or xero")
+        resolved = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved:
+            raise ValueError("Select a workspace before choosing an accounting destination")
+        self.client.table("workspaces")\
+            .update({"accounting_destination": destination, "updated_at": datetime.utcnow().isoformat()})\
+            .eq("id", resolved)\
+            .eq("owner_user_id", user_id)\
+            .execute()
+        return destination
+
     async def resolve_owned_workspace_id(self, user_id: Optional[str], workspace_id: Optional[str] = None) -> Optional[str]:
         """Resolve an authenticated user's requested or active workspace."""
         if not user_id:
