@@ -98,12 +98,12 @@ primary_region = 'arn'
 
 [[vm]]
   processes = ['app']
-  memory = '256mb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
 
 [[vm]]
   processes = ['worker']
-  memory = '256mb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
