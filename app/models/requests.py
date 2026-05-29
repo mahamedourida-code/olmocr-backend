@@ -222,6 +222,36 @@ class AccountsPayableDiscardRequest(BaseModel):
     reason: Optional[str] = Field(None, max_length=240, description="Short note explaining why the item was discarded")
 
 
+ConnectedSourceProvider = Literal["google_drive", "dropbox"]
+
+
+class ConnectedSourceConnectRequest(BaseModel):
+    """Start an OAuth handshake for a Google Drive or Dropbox watch folder."""
+
+    workspace_id: str = Field(..., min_length=1)
+    provider: ConnectedSourceProvider
+    redirect_after: Optional[str] = Field(
+        None,
+        max_length=400,
+        description="Frontend URL to redirect to after the OAuth callback completes",
+    )
+
+
+class ConnectedSourceCallbackRequest(BaseModel):
+    """Exchange an OAuth authorisation code for tokens and record the source."""
+
+    code: str = Field(..., min_length=1)
+    state: str = Field(..., min_length=1)
+
+
+class ConnectedSourceFolderUpdate(BaseModel):
+    """Set or change the watched folder for a connected source."""
+
+    watched_folder: Optional[str] = Field(None, max_length=400)
+    watched_folder_id: Optional[str] = Field(None, max_length=200)
+    display_label: Optional[str] = Field(None, max_length=160)
+
+
 class AccountsPayableBulkStatusRequest(BaseModel):
     """Record published status for selected prepared draft bills."""
 

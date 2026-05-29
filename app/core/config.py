@@ -116,6 +116,18 @@ class Settings(BaseSettings):
     quickbooks_environment: str = Field("sandbox", env="QUICKBOOKS_ENVIRONMENT")
     quickbooks_minor_version: str = Field("75", env="QUICKBOOKS_MINOR_VERSION")
 
+    # P6 — Connected Sources (Google Drive / Dropbox watch folders)
+    # Set via Fly secrets; see manual_setup_requirements.md → "Prompt P6".
+    google_drive_client_id: str = Field("", env="GOOGLE_DRIVE_CLIENT_ID")
+    google_drive_client_secret: str = Field("", env="GOOGLE_DRIVE_CLIENT_SECRET")
+    google_drive_redirect_uri: str = Field("", env="GOOGLE_DRIVE_REDIRECT_URI")
+    dropbox_app_key: str = Field("", env="DROPBOX_APP_KEY")
+    dropbox_app_secret: str = Field("", env="DROPBOX_APP_SECRET")
+    dropbox_redirect_uri: str = Field("", env="DROPBOX_REDIRECT_URI")
+    connected_sources_token_encryption_key: str = Field(
+        "", env="CONNECTED_SOURCES_TOKEN_ENCRYPTION_KEY",
+    )
+
     # Resend Inbound Email Intake Configuration
     resend_api_key: str = Field("", env="RESEND_API_KEY")
     resend_webhook_secret: str = Field("", env="RESEND_WEBHOOK_SECRET")
