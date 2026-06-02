@@ -85,6 +85,7 @@ class BatchConvertRequest(BaseModel):
         description="Document processing mode. invoice_receipt remains supported as a legacy combined mode."
     )
     workspace_id: Optional[str] = Field(None, description="Authenticated user's active workspace for durable document memory")
+    company_id: Optional[str] = Field(None, description="Company within the selected workspace")
     batch_options: Optional[BatchOptions] = Field(
         default_factory=BatchOptions, 
         description="Batch processing options"

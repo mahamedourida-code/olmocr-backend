@@ -2406,12 +2406,12 @@ class SupabaseService:
             raise ValueError("Document not found")
         payload = self._duplicate_review_payload(document)
         if self._duplicate_document_mode(document, payload) != "invoice":
-            raise ValueError("Only invoices can enter Accounts Payable")
+            raise ValueError("Only invoices can be added to Bills")
         if document.get("review_status") not in {"ready", "published"}:
-            raise ValueError("Confirm this invoice as Ready before adding it to Accounts Payable")
+            raise ValueError("Confirm this invoice as Ready before adding it to Bills")
         workspace_id = document.get("workspace_id") or await self.resolve_owned_workspace_id(user_id)
         if not workspace_id:
-            raise ValueError("Select a workspace before adding an Accounts Payable item")
+            raise ValueError("Select a workspace before adding a Bill")
         existing = self.client.table("accounts_payable_items")\
             .select("*")\
             .eq("owner_user_id", user_id)\
@@ -2486,7 +2486,7 @@ class SupabaseService:
         }
         response = self.client.table("accounts_payable_items").insert(item).execute()
         if not response.data:
-            raise Exception("Supabase returned no Accounts Payable item")
+            raise Exception("Supabase returned no Bill")
         created = response.data[0]
         # P4 — compute cross-batch duplicate warnings against the same workspace
         created = await self._refresh_ap_duplicate_warnings(created, user_id)
@@ -2535,7 +2535,7 @@ class SupabaseService:
             .limit(1)\
             .execute()
         if not response.data:
-            raise ValueError("Accounts Payable item not found")
+            raise ValueError("Bill not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
 
     async def update_accounts_payable_item(
@@ -2569,7 +2569,7 @@ class SupabaseService:
                 raise ValueError("Publish this item through QuickBooks from the Ready to publish state")
             allowed_statuses = self.AP_ALLOWED_STATUS_TRANSITIONS.get(current_status, set())
             if next_status not in allowed_statuses:
-                raise ValueError(f"Accounts Payable status cannot move from {current_status} to {next_status}")
+                raise ValueError(f"Bill status cannot move from {current_status} to {next_status}")
             if next_status == "ready_to_publish":
                 missing = [
                     label
@@ -2603,7 +2603,7 @@ class SupabaseService:
             .eq("owner_user_id", user_id)\
             .execute()
         if not response.data:
-            raise ValueError("Accounts Payable item not found")
+            raise ValueError("Bill not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
 
     async def bulk_publish_accounts_payable_items(
@@ -2644,7 +2644,7 @@ class SupabaseService:
             .eq("owner_user_id", user_id)\
             .execute()
         if not response.data:
-            raise ValueError("Accounts Payable item not found")
+            raise ValueError("Bill not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
 
     async def mark_receipt_quickbooks_published(

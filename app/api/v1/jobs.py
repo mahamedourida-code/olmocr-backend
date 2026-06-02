@@ -493,6 +493,7 @@ async def create_batch_job(
             user["user_id"] if user else None,
             request.workspace_id,
         )
+        company_id = supabase_service.resolve_company_id(workspace_id, request.company_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
@@ -584,6 +585,7 @@ async def create_batch_job(
                 "owner_user_id": user['user_id'] if user else None,
                 "owner_session_id": None if user else session.session_id,
                 "workspace_id": workspace_id,
+                "company_id": company_id,
                 "original_filename": filename,
                 "source_storage_path": source_file["storage_path"],
                 "source_content_type": source_file["content_type"],
@@ -609,6 +611,7 @@ async def create_batch_job(
             'progress': 0,
             'output_format': normalized_output_format,
             'document_mode': normalized_document_mode,
+            'company_id': company_id,
             'consolidation_strategy': request.consolidation_strategy,
             'images': stored_images,
             'results': [],
@@ -635,6 +638,7 @@ async def create_batch_job(
                 'owner_user_id': user['user_id'] if user else None,
                 'owner_session_id': None if user else session.session_id,
                 'workspace_id': workspace_id,
+                'company_id': company_id,
                 'plan': limits["plan"],
                 'max_files_per_batch': limits["max_files_per_batch"],
                 'credits_reserved': len(request.images) if user else 0,
@@ -686,6 +690,7 @@ async def create_batch_job(
                     'owner_user_id': user['user_id'] if user else None,
                     'owner_session_id': None if user else session.session_id,
                     'workspace_id': workspace_id,
+                    'company_id': company_id,
                     'celery_task_id': async_result.id,
                     'plan': limits["plan"],
                     'max_files_per_batch': limits["max_files_per_batch"],
@@ -735,6 +740,7 @@ async def create_batch_job_multipart(
     consolidation_strategy: str = Form("consolidated"),
     document_mode: str = Form("table"),
     workspace_id: Optional[str] = Form(None),
+    company_id: Optional[str] = Form(None),
     session: SessionMetadata = Depends(get_or_create_session),
     redis_service: RedisService = Depends(get_redis_service),
     user: Optional[dict] = Depends(get_optional_user),
@@ -778,6 +784,7 @@ async def create_batch_job_multipart(
             user["user_id"] if user else None,
             workspace_id,
         )
+        company_id = supabase_service.resolve_company_id(workspace_id, company_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
@@ -999,6 +1006,7 @@ async def create_batch_job_multipart(
                 "owner_user_id": user['user_id'] if user else None,
                 "owner_session_id": None if user else session.session_id,
                 "workspace_id": workspace_id,
+                "company_id": company_id,
                 "original_filename": source_file_info["filename"],
                 "source_storage_path": source_storage_path,
                 "source_content_type": source_file_info["content_type"],
@@ -1027,6 +1035,7 @@ async def create_batch_job_multipart(
             'progress': 0,
             'output_format': normalized_output_format,
             'document_mode': normalized_document_mode,
+            'company_id': company_id,
             'consolidation_strategy': consolidation_strategy,
             'images': stored_images,
             'results': [],
@@ -1054,6 +1063,7 @@ async def create_batch_job_multipart(
                 'owner_user_id': user['user_id'] if user else None,
                 'owner_session_id': None if user else session.session_id,
                 'workspace_id': workspace_id,
+                'company_id': company_id,
                 'plan': limits["plan"],
                 'max_files_per_batch': limits["max_files_per_batch"],
                 'credits_reserved': credits_reserved_count,
@@ -1098,6 +1108,7 @@ async def create_batch_job_multipart(
                     'owner_user_id': user['user_id'] if user else None,
                     'owner_session_id': None if user else session.session_id,
                     'workspace_id': workspace_id,
+                    'company_id': company_id,
                     'celery_task_id': async_result.id,
                     'plan': limits["plan"],
                     'max_files_per_batch': limits["max_files_per_batch"],
