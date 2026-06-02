@@ -34,6 +34,7 @@ async def _publisher_for(item_id: str, user_id: str):
 @router.get("", response_model=Dict[str, Any])
 async def list_accounts_payable_items(
     workspace_id: Optional[str] = Query(None),
+    company_id: Optional[str] = Query(None),
     item_status: Optional[str] = Query(None, alias="status"),
     duplicates_only: bool = Query(False, description="Return only items with an active duplicate warning"),
     user: dict = Depends(get_current_user),
@@ -43,6 +44,7 @@ async def list_accounts_payable_items(
         items = await service.list_accounts_payable_items(
             user_id=user["user_id"],
             workspace_id=workspace_id,
+            company_id=company_id,
             ap_status=item_status,
             duplicates_only=duplicates_only,
         )

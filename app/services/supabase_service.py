@@ -781,17 +781,39 @@ class SupabaseService:
                 files.append(file_metadata)
         return files
 
+    def resolve_company_id(
+        self,
+        workspace_id: Optional[str],
+        company_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve an explicit company or the workspace's durable General fallback."""
+        if not workspace_id:
+            return None
+        query = self.client.table("companies")\
+            .select("id")\
+            .eq("workspace_id", workspace_id)
+        if company_id:
+            query = query.eq("id", company_id)
+        else:
+            query = query.eq("is_default", True)
+        response = query.limit(1).execute()
+        if company_id and not response.data:
+            raise ValueError("Company not found in the selected workspace")
+        return str(response.data[0]["id"]) if response.data else None
+
     async def create_job_document(self, document: Dict[str, Any]) -> Dict[str, Any]:
         """Store one durable logical source document for a processing job."""
         owner_user_id = document.get("owner_user_id") or None
         owner_session_id = document.get("owner_session_id") or None
         if bool(owner_user_id) == bool(owner_session_id):
             raise ValueError("document metadata must include exactly one user or session owner")
+        workspace_id = document.get("workspace_id")
 
         data = {
             "id": document["id"],
             "job_id": document["job_id"],
-            "workspace_id": document.get("workspace_id"),
+            "workspace_id": workspace_id,
+            "company_id": self.resolve_company_id(workspace_id, document.get("company_id")),
             "owner_user_id": owner_user_id,
             "owner_session_id": owner_session_id,
             "original_filename": document["original_filename"],
@@ -1171,6 +1193,151 @@ class SupabaseService:
         await self._ensure_owner_membership(str(workspace["id"]), user_id, email)
         await self.select_accessible_workspace(user_id, email, str(workspace["id"]))
         return {**workspace, "role": "owner"}
+
+    @staticmethod
+    def _clean_company_name(name: Any) -> str:
+        cleaned_name = str(name or "").strip()[:120]
+        if not cleaned_name:
+            raise ValueError("Company name is required")
+        return cleaned_name
+
+    async def _summarize_companies(
+        self,
+        workspace_id: str,
+        companies: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Attach the small document and AP rollups needed by the companies table."""
+        if not companies:
+            return []
+        company_ids = [str(company["id"]) for company in companies]
+        documents = self.client.table("job_documents")\
+            .select("company_id,resolved_mode,selected_mode,review_status,created_at")\
+            .eq("workspace_id", workspace_id)\
+            .in_("company_id", company_ids)\
+            .execute()
+        bills = self.client.table("accounts_payable_items")\
+            .select("company_id,status")\
+            .eq("workspace_id", workspace_id)\
+            .in_("company_id", company_ids)\
+            .execute()
+        quickbooks = self.client.table("quickbooks_connections")\
+            .select("status,company_name")\
+            .eq("workspace_id", workspace_id)\
+            .limit(1)\
+            .execute()
+        quickbooks_connection = quickbooks.data[0] if quickbooks.data else {}
+        summaries: Dict[str, Dict[str, Any]] = {}
+        for company in companies:
+            company_id = str(company["id"])
+            summaries[company_id] = {
+                **company,
+                "document_counts": {
+                    "purchases": 0,
+                    "receipts": 0,
+                    "bank_statements": 0,
+                    "other": 0,
+                    "needs_review": 0,
+                },
+                "bills": 0,
+                "last_upload_at": None,
+                "quickbooks_connected": False,
+                "quickbooks_company_name": None,
+            }
+        for document in documents.data or []:
+            summary = summaries.get(str(document.get("company_id") or ""))
+            if not summary:
+                continue
+            counts = summary["document_counts"]
+            mode = document.get("resolved_mode") or document.get("selected_mode")
+            if mode in {"invoice", "invoice_receipt"}:
+                counts["purchases"] += 1
+            elif mode == "receipt":
+                counts["receipts"] += 1
+            elif mode == "bank_statement":
+                counts["bank_statements"] += 1
+            else:
+                counts["other"] += 1
+            if document.get("review_status") == "needs_review":
+                counts["needs_review"] += 1
+            created_at = document.get("created_at")
+            if created_at and (
+                not summary["last_upload_at"]
+                or str(created_at) > str(summary["last_upload_at"])
+            ):
+                summary["last_upload_at"] = created_at
+        for bill in bills.data or []:
+            summary = summaries.get(str(bill.get("company_id") or ""))
+            if summary and bill.get("status") != "discarded":
+                summary["bills"] += 1
+        for summary in summaries.values():
+            if summary.get("is_default") and quickbooks_connection:
+                summary["quickbooks_connected"] = quickbooks_connection.get("status") == "connected"
+                summary["quickbooks_company_name"] = quickbooks_connection.get("company_name")
+        return list(summaries.values())
+
+    async def list_companies(self, user_id: str, workspace_id: str) -> List[Dict[str, Any]]:
+        resolved_workspace_id = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved_workspace_id:
+            return []
+        response = self.client.table("companies")\
+            .select("*")\
+            .eq("workspace_id", resolved_workspace_id)\
+            .order("name")\
+            .execute()
+        return await self._summarize_companies(resolved_workspace_id, response.data or [])
+
+    async def create_company(self, user_id: str, workspace_id: str, name: str) -> Dict[str, Any]:
+        resolved_workspace_id = await self.resolve_owned_workspace_id(user_id, workspace_id)
+        if not resolved_workspace_id:
+            raise ValueError("Select a workspace before adding a company")
+        cleaned_name = self._clean_company_name(name)
+        existing = await self.list_companies(user_id, resolved_workspace_id)
+        if any(str(company.get("name") or "").casefold() == cleaned_name.casefold() for company in existing):
+            raise ValueError("A company with this name already exists")
+        response = self.client.table("companies").insert({
+            "workspace_id": resolved_workspace_id,
+            "name": cleaned_name,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).execute()
+        if not response.data:
+            raise ValueError("Company could not be created")
+        return (await self._summarize_companies(resolved_workspace_id, [response.data[0]]))[0]
+
+    async def get_company(self, company_id: str, user_id: str) -> Dict[str, Any]:
+        response = self.client.table("companies")\
+            .select("*")\
+            .eq("id", company_id)\
+            .limit(1)\
+            .execute()
+        if not response.data:
+            raise ValueError("Company not found")
+        company = response.data[0]
+        workspace_id = await self.resolve_owned_workspace_id(user_id, str(company["workspace_id"]))
+        if not workspace_id:
+            raise ValueError("Company not found")
+        return (await self._summarize_companies(workspace_id, [company]))[0]
+
+    async def update_company(self, company_id: str, user_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        current = await self.get_company(company_id, user_id)
+        update: Dict[str, Any] = {"updated_at": datetime.utcnow().isoformat()}
+        if updates.get("name") is not None:
+            cleaned_name = self._clean_company_name(updates["name"])
+            existing = await self.list_companies(user_id, str(current["workspace_id"]))
+            if any(
+                str(company.get("id")) != company_id
+                and str(company.get("name") or "").casefold() == cleaned_name.casefold()
+                for company in existing
+            ):
+                raise ValueError("A company with this name already exists")
+            update["name"] = cleaned_name
+        response = self.client.table("companies")\
+            .update(update)\
+            .eq("id", company_id)\
+            .eq("workspace_id", current["workspace_id"])\
+            .execute()
+        if not response.data:
+            raise ValueError("Company not found")
+        return (await self._summarize_companies(str(current["workspace_id"]), [response.data[0]]))[0]
 
     async def select_accessible_workspace(self, user_id: str, email: Optional[str], workspace_id: str) -> Dict[str, Any]:
         role = await self.require_workspace_role(user_id, email, workspace_id)
@@ -1850,6 +2017,7 @@ class SupabaseService:
         allowed_text = {
             "vendor",
             "vendor_ref_id",
+            "invoice_number",
             "invoice_date",
             "due_date",
             "account_category",
@@ -1869,6 +2037,15 @@ class SupabaseService:
                 item for item in fields["line_items"] if isinstance(item, dict)
             ]
         return cleaned
+
+    AP_ALLOWED_STATUS_TRANSITIONS = {
+        "needs_coding": {"needs_review", "ready_to_publish", "failed"},
+        "needs_review": {"needs_coding", "ready_to_publish", "failed"},
+        "ready_to_publish": {"needs_coding", "needs_review", "failed"},
+        "failed": {"needs_coding", "needs_review", "ready_to_publish"},
+        "published": set(),
+        "discarded": set(),
+    }
 
     def _accounts_payable_draft_from_document(self, document: Dict[str, Any]) -> Dict[str, Any]:
         payload = self._duplicate_review_payload(document)
@@ -2071,13 +2248,17 @@ class SupabaseService:
         if not workspace_id:
             return []
         cutoff = (datetime.utcnow() - timedelta(days=self.AP_DUPLICATE_WINDOW_DAYS)).isoformat()
-        response = self.client.table("accounts_payable_items")\
+        query = self.client.table("accounts_payable_items")\
             .select("id,workspace_id,document_id,job_id,status,draft_data,source_filename,created_at,metadata")\
             .eq("owner_user_id", user_id)\
             .eq("workspace_id", workspace_id)\
             .gte("created_at", cutoff)\
-            .neq("id", item["id"])\
-            .execute()
+            .neq("id", item["id"])
+        if item.get("company_id"):
+            query = query.eq("company_id", item["company_id"])
+        else:
+            query = query.is_("company_id", "null")
+        response = query.execute()
         return [row for row in (response.data or []) if row.get("status") != "discarded"]
 
     async def _refresh_ap_duplicate_warnings(
@@ -2281,6 +2462,7 @@ class SupabaseService:
         item = {
             "owner_user_id": user_id,
             "workspace_id": workspace_id,
+            "company_id": document.get("company_id") or self.resolve_company_id(workspace_id),
             "document_id": document_id,
             "job_id": job_id,
             "status": initial_status,
@@ -2314,6 +2496,7 @@ class SupabaseService:
         self,
         user_id: str,
         workspace_id: Optional[str] = None,
+        company_id: Optional[str] = None,
         ap_status: Optional[str] = None,
         duplicates_only: bool = False,
     ) -> List[Dict[str, Any]]:
@@ -2324,6 +2507,8 @@ class SupabaseService:
             .select("*")\
             .eq("owner_user_id", user_id)\
             .eq("workspace_id", resolved_workspace_id)
+        if company_id:
+            query = query.eq("company_id", company_id)
         if ap_status:
             query = query.eq("status", ap_status)
         response = query.order("updated_at", desc=True).execute()
@@ -2378,9 +2563,13 @@ class SupabaseService:
             if existing_metadata.pop("auto_applied_rule", None) is not None:
                 update["metadata"] = existing_metadata
         next_status = updates.get("status")
-        if next_status:
-            if current.get("status") == "published" and next_status != "published":
-                raise ValueError("Published items cannot be returned to preparation")
+        current_status = str(current.get("status") or "")
+        if next_status and next_status != current_status:
+            if next_status == "published":
+                raise ValueError("Publish this item through QuickBooks from the Ready to publish state")
+            allowed_statuses = self.AP_ALLOWED_STATUS_TRANSITIONS.get(current_status, set())
+            if next_status not in allowed_statuses:
+                raise ValueError(f"Accounts Payable status cannot move from {current_status} to {next_status}")
             if next_status == "ready_to_publish":
                 missing = [
                     label
@@ -2397,10 +2586,8 @@ class SupabaseService:
                     raise ValueError(f"Complete {', '.join(missing)} before marking Ready to publish")
                 if not draft_data.get("total") and not draft_data.get("line_items"):
                     raise ValueError("A bill candidate needs a total or line items before publishing")
-            if next_status == "published":
-                raise ValueError("Publish this item through QuickBooks from the Ready to publish state")
             update["status"] = next_status
-            metadata = dict(current.get("metadata") or {})
+            metadata = dict(update.get("metadata") or current.get("metadata") or {})
             history = list(metadata.get("status_history") or [])
             history.append({
                 "from_status": current.get("status"),
@@ -2564,6 +2751,10 @@ class SupabaseService:
             query = query.eq("owner_session_id", document["owner_session_id"])
         else:
             return []
+        if document.get("company_id"):
+            query = query.eq("company_id", document["company_id"])
+        elif document.get("workspace_id"):
+            query = query.eq("workspace_id", document["workspace_id"])
         response = query.order("created_at").limit(500).execute()
         peers = [
             row for row in (response.data or [])

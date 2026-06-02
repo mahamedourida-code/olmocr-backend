@@ -185,6 +185,7 @@ class AccountsPayableDraftFields(BaseModel):
 
     vendor: Optional[str] = Field(None, max_length=200)
     vendor_ref_id: Optional[str] = Field(None, max_length=120)
+    invoice_number: Optional[str] = Field(None, max_length=160)
     invoice_date: Optional[str] = Field(None, max_length=40)
     due_date: Optional[str] = Field(None, max_length=40)
     account_category: Optional[str] = Field(None, max_length=160)
@@ -299,6 +300,19 @@ class WorkspaceCreateRequest(BaseModel):
     """Create one owned workspace."""
 
     name: str = Field(..., min_length=2, max_length=60)
+
+
+class CompanyCreateRequest(BaseModel):
+    """Create one company inside an owned workspace."""
+
+    workspace_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1, max_length=120)
+
+
+class CompanyUpdateRequest(BaseModel):
+    """Update editable company metadata."""
+
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
 
 
 class WorkspaceReviewerRequest(BaseModel):
