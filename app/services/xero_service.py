@@ -15,7 +15,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
@@ -296,6 +296,30 @@ class XeroService:
             raise XeroPublishError(detail)
         return response.json()
 
+    async def _api_upload_attachment(
+        self,
+        connection: Dict[str, Any],
+        path: str,
+        content: bytes,
+        content_type: Optional[str],
+    ) -> None:
+        token = await self._access_token(connection)
+        url = f"{self.API_BASE}/{path}"
+        headers = {
+            **self._headers(token, connection),
+            "Content-Type": str(content_type or "application/octet-stream"),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                response = await client.post(url, headers=headers, content=content)
+                if response.status_code == 401:
+                    headers["Authorization"] = f"Bearer {await self._refresh_access_token(connection)}"
+                    response = await client.post(url, headers=headers, content=content)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise ValueError("Xero did not confirm the source-document attachment") from exc
+        if response.status_code >= 400:
+            raise ValueError("Xero could not attach the source document to this bill")
+
     # ── reference sync ───────────────────────────────────────────────────────
 
     @staticmethod
@@ -486,6 +510,24 @@ class XeroService:
             payload["CurrencyCode"] = str(draft["currency"]).upper()
         return payload
 
+    async def _attach_source_to_bill(
+        self,
+        connection: Dict[str, Any],
+        item: Dict[str, Any],
+        invoice_id: str,
+    ) -> None:
+        source_storage_path = str(item.get("source_storage_path") or "").strip()
+        if not source_storage_path:
+            raise ValueError("The source document is no longer available for attachment")
+        content = await self.supabase.download_file_from_storage(source_storage_path)
+        filename = quote(str(item.get("source_filename") or "source-document"), safe="")
+        await self._api_upload_attachment(
+            connection,
+            f"Invoices/{invoice_id}/Attachments/{filename}",
+            content,
+            item.get("source_content_type"),
+        )
+
     async def publish_accounts_payable_bill(self, item_id: str, user_id: str) -> Dict[str, Any]:
         """Publish one Ready AP invoice as one DRAFT ACCPAY invoice in Xero."""
         item = await self.supabase.get_accounts_payable_item(item_id, user_id)
@@ -504,7 +546,20 @@ class XeroService:
             .execute()
         publication = existing.data[0] if existing.data else None
         if publication and publication.get("xero_invoice_id"):
-            item = await self.supabase.mark_accounts_payable_quickbooks_published(item_id, user_id, str(publication["id"]))
+            if item.get("attachment_visible") and publication.get("attachment_status") != "attached":
+                try:
+                    await self._attach_source_to_bill(connection, item, str(publication["xero_invoice_id"]))
+                    publication = self._update_publication(publication["id"], {"attachment_status": "attached"})
+                except Exception as exc:
+                    publication = self._update_publication(publication["id"], {
+                        "attachment_status": "failed",
+                        "failure_details": list(publication.get("failure_details") or []) + [{
+                            "stage": "attachment",
+                            "message": str(exc)[:240],
+                            "at": self._now().isoformat(),
+                        }],
+                    })
+            item = await self.supabase.mark_accounts_payable_published(item_id, user_id, str(publication["id"]), provider="xero")
             item["xero_publication"] = self._safe_publication(publication)
             return item
         if publication and publication.get("status") in {"publishing", "indeterminate"}:
@@ -518,6 +573,7 @@ class XeroService:
             "workspace_id": item.get("workspace_id"),
             "connection_id": connection["id"],
             "status": "publishing",
+            "attachment_status": "pending" if item.get("attachment_visible") else "not_requested",
             "attempted_at": now,
             "updated_at": now,
         }
@@ -546,7 +602,20 @@ class XeroService:
             "xero_invoice_id": str(invoice_id),
             "published_at": self._now().isoformat(),
         })
-        item = await self.supabase.mark_accounts_payable_quickbooks_published(item_id, user_id, str(publication_id))
+        if item.get("attachment_visible"):
+            try:
+                await self._attach_source_to_bill(connection, item, str(invoice_id))
+                completed = self._update_publication(publication_id, {"attachment_status": "attached"})
+            except Exception as exc:
+                completed = self._update_publication(publication_id, {
+                    "attachment_status": "failed",
+                    "failure_details": list(completed.get("failure_details") or []) + [{
+                        "stage": "attachment",
+                        "message": str(exc)[:240],
+                        "at": self._now().isoformat(),
+                    }],
+                })
+        item = await self.supabase.mark_accounts_payable_published(item_id, user_id, str(publication_id), provider="xero")
         item["xero_publication"] = self._safe_publication(completed)
         return item
 
@@ -567,6 +636,8 @@ class XeroService:
             "status": publication.get("status"),
             "xero_invoice_id": publication.get("xero_invoice_id"),
             "attachment_status": publication.get("attachment_status"),
+            "failure_details": publication.get("failure_details") or [],
+            "attempted_at": publication.get("attempted_at"),
             "published_at": publication.get("published_at"),
             "updated_at": publication.get("updated_at"),
         }

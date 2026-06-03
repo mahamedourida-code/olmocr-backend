@@ -276,7 +276,7 @@ class AccountsPayableBulkStatusRequest(BaseModel):
 
 
 class AccountsPayableBulkPublishRequest(BaseModel):
-    """Publish confirmed AP items as unpaid QuickBooks Bills."""
+    """Publish confirmed AP items as unpaid draft bills."""
 
     item_ids: List[str] = Field(..., min_length=1)
 

@@ -1226,6 +1226,23 @@ class SupabaseService:
             .limit(1)\
             .execute()
         quickbooks_connection = quickbooks.data[0] if quickbooks.data else {}
+        xero = self.client.table("xero_connections")\
+            .select("status,tenant_name")\
+            .eq("workspace_id", workspace_id)\
+            .limit(1)\
+            .execute()
+        xero_connection = xero.data[0] if xero.data else {}
+        workspace = self.client.table("workspaces")\
+            .select("accounting_destination")\
+            .eq("id", workspace_id)\
+            .limit(1)\
+            .execute()
+        accounting_destination = (
+            str(workspace.data[0].get("accounting_destination") or "quickbooks")
+            if workspace.data
+            else "quickbooks"
+        )
+        accounting_connection = xero_connection if accounting_destination == "xero" else quickbooks_connection
         summaries: Dict[str, Dict[str, Any]] = {}
         for company in companies:
             company_id = str(company["id"])
@@ -1242,6 +1259,9 @@ class SupabaseService:
                 "last_upload_at": None,
                 "quickbooks_connected": False,
                 "quickbooks_company_name": None,
+                "accounting_destination": accounting_destination,
+                "accounting_connected": False,
+                "accounting_company_name": None,
             }
         for document in documents.data or []:
             summary = summaries.get(str(document.get("company_id") or ""))
@@ -1270,9 +1290,17 @@ class SupabaseService:
             if summary and bill.get("status") != "discarded":
                 summary["bills"] += 1
         for summary in summaries.values():
-            if summary.get("is_default") and quickbooks_connection:
-                summary["quickbooks_connected"] = quickbooks_connection.get("status") == "connected"
-                summary["quickbooks_company_name"] = quickbooks_connection.get("company_name")
+            if summary.get("is_default"):
+                if quickbooks_connection:
+                    summary["quickbooks_connected"] = quickbooks_connection.get("status") == "connected"
+                    summary["quickbooks_company_name"] = quickbooks_connection.get("company_name")
+                if accounting_connection:
+                    summary["accounting_connected"] = accounting_connection.get("status") == "connected"
+                    summary["accounting_company_name"] = (
+                        accounting_connection.get("tenant_name")
+                        if accounting_destination == "xero"
+                        else accounting_connection.get("company_name")
+                    )
         return list(summaries.values())
 
     async def list_companies(self, user_id: str, workspace_id: str) -> List[Dict[str, Any]]:
@@ -2097,6 +2125,13 @@ class SupabaseService:
             .limit(1)\
             .execute()
         enriched["quickbooks_publication"] = publication.data[0] if publication.data else None
+        xero_publication = self.client.table("xero_bill_publications")\
+            .select("id,status,xero_invoice_id,attachment_status,failure_details,attempted_at,published_at,updated_at")\
+            .eq("accounts_payable_item_id", item["id"])\
+            .eq("owner_user_id", user_id)\
+            .limit(1)\
+            .execute()
+        enriched["xero_publication"] = xero_publication.data[0] if xero_publication.data else None
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         enriched["duplicate_warnings"] = list(metadata.get("ap_duplicate_warnings") or [])
         enriched["matched_po"], enriched["po_match_status"] = self._resolve_matched_po(item)
@@ -2406,12 +2441,12 @@ class SupabaseService:
             raise ValueError("Document not found")
         payload = self._duplicate_review_payload(document)
         if self._duplicate_document_mode(document, payload) != "invoice":
-            raise ValueError("Only invoices can be added to Bills")
+            raise ValueError("Only invoices can become draft bills")
         if document.get("review_status") not in {"ready", "published"}:
-            raise ValueError("Confirm this invoice as Ready before adding it to Bills")
+            raise ValueError("Confirm extraction before sending this invoice to draft bills")
         workspace_id = document.get("workspace_id") or await self.resolve_owned_workspace_id(user_id)
         if not workspace_id:
-            raise ValueError("Select a workspace before adding a Bill")
+            raise ValueError("Select a workspace before creating a draft bill")
         existing = self.client.table("accounts_payable_items")\
             .select("*")\
             .eq("owner_user_id", user_id)\
@@ -2486,7 +2521,7 @@ class SupabaseService:
         }
         response = self.client.table("accounts_payable_items").insert(item).execute()
         if not response.data:
-            raise Exception("Supabase returned no Bill")
+            raise Exception("Supabase returned no draft bill")
         created = response.data[0]
         # P4 — compute cross-batch duplicate warnings against the same workspace
         created = await self._refresh_ap_duplicate_warnings(created, user_id)
@@ -2535,7 +2570,7 @@ class SupabaseService:
             .limit(1)\
             .execute()
         if not response.data:
-            raise ValueError("Bill not found")
+            raise ValueError("Draft bill not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
 
     async def update_accounts_payable_item(
@@ -2566,7 +2601,7 @@ class SupabaseService:
         current_status = str(current.get("status") or "")
         if next_status and next_status != current_status:
             if next_status == "published":
-                raise ValueError("Publish this item through QuickBooks from the Ready to publish state")
+                raise ValueError("Publish this item from the Ready to publish state")
             allowed_statuses = self.AP_ALLOWED_STATUS_TRANSITIONS.get(current_status, set())
             if next_status not in allowed_statuses:
                 raise ValueError(f"Bill status cannot move from {current_status} to {next_status}")
@@ -2577,8 +2612,8 @@ class SupabaseService:
                         ("vendor", "vendor"),
                         ("due date", "due_date"),
                         ("account/category", "account_category"),
-                        ("QuickBooks vendor", "vendor_ref_id"),
-                        ("QuickBooks account", "account_ref_id"),
+                        ("supplier", "vendor_ref_id"),
+                        ("account", "account_ref_id"),
                     )
                     if not str(draft_data.get(key) or "").strip()
                 ]
@@ -2603,7 +2638,7 @@ class SupabaseService:
             .eq("owner_user_id", user_id)\
             .execute()
         if not response.data:
-            raise ValueError("Bill not found")
+            raise ValueError("Draft bill not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
 
     async def bulk_publish_accounts_payable_items(
@@ -2612,23 +2647,26 @@ class SupabaseService:
         user_id: str,
         reason: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        raise ValueError("Publish ready items through the QuickBooks publishing endpoint")
+        raise ValueError("Publish ready items through the accounting publishing endpoint")
 
-    async def mark_accounts_payable_quickbooks_published(
+    async def mark_accounts_payable_published(
         self,
         item_id: str,
         user_id: str,
         publication_id: str,
+        provider: str = "quickbooks",
     ) -> Dict[str, Any]:
         current = await self.get_accounts_payable_item(item_id, user_id)
         changed_at = datetime.utcnow().isoformat()
         metadata = dict(current.get("metadata") or {})
         history = list(metadata.get("status_history") or [])
+        provider_key = "xero_publication_id" if provider == "xero" else "quickbooks_publication_id"
+        provider_name = "Xero" if provider == "xero" else "QuickBooks Online"
         if current.get("status") != "published":
             history.append({
                 "from_status": current.get("status"),
                 "to_status": "published",
-                "reason": "Created as an unpaid Bill in QuickBooks Online",
+                "reason": f"Created as an unpaid draft bill in {provider_name}",
                 "actor": {"user_id": user_id},
                 "changed_at": changed_at,
                 "publication_id": publication_id,
@@ -2638,14 +2676,27 @@ class SupabaseService:
                 "status": "published",
                 "published_at": changed_at,
                 "updated_at": changed_at,
-                "metadata": {**metadata, "status_history": history, "quickbooks_publication_id": publication_id},
+                "metadata": {**metadata, "status_history": history, provider_key: publication_id},
             })\
             .eq("id", item_id)\
             .eq("owner_user_id", user_id)\
             .execute()
         if not response.data:
-            raise ValueError("Bill not found")
+            raise ValueError("Draft bill not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
+
+    async def mark_accounts_payable_quickbooks_published(
+        self,
+        item_id: str,
+        user_id: str,
+        publication_id: str,
+    ) -> Dict[str, Any]:
+        return await self.mark_accounts_payable_published(
+            item_id,
+            user_id,
+            publication_id,
+            provider="quickbooks",
+        )
 
     async def mark_receipt_quickbooks_published(
         self,

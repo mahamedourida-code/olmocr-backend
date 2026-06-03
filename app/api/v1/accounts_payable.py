@@ -195,8 +195,9 @@ async def match_purchase_order(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
-@router.post("/{item_id}/publish/quickbooks", response_model=Dict[str, Any])
-async def publish_accounts_payable_item_to_quickbooks(
+@router.post("/{item_id}/publish", response_model=Dict[str, Any])
+@router.post("/{item_id}/publish/quickbooks", response_model=Dict[str, Any], include_in_schema=False)
+async def publish_accounts_payable_item(
     item_id: str,
     user: dict = Depends(get_current_user),
 ):
@@ -209,8 +210,9 @@ async def publish_accounts_payable_item_to_quickbooks(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
-@router.post("/publish/quickbooks", response_model=Dict[str, Any])
-async def publish_accounts_payable_batch_to_quickbooks(
+@router.post("/publish", response_model=Dict[str, Any])
+@router.post("/publish/quickbooks", response_model=Dict[str, Any], include_in_schema=False)
+async def publish_accounts_payable_batch(
     request: AccountsPayableBulkPublishRequest,
     user: dict = Depends(get_current_user),
 ):
