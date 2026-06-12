@@ -12,7 +12,7 @@ import hashlib
 import json
 import io
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from app.models.requests import (
@@ -1168,6 +1168,117 @@ async def create_batch_job_multipart(
         )
 
 
+def _parse_iso_timestamp(value: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp (string or datetime) into a tz-aware datetime."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+async def _reap_stale_active_job(
+    job_id: str,
+    job_data: Dict[str, Any],
+    supabase_service,
+) -> Dict[str, Any]:
+    """
+    Self-healing watchdog for orphaned jobs.
+
+    When a Celery worker dies mid-batch the job is left in an active
+    ("queued"/"processing") state forever: the UI shows it processing
+    indefinitely, the reserved credits are never returned, and its documents
+    can't be deleted (the delete guard treats the conversion as still active).
+
+    If an active job hasn't been touched for longer than the configured batch
+    processing timeout, it is treated as timed out — the Celery task is revoked,
+    the job and its documents are marked ``failed``, and any reserved (but
+    unsettled) credits are refunded. This mirrors an explicit user cancel.
+
+    Returns ``job_data``, mutated to the failed state when a reap happens.
+    """
+    status_value = str(job_data.get("status") or "").lower()
+    if status_value not in ACTIVE_JOB_STATUSES:
+        return job_data
+
+    last_active = _parse_iso_timestamp(job_data.get("updated_at") or job_data.get("created_at"))
+    if last_active is None:
+        return job_data
+    age_seconds = (datetime.now(timezone.utc) - last_active).total_seconds()
+    if age_seconds < settings.batch_processing_timeout:
+        return job_data
+
+    # Re-read authoritative state; bail if another request already reaped it.
+    supabase_job = await supabase_service.get_job(job_id)
+    if not supabase_job or str(supabase_job.get("status") or "").lower() not in ACTIVE_JOB_STATUSES:
+        if supabase_job:
+            job_data["status"] = supabase_job.get("status", job_data.get("status"))
+        return job_data
+
+    metadata = _parse_metadata(supabase_job.get("processing_metadata"))
+
+    celery_task_id = metadata.get("celery_task_id")
+    if celery_task_id:
+        try:
+            from app.tasks.celery_app import celery_app
+            celery_app.control.revoke(celery_task_id, terminate=True)
+        except Exception as exc:
+            logger.debug(f"Stale reap: could not revoke task for {job_id}: {exc}")
+
+    credit_metadata: Dict[str, Any] = {}
+    if not metadata.get("credits_settled"):
+        reserved_credits = int(metadata.get("credits_reserved") or job_data.get("total_images") or 0)
+        completed_files = await supabase_service.get_job_files_for_job(job_id)
+        charged_credits = min(len(completed_files), reserved_credits)
+        refunded_credits = max(0, reserved_credits - charged_credits)
+        stored_user_id = str(supabase_job.get("user_id") or "")
+        owner_user_id = metadata.get("owner_user_id") or (
+            stored_user_id if not stored_user_id.startswith("session:") else ""
+        )
+        if refunded_credits and owner_user_id and not str(owner_user_id).startswith("session:"):
+            supabase_service.refund_credits(owner_user_id, refunded_credits)
+        credit_metadata = {
+            "credits_reserved": reserved_credits,
+            "credits_charged": charged_credits,
+            "credits_refunded": refunded_credits,
+            "credits_settled": True,
+        }
+
+    timeout_message = (
+        "Processing timed out — this batch did not finish in time. "
+        "Any reserved credits were refunded; please upload it again."
+    )
+    metadata["timed_out_at"] = datetime.utcnow().isoformat()
+    try:
+        await supabase_service.update_job_status(
+            job_id=job_id,
+            status="failed",
+            error_message=timeout_message,
+            metadata={**metadata, **credit_metadata},
+        )
+    except Exception as exc:
+        logger.error(f"Stale reap: failed to mark job {job_id} failed: {exc}")
+        return job_data
+
+    try:
+        await supabase_service.update_job_documents_status(job_id, "failed")
+    except Exception as exc:
+        logger.debug(f"Stale reap: could not fail documents for {job_id}: {exc}")
+
+    logger.warning(
+        f"Reaped stale job {job_id}: inactive {int(age_seconds)}s "
+        f"(> {settings.batch_processing_timeout}s); marked failed and refunded credits."
+    )
+    job_data["status"] = "failed"
+    job_data["error"] = timeout_message
+    job_data["progress"] = 100
+    return job_data
+
+
 @router.get("/{job_id}/status", response_model=JobStatusResponse)
 async def get_job_status(
     job_id: str,
@@ -1269,6 +1380,11 @@ async def get_job_status(
         if not workspace_authorized:
             verify_job_data_access(job_data, user, session.session_id)
     
+    # Self-healing watchdog: an active job that has gone stale (its worker died
+    # mid-batch) is timed out here — marked failed, its documents failed, and any
+    # reserved-but-unsettled credits refunded — so it stops "processing" forever.
+    job_data = await _reap_stale_active_job(job_id, job_data, get_supabase_service())
+
     # Build progress info
     progress = None
     total_images = int(job_data.get('total_images', 0))
