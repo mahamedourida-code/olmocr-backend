@@ -70,6 +70,32 @@ async def create_accounts_payable_item(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
+@router.get("/purchase-orders", response_model=Dict[str, Any])
+async def list_purchase_orders(
+    workspace_id: Optional[str] = Query(None),
+    vendor: Optional[str] = Query(None, description="Filter open POs to this vendor name"),
+    user: dict = Depends(get_current_user),
+):
+    pos = await get_supabase_service().list_open_purchase_orders(user["user_id"], workspace_id, vendor)
+    return {"purchase_orders": pos, "total": len(pos)}
+
+
+@router.post("/purchase-orders/import", response_model=Dict[str, Any])
+async def import_purchase_orders(
+    request: PurchaseOrderImportRequest,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        reader = csv.DictReader(io.StringIO(request.csv_text))
+        rows: List[Dict[str, str]] = [dict(row) for row in reader]
+        result = await get_supabase_service().import_purchase_orders_csv(
+            user["user_id"], request.workspace_id, rows,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
 @router.get("/{item_id}", response_model=Dict[str, Any])
 async def get_accounts_payable_item(
     item_id: str,
@@ -155,32 +181,6 @@ async def discard_accounts_payable_item(
 
 
 # ── P9 — Purchase order matching ─────────────────────────────────────────────
-
-@router.get("/purchase-orders", response_model=Dict[str, Any])
-async def list_purchase_orders(
-    workspace_id: Optional[str] = Query(None),
-    vendor: Optional[str] = Query(None, description="Filter open POs to this vendor name"),
-    user: dict = Depends(get_current_user),
-):
-    pos = await get_supabase_service().list_open_purchase_orders(user["user_id"], workspace_id, vendor)
-    return {"purchase_orders": pos, "total": len(pos)}
-
-
-@router.post("/purchase-orders/import", response_model=Dict[str, Any])
-async def import_purchase_orders(
-    request: PurchaseOrderImportRequest,
-    user: dict = Depends(get_current_user),
-):
-    try:
-        reader = csv.DictReader(io.StringIO(request.csv_text))
-        rows: List[Dict[str, str]] = [dict(row) for row in reader]
-        result = await get_supabase_service().import_purchase_orders_csv(
-            user["user_id"], request.workspace_id, rows,
-        )
-        return result
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-
 
 @router.post("/{item_id}/match-po", response_model=Dict[str, Any])
 async def match_purchase_order(

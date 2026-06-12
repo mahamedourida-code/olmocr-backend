@@ -79,7 +79,30 @@ class Settings(BaseSettings):
     queue_admission_max_queued_jobs: int = Field(50, env="QUEUE_ADMISSION_MAX_QUEUED_JOBS")
     queue_admission_max_active_jobs: int = Field(100, env="QUEUE_ADMISSION_MAX_ACTIVE_JOBS")
 
-    # Lemon Squeezy Billing Configuration
+    # Polar Billing Configuration
+    polar_access_token: str = Field("", env="POLAR_ACCESS_TOKEN")
+    polar_api_base_url: str = Field("https://api.polar.sh/v1", env="POLAR_API_BASE_URL")
+    polar_webhook_secret: str = Field("", env="POLAR_WEBHOOK_SECRET")
+    polar_pro_monthly_product_id: str = Field("", env="POLAR_PRO_MONTHLY_PRODUCT_ID")
+    polar_pro_yearly_product_id: str = Field("", env="POLAR_PRO_YEARLY_PRODUCT_ID")
+    polar_max_monthly_product_id: str = Field("", env="POLAR_MAX_MONTHLY_PRODUCT_ID")
+    polar_max_yearly_product_id: str = Field("", env="POLAR_MAX_YEARLY_PRODUCT_ID")
+    polar_mega_monthly_product_id: str = Field("", env="POLAR_MEGA_MONTHLY_PRODUCT_ID")
+    polar_mega_yearly_product_id: str = Field("", env="POLAR_MEGA_YEARLY_PRODUCT_ID")
+    polar_pro_monthly_price_cents: int = Field(1900, env="POLAR_PRO_MONTHLY_PRICE_CENTS")
+    polar_pro_yearly_price_cents: int = Field(19000, env="POLAR_PRO_YEARLY_PRICE_CENTS")
+    polar_max_monthly_price_cents: int = Field(3900, env="POLAR_MAX_MONTHLY_PRICE_CENTS")
+    polar_max_yearly_price_cents: int = Field(39000, env="POLAR_MAX_YEARLY_PRICE_CENTS")
+    polar_mega_monthly_price_cents: int = Field(7900, env="POLAR_MEGA_MONTHLY_PRICE_CENTS")
+    polar_mega_yearly_price_cents: int = Field(79000, env="POLAR_MEGA_YEARLY_PRICE_CENTS")
+    polar_pro_monthly_credits: int = Field(1000, env="POLAR_PRO_MONTHLY_CREDITS")
+    polar_pro_yearly_credits: int = Field(12000, env="POLAR_PRO_YEARLY_CREDITS")
+    polar_max_monthly_credits: int = Field(2500, env="POLAR_MAX_MONTHLY_CREDITS")
+    polar_max_yearly_credits: int = Field(30000, env="POLAR_MAX_YEARLY_CREDITS")
+    polar_mega_monthly_credits: int = Field(7000, env="POLAR_MEGA_MONTHLY_CREDITS")
+    polar_mega_yearly_credits: int = Field(84000, env="POLAR_MEGA_YEARLY_CREDITS")
+
+    # Legacy Lemon Squeezy Billing Configuration
     lemonsqueezy_api_key: str = Field("", env="LEMONSQUEEZY_API_KEY")
     lemonsqueezy_store_id: str = Field("", env="LEMONSQUEEZY_STORE_ID")
     lemonsqueezy_webhook_secret: str = Field("", env="LEMONSQUEEZY_WEBHOOK_SECRET")
@@ -210,6 +233,74 @@ class Settings(BaseSettings):
     def cleanup_interval_seconds(self) -> int:
         """Convert hours to seconds for cleanup interval."""
         return self.cleanup_interval_hours * 3600
+
+    @property
+    def polar_plan_products(self) -> dict:
+        """Map local billing plan keys to Polar product IDs and entitlements."""
+        return {
+            "pro_monthly": {
+                "product_id": self.polar_pro_monthly_product_id,
+                "plan": "pro",
+                "display_name": "Standard Plan",
+                "interval": "month",
+                "price_cents": self.polar_pro_monthly_price_cents,
+                "credits": self.polar_pro_monthly_credits,
+                "volume_label": "1,000 credits/month",
+            },
+            "pro_yearly": {
+                "product_id": self.polar_pro_yearly_product_id,
+                "plan": "pro",
+                "display_name": "Standard Plan",
+                "interval": "year",
+                "price_cents": self.polar_pro_yearly_price_cents,
+                "credits": self.polar_pro_yearly_credits,
+                "volume_label": "12,000 credits/year",
+            },
+            "max_monthly": {
+                "product_id": self.polar_max_monthly_product_id,
+                "plan": "max",
+                "display_name": "Pro Plan",
+                "interval": "month",
+                "price_cents": self.polar_max_monthly_price_cents,
+                "credits": self.polar_max_monthly_credits,
+                "volume_label": "2,500 credits/month",
+            },
+            "max_yearly": {
+                "product_id": self.polar_max_yearly_product_id,
+                "plan": "max",
+                "display_name": "Pro Plan",
+                "interval": "year",
+                "price_cents": self.polar_max_yearly_price_cents,
+                "credits": self.polar_max_yearly_credits,
+                "volume_label": "30,000 credits/year",
+            },
+            "mega_monthly": {
+                "product_id": self.polar_mega_monthly_product_id,
+                "plan": "mega",
+                "display_name": "Max Plan",
+                "interval": "month",
+                "price_cents": self.polar_mega_monthly_price_cents,
+                "credits": self.polar_mega_monthly_credits,
+                "volume_label": "7,000 credits/month",
+            },
+            "mega_yearly": {
+                "product_id": self.polar_mega_yearly_product_id,
+                "plan": "mega",
+                "display_name": "Max Plan",
+                "interval": "year",
+                "price_cents": self.polar_mega_yearly_price_cents,
+                "credits": self.polar_mega_yearly_credits,
+                "volume_label": "84,000 credits/year",
+            },
+        }
+
+    def polar_plan_for_product(self, product_id: str) -> Optional[dict]:
+        """Return local plan metadata for a Polar product ID."""
+        product = str(product_id)
+        for plan_key, plan_data in self.polar_plan_products.items():
+            if plan_data.get("product_id") and str(plan_data["product_id"]) == product:
+                return {"plan_key": plan_key, **plan_data}
+        return None
 
     @property
     def lemonsqueezy_plan_variants(self) -> dict:

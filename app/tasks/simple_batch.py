@@ -281,6 +281,7 @@ async def process_single_image_simple(
             image_data = image_data.split(',', 1)[1]
         output_format = str(img.get('output_format') or 'xlsx').lower()
         requested_document_mode = str(img.get('document_mode') or 'table').lower()
+        ocr_language = str(img.get('ocr_language') or 'en').strip().lower()[:16] or 'en'
         document_mode = requested_document_mode
         classification_data = None
 
@@ -299,7 +300,7 @@ async def process_single_image_simple(
 
         try:
             if requested_document_mode == "auto":
-                classification_data = await olmocr.classify_document_from_image(image_data)
+                classification_data = await olmocr.classify_document_from_image(image_data, ocr_language=ocr_language)
                 suggested_mode = classification_data.get("document_type")
                 confidence = float(classification_data.get("confidence") or 0)
                 if (
@@ -354,6 +355,7 @@ async def process_single_image_simple(
                                 "source_page": source_page,
                                 "source_page_count": source_page_count,
                                 "source_sha256": source_sha256,
+                                "ocr_language": ocr_language,
                                 "classification": classification_data,
                             },
                         })
@@ -377,17 +379,17 @@ async def process_single_image_simple(
             wants_notes = document_mode == 'notes'
 
             if wants_bank_statement:
-                bank_statement_data = await olmocr.extract_bank_statement_from_image(image_data)
+                bank_statement_data = await olmocr.extract_bank_statement_from_image(image_data, ocr_language=ocr_language)
             elif wants_invoice:
-                invoice_data = await olmocr.extract_invoice_from_image(image_data)
+                invoice_data = await olmocr.extract_invoice_from_image(image_data, ocr_language=ocr_language)
             elif wants_receipt:
-                receipt_data = await olmocr.extract_receipt_from_image(image_data)
+                receipt_data = await olmocr.extract_receipt_from_image(image_data, ocr_language=ocr_language)
             elif wants_notes:
-                notes_data = await olmocr.extract_notes_from_image(image_data)
+                notes_data = await olmocr.extract_notes_from_image(image_data, ocr_language=ocr_language)
             elif wants_text_output:
-                text_data = await olmocr.extract_text_from_image(image_data)
+                text_data = await olmocr.extract_text_from_image(image_data, ocr_language=ocr_language)
             else:
-                csv_data = await olmocr.extract_table_from_image(image_data)
+                csv_data = await olmocr.extract_table_from_image(image_data, ocr_language=ocr_language)
         finally:
             await redis.release_distributed_semaphore("deepinfra_ocr", holder_id)
 
@@ -498,6 +500,7 @@ async def process_single_image_simple(
                     "size_bytes": len(output_data),
                     "document_mode": document_mode,
                     "selected_mode": requested_document_mode,
+                    "ocr_language": ocr_language,
                     "detected_mode": classification_data.get("document_type") if classification_data else None,
                     "detection_confidence": classification_data.get("confidence") if classification_data else None,
                     "detection_review_reason": classification_data.get("review_reason") if classification_data else None,
@@ -570,6 +573,7 @@ async def process_single_image_simple(
             'content_type': output_content_type,
             'document_mode': document_mode,
             'selected_mode': requested_document_mode,
+            'ocr_language': ocr_language,
             'detected_mode': classification_data.get("document_type") if classification_data else None,
             'detection_confidence': classification_data.get("confidence") if classification_data else None,
             'detection_review_reason': classification_data.get("review_reason") if classification_data else None,
@@ -613,6 +617,7 @@ async def process_single_image_simple(
                             "output_content_type": output_content_type,
                             "selected_mode": requested_document_mode,
                             "resolved_mode": document_mode,
+                            "ocr_language": ocr_language,
                             "classification": classification_data,
                         },
                     })

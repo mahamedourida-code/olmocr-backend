@@ -28,6 +28,19 @@ async def create_workspace(request: WorkspaceCreateRequest, user: dict = Depends
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
+@router.post("/invite/{token}/accept", response_model=Dict[str, Any])
+async def accept_invite(token: str, user: dict = Depends(get_current_user)):
+    try:
+        member = await get_supabase_service().accept_workspace_invite(
+            user["user_id"],
+            user.get("email"),
+            token,
+        )
+        return {"member": member}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
 @router.put("/{workspace_id}/active", response_model=Dict[str, Any])
 async def set_active_workspace(workspace_id: str, user: dict = Depends(get_current_user)):
     try:
@@ -88,3 +101,23 @@ async def revoke_reviewer(
         return {"success": True, "membership_id": membership_id}
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@router.delete("/{workspace_id}", response_model=Dict[str, Any])
+async def delete_workspace(workspace_id: str, user: dict = Depends(get_current_user)):
+    try:
+        return await get_supabase_service().delete_owned_workspace(
+            user["user_id"], user.get("email"), workspace_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
+@router.post("/{workspace_id}/leave", response_model=Dict[str, Any])
+async def leave_workspace(workspace_id: str, user: dict = Depends(get_current_user)):
+    try:
+        return await get_supabase_service().leave_workspace(
+            user["user_id"], user.get("email"), workspace_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

@@ -12,6 +12,15 @@ RoutableDocumentMode = Literal["table", "invoice", "receipt", "bank_statement", 
 VendorRuleAutoMode = Literal["suggest", "auto_fill", "auto_ready"]
 
 
+class DemoLeadRequest(BaseModel):
+    """Public 'Request a demo' lead capture (collected before scheduling)."""
+
+    name: str = Field(..., min_length=1, max_length=200)
+    work_email: str = Field(..., min_length=3, max_length=255)
+    company: str = Field(..., min_length=1, max_length=200)
+    automation_goal: Optional[str] = Field(None, max_length=2000)
+
+
 class ImageData(BaseModel):
     """Model for individual image data in requests."""
     

@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.dependencies import get_current_user
 from app.core.limits import get_plan_limits
 from app.services.lemon_squeezy_service import LemonSqueezyService, get_lemon_squeezy_service
+from app.services.polar_service import PolarService, get_polar_service
 from app.services.supabase_service import SupabaseService, get_supabase_service
 
 logger = logging.getLogger(__name__)
@@ -67,16 +68,12 @@ def _public_plan(
             if interval == "year" and monthly_reference_cents
             else 0
         ),
-        "checkout_available": bool(
-            settings.lemonsqueezy_api_key
-            and settings.lemonsqueezy_store_id
-            and plan_data.get("variant_id")
-        ),
+        "checkout_available": bool(settings.polar_access_token and plan_data.get("product_id")),
     }
 
 
 def _billing_plan_catalog() -> Dict[str, Any]:
-    variants = settings.lemonsqueezy_plan_variants
+    variants = settings.polar_plan_products
     free_limits = get_plan_limits("free")
     pro_monthly = variants["pro_monthly"]["price_cents"]
     max_monthly = variants["max_monthly"]["price_cents"]
@@ -92,7 +89,7 @@ def _billing_plan_catalog() -> Dict[str, Any]:
     ]
 
     return {
-        "provider": "lemonsqueezy",
+        "provider": "polar",
         "currency": "USD",
         "plans": [
             {
@@ -389,6 +386,37 @@ def _process_lemon_webhook(payload: Dict[str, Any], supabase: SupabaseService, e
     return {"ignored": True, "event_name": event_name}
 
 
+@router.post("/checkout")
+async def create_checkout(
+    checkout_request: CheckoutRequest,
+    user: dict = Depends(get_current_user),
+    polar: PolarService = Depends(get_polar_service)
+):
+    try:
+        return await polar.create_checkout(
+            plan_key=checkout_request.plan_key,
+            user_id=user["user_id"],
+            email=user.get("email") or "",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to create Polar checkout: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not create checkout. Please try again shortly."
+        )
+
+
+@router.post("/polar/checkout")
+async def create_polar_checkout(
+    checkout_request: CheckoutRequest,
+    user: dict = Depends(get_current_user),
+    polar: PolarService = Depends(get_polar_service)
+):
+    return await create_checkout(checkout_request, user, polar)
+
+
 @router.post("/lemon/checkout")
 async def create_lemon_checkout(
     checkout_request: CheckoutRequest,
@@ -467,8 +495,14 @@ async def billing_portal(
     user: dict = Depends(get_current_user),
     supabase: SupabaseService = Depends(get_supabase_service)
 ):
-    subscription = supabase.get_latest_subscription_for_user(user["user_id"])
-    customer = supabase.get_billing_customer_for_user(user["user_id"])
+    subscription = (
+        supabase.get_latest_subscription_for_user(user["user_id"], provider="polar")
+        or supabase.get_latest_subscription_for_user(user["user_id"], provider="lemonsqueezy")
+    )
+    customer = (
+        supabase.get_billing_customer_for_user(user["user_id"], provider="polar")
+        or supabase.get_billing_customer_for_user(user["user_id"], provider="lemonsqueezy")
+    )
     portal_url = (
         (subscription or {}).get("customer_portal_url")
         or (customer or {}).get("portal_url")

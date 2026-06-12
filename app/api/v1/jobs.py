@@ -739,6 +739,7 @@ async def create_batch_job_multipart(
     output_format: str = Form("xlsx"),
     consolidation_strategy: str = Form("consolidated"),
     document_mode: str = Form("table"),
+    ocr_language: Optional[str] = Form("en"),
     workspace_id: Optional[str] = Form(None),
     company_id: Optional[str] = Form(None),
     session: SessionMetadata = Depends(get_or_create_session),
@@ -769,6 +770,7 @@ async def create_batch_job_multipart(
     supabase_service = get_supabase_service()
     limits = resolve_upload_limits(user, supabase_service)
     normalized_document_mode = normalize_document_mode(document_mode)
+    normalized_ocr_language = (str(ocr_language or "en").strip().lower() or "en")[:16]
     requested_output_format = str(output_format).lower()
     normalized_output_format = (
         "txt"
@@ -878,6 +880,7 @@ async def create_batch_job_multipart(
                     "content_type": "image/png",
                     "output_format": normalized_output_format,
                     "document_mode": normalized_document_mode,
+                    "ocr_language": normalized_ocr_language,
                     "source_filename": filename,
                     "source_content_type": "application/pdf",
                     "source_page": page_index,
@@ -894,6 +897,7 @@ async def create_batch_job_multipart(
             "content_type": file_info["content_type"],
             "output_format": normalized_output_format,
             "document_mode": normalized_document_mode,
+            "ocr_language": normalized_ocr_language,
             "source_filename": filename,
             "source_content_type": file_info["content_type"],
             "source_page": None,
@@ -973,6 +977,7 @@ async def create_batch_job_multipart(
                 'content_type': source_file['content_type'],
                 'output_format': unit["output_format"],
                 'document_mode': unit["document_mode"],
+                'ocr_language': unit["ocr_language"],
                 'size_bytes': source_file['size_bytes'],
                 'original_filename': unit["source_filename"],
                 'source_content_type': unit["source_content_type"],
@@ -1020,6 +1025,7 @@ async def create_batch_job_multipart(
                 "metadata": {
                     "source_page_count": first_unit.get("source_page_count"),
                     "source_sha256": source_file_info["source_sha256"],
+                    "ocr_language": normalized_ocr_language,
                 },
                 "expires_at": (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
             })
@@ -1035,6 +1041,7 @@ async def create_batch_job_multipart(
             'progress': 0,
             'output_format': normalized_output_format,
             'document_mode': normalized_document_mode,
+            'ocr_language': normalized_ocr_language,
             'company_id': company_id,
             'consolidation_strategy': consolidation_strategy,
             'images': stored_images,
@@ -1059,6 +1066,7 @@ async def create_batch_job_multipart(
                 'consolidation_strategy': consolidation_strategy,
                 'output_format': normalized_output_format,
                 'document_mode': normalized_document_mode,
+                'ocr_language': normalized_ocr_language,
                 'session_id': session.session_id,
                 'owner_user_id': user['user_id'] if user else None,
                 'owner_session_id': None if user else session.session_id,
@@ -1104,6 +1112,7 @@ async def create_batch_job_multipart(
                     'consolidation_strategy': consolidation_strategy,
                     'output_format': normalized_output_format,
                     'document_mode': normalized_document_mode,
+                    'ocr_language': normalized_ocr_language,
                     'session_id': session.session_id,
                     'owner_user_id': user['user_id'] if user else None,
                     'owner_session_id': None if user else session.session_id,

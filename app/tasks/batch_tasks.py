@@ -457,6 +457,7 @@ async def _process_single_stored_image_async(
         'original_filename': image_info.get('original_filename') or image_info.get('filename', f"image_{img_index}.png"),
         'output_format': image_info.get('output_format', 'xlsx'),
         'document_mode': image_info.get('document_mode', 'table'),
+        'ocr_language': image_info.get('ocr_language', 'en'),
         'source_storage_path': image_info.get('storage_path'),
         'source_content_type': image_info.get('content_type'),
         'source_page': image_info.get('source_page'),

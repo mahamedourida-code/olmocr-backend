@@ -540,11 +540,19 @@ class SupabaseService:
 
     def get_billing_status(self, user_id: str) -> Dict[str, Any]:
         """Return current app billing state for dashboard/API consumers."""
+        subscription = (
+            self.get_latest_subscription_for_user(user_id, provider="polar")
+            or self.get_latest_subscription_for_user(user_id, provider="lemonsqueezy")
+        )
+        customer = (
+            self.get_billing_customer_for_user(user_id, provider="polar")
+            or self.get_billing_customer_for_user(user_id, provider="lemonsqueezy")
+        )
         return {
             "plan": self.get_user_plan_type(user_id),
             "credits": self.get_user_credits(user_id),
-            "subscription": self.get_latest_subscription_for_user(user_id),
-            "customer": self.get_billing_customer_for_user(user_id),
+            "subscription": subscription,
+            "customer": customer,
         }
 
     async def update_job_status(
@@ -1367,6 +1375,18 @@ class SupabaseService:
             raise ValueError("Company not found")
         return (await self._summarize_companies(str(current["workspace_id"]), [response.data[0]]))[0]
 
+    async def delete_company(self, company_id: str, user_id: str) -> Dict[str, Any]:
+        """Remove a client (company). Keeps documents/bills but detaches them."""
+        company = await self.get_company(company_id, user_id)  # validates ownership
+        if company.get("is_default"):
+            raise ValueError("The default client can't be deleted")
+        workspace_id = str(company["workspace_id"])
+        # Detach financial records from the company rather than destroying them.
+        self.client.table("job_documents").update({"company_id": None}).eq("company_id", company_id).execute()
+        self.client.table("accounts_payable_items").update({"company_id": None}).eq("company_id", company_id).execute()
+        self.client.table("companies").delete().eq("id", company_id).eq("workspace_id", workspace_id).execute()
+        return {"deleted": True}
+
     async def select_accessible_workspace(self, user_id: str, email: Optional[str], workspace_id: str) -> Dict[str, Any]:
         role = await self.require_workspace_role(user_id, email, workspace_id)
         self.client.table("workspace_preferences").upsert({
@@ -1411,6 +1431,57 @@ class SupabaseService:
         await self.record_workspace_audit(workspace_id, user_id, "owner", "reviewer_invited", "membership", member.get("id"), {"role": "reviewer"})
         return member
 
+    async def accept_workspace_invite(self, user_id: str, email: Optional[str], token: str) -> Dict[str, Any]:
+        normalized = self._normalize_member_email(email)
+        if not normalized:
+            raise ValueError("Sign in with the invited email address to accept this workspace invite")
+
+        await self._claim_reviewer_memberships(user_id, normalized)
+        response = self.client.table("workspace_memberships")\
+            .select("id,workspace_id,user_id,member_email,role,status,created_at,updated_at")\
+            .eq("member_email", normalized)\
+            .eq("role", "reviewer")\
+            .in_("status", ["pending", "active"])\
+            .order("created_at")\
+            .execute()
+
+        memberships = response.data or []
+        token_value = str(token or "").strip()
+        if token_value:
+            narrowed = [
+                member for member in memberships
+                if token_value in {str(member.get("id") or ""), str(member.get("workspace_id") or "")}
+            ]
+            if narrowed:
+                memberships = narrowed
+
+        if not memberships:
+            raise ValueError("This invite link is invalid or does not match your signed-in email")
+
+        member = memberships[0]
+        was_active = member.get("status") == "active" and str(member.get("user_id") or "") == str(user_id)
+        update = {
+            "user_id": user_id,
+            "status": "active",
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        updated = self.client.table("workspace_memberships")\
+            .update(update)\
+            .eq("id", member["id"])\
+            .execute()
+        accepted = (updated.data or [{**member, **update}])[0]
+        if not was_active:
+            await self.record_workspace_audit(
+                str(accepted["workspace_id"]),
+                user_id,
+                "reviewer",
+                "reviewer_invite_accepted",
+                "membership",
+                str(accepted["id"]),
+                {"role": "reviewer"},
+            )
+        return accepted
+
     async def revoke_workspace_member(
         self,
         user_id: str,
@@ -1432,6 +1503,130 @@ class SupabaseService:
             "updated_at": datetime.utcnow().isoformat(),
         }).eq("id", membership_id).execute()
         await self.record_workspace_audit(workspace_id, user_id, "owner", "reviewer_revoked", "membership", membership_id, {"role": "reviewer"})
+
+    async def _purge_workspace_data(self, workspace_id: str) -> None:
+        """Best-effort cascade of everything scoped to a workspace (service role).
+
+        Does not rely on DB ON DELETE CASCADE: stored document content is erased
+        per job through the tested batch deleter, accounting connection children
+        are cleared by connection id, and every other workspace-scoped table is
+        cleared by workspace_id. Tables that lack a workspace_id column simply
+        raise and are skipped (their rows are already removed via the job/document
+        path), so the final workspace row delete won't hit an FK violation."""
+        jobs = self.client.table("processing_jobs").select("id").eq("workspace_id", workspace_id).execute()
+        for job in jobs.data or []:
+            try:
+                await self.delete_batch_content(str(job["id"]), actor={}, reason="workspace_deleted")
+            except Exception:
+                logger.warning("workspace purge: batch delete failed for job %s", job.get("id"), exc_info=True)
+
+        # Accounting connection children are keyed by connection_id — clear them first.
+        for conn_table, child_tables in (
+            ("quickbooks_connections", ("quickbooks_reference_data", "quickbooks_bill_publications")),
+            ("xero_connections", ("xero_reference_data", "xero_bill_publications")),
+        ):
+            try:
+                conns = self.client.table(conn_table).select("id").eq("workspace_id", workspace_id).execute()
+                conn_ids = [str(row["id"]) for row in (conns.data or [])]
+                for child in child_tables:
+                    if conn_ids:
+                        try:
+                            self.client.table(child).delete().in_("connection_id", conn_ids).execute()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # Everything else scoped directly by workspace_id (best-effort, leaf → root).
+        for table in (
+            "quickbooks_receipt_publications", "quickbooks_bill_publications", "quickbooks_reference_data",
+            "xero_bill_publications", "xero_reference_data",
+            "accounts_payable_items", "purchase_orders", "vendor_rules",
+            "email_intake_messages", "workspace_email_intakes",
+            "client_upload_submissions", "client_upload_links", "connected_sources",
+            "job_history", "processing_jobs",
+            "quickbooks_oauth_states", "xero_oauth_states",
+            "quickbooks_connections", "xero_connections",
+            "companies", "workspace_audit_events", "workspace_memberships",
+        ):
+            try:
+                self.client.table(table).delete().eq("workspace_id", workspace_id).execute()
+            except Exception:
+                logger.warning("workspace purge: could not clear %s for %s", table, workspace_id, exc_info=True)
+
+    async def delete_owned_workspace(self, user_id: str, email: Optional[str], workspace_id: str) -> Dict[str, Any]:
+        """Owner-only: permanently delete a workspace and everything it owns."""
+        await self.require_workspace_role(user_id, email, workspace_id, ["owner"])
+        await self._purge_workspace_data(workspace_id)
+        self.client.table("workspace_preferences").delete().eq("active_workspace_id", workspace_id).execute()
+        self.client.table("workspaces").delete().eq("id", workspace_id).eq("owner_user_id", user_id).execute()
+        remaining = await self.list_accessible_workspaces(user_id, email)
+        return {"deleted": True, "active_workspace_id": remaining.get("active_workspace_id")}
+
+    async def leave_workspace(self, user_id: str, email: Optional[str], workspace_id: str) -> Dict[str, Any]:
+        """Remove the current member from a workspace they don't own."""
+        role = await self.require_workspace_role(user_id, email, workspace_id)
+        if role == "owner":
+            raise ValueError("Owners can't leave their own workspace — delete it instead")
+        now = datetime.utcnow().isoformat()
+        self.client.table("workspace_memberships").update({"status": "revoked", "updated_at": now})\
+            .eq("workspace_id", workspace_id).eq("user_id", user_id).execute()
+        normalized = self._normalize_member_email(email)
+        if normalized:
+            self.client.table("workspace_memberships").update({"status": "revoked", "updated_at": now})\
+                .eq("workspace_id", workspace_id).eq("member_email", normalized).execute()
+        self.client.table("workspace_preferences").delete()\
+            .eq("user_id", user_id).eq("active_workspace_id", workspace_id).execute()
+        remaining = await self.list_accessible_workspaces(user_id, email)
+        return {"left": True, "active_workspace_id": remaining.get("active_workspace_id")}
+
+    async def delete_account(self, user_id: str, email: Optional[str]) -> Dict[str, Any]:
+        """Permanently delete the user's auth account and all data they own."""
+        owned = self.client.table("workspaces").select("id").eq("owner_user_id", user_id).execute()
+        for workspace in owned.data or []:
+            workspace_id = str(workspace["id"])
+            try:
+                await self._purge_workspace_data(workspace_id)
+                self.client.table("workspace_preferences").delete().eq("active_workspace_id", workspace_id).execute()
+                self.client.table("workspaces").delete().eq("id", workspace_id).execute()
+            except Exception:
+                logger.exception("Failed to delete workspace %s during account deletion", workspace_id)
+        # Drop the user's own memberships + preferences.
+        self.client.table("workspace_memberships").delete().eq("user_id", user_id).execute()
+        self.client.table("workspace_preferences").delete().eq("user_id", user_id).execute()
+        # Best-effort cleanup of per-user rows (these also cascade from auth.users where wired).
+        for table, column in (
+            ("credit_ledger", "user_id"),
+            ("user_credits", "user_id"),
+            ("subscriptions", "user_id"),
+            ("billing_customers", "user_id"),
+            ("profiles", "id"),
+        ):
+            try:
+                self.client.table(table).delete().eq(column, user_id).execute()
+            except Exception:
+                logger.warning("Could not clear %s for user during account deletion", table, exc_info=True)
+        try:
+            self.client.auth.admin.delete_user(user_id)
+        except Exception:
+            logger.exception("auth.admin.delete_user failed for %s", user_id)
+            raise ValueError("Account data was removed but the auth user could not be deleted")
+        return {"deleted": True}
+
+    async def create_demo_lead(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Store a public 'Request a demo' lead."""
+        record = {
+            "name": str(payload.get("name") or "").strip()[:200],
+            "work_email": str(payload.get("work_email") or "").strip().lower()[:255],
+            "company": str(payload.get("company") or "").strip()[:200],
+            "automation_goal": (
+                str(payload.get("automation_goal")).strip()[:2000]
+                if payload.get("automation_goal")
+                else None
+            ),
+        }
+        response = self.client.table("demo_leads").insert(record).execute()
+        return (response.data or [{}])[0]
 
     async def record_workspace_audit(
         self,

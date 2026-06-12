@@ -74,13 +74,35 @@ class OlmOCRService:
         except Exception as exc:
             raise OlmOCRError(f"Failed to render PDF for OCR: {exc}") from exc
 
-    async def _extract_table_from_pdf(self, pdf_data: bytes) -> str:
+    @staticmethod
+    def _ocr_language_instruction(ocr_language: Optional[str]) -> str:
+        code = str(ocr_language or "en").strip().lower()
+        language_names = {
+            "ar": "Arabic",
+            "de": "German",
+            "en": "English",
+            "es": "Spanish",
+            "fr": "French",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "zh": "Chinese",
+        }
+        language_name = language_names.get(code)
+        if not language_name or code == "en":
+            return ""
+        return (
+            f" The user selected {language_name} as the OCR language. "
+            "Use that preference to interpret printed labels, reading order, and common terms, "
+            "while preserving visible text, dates, numbers, currencies, and field values exactly as written."
+        )
+
+    async def _extract_table_from_pdf(self, pdf_data: bytes, ocr_language: Optional[str] = "en") -> str:
         page_images = self._render_pdf_pages_to_png(pdf_data)
         page_outputs: List[str] = []
 
         for index, page_image in enumerate(page_images):
             logger.info(f"Processing PDF page {index + 1}/{len(page_images)}")
-            page_csv = await self.extract_table_from_image(page_image)
+            page_csv = await self.extract_table_from_image(page_image, ocr_language=ocr_language)
             if page_csv and page_csv.strip():
                 page_outputs.append(page_csv.strip())
 
@@ -89,13 +111,13 @@ class OlmOCRService:
 
         return "\n".join(page_outputs)
 
-    async def _extract_text_from_pdf(self, pdf_data: bytes) -> str:
+    async def _extract_text_from_pdf(self, pdf_data: bytes, ocr_language: Optional[str] = "en") -> str:
         page_images = self._render_pdf_pages_to_png(pdf_data)
         page_outputs: List[str] = []
 
         for index, page_image in enumerate(page_images):
             logger.info(f"Processing PDF page {index + 1}/{len(page_images)} as text")
-            page_text = await self.extract_text_from_image(page_image)
+            page_text = await self.extract_text_from_image(page_image, ocr_language=ocr_language)
             if page_text and page_text.strip():
                 page_outputs.append(page_text.strip())
 
@@ -147,7 +169,7 @@ class OlmOCRService:
         max_tries=3,
         max_time=30
     )
-    async def extract_table_from_image(self, image_data: Union[bytes, str]) -> str:
+    async def extract_table_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> str:
         """
         Extract table data from image using OlmOCR API.
 
@@ -173,7 +195,7 @@ class OlmOCRService:
                 image_bytes = base64.b64decode(img_b64_str)
 
             if self._is_pdf_bytes(image_bytes):
-                return await self._extract_table_from_pdf(image_bytes)
+                return await self._extract_table_from_pdf(image_bytes, ocr_language=ocr_language)
 
             # Apply rate limiting before making the image OCR API call
             await self._apply_rate_limiting()
@@ -214,6 +236,7 @@ class OlmOCRService:
             
             # Convert to base64 for API
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
             
             # Prepare the request
             messages = [
@@ -229,7 +252,7 @@ class OlmOCRService:
                         {
                             "type": "text",
                             "text": "Attached is one page of a document that you must process. Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown."
-                                    "Return your output as markdown"
+                                    "Return your output as markdown." + language_instruction
                         }
                     ]
                 }
@@ -288,7 +311,7 @@ class OlmOCRService:
         max_tries=3,
         max_time=30
     )
-    async def extract_text_from_image(self, image_data: Union[bytes, str]) -> str:
+    async def extract_text_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> str:
         """Extract plain text from an image or rendered PDF page."""
         try:
             if isinstance(image_data, bytes):
@@ -298,7 +321,7 @@ class OlmOCRService:
                 image_bytes = base64.b64decode(img_b64_str)
 
             if self._is_pdf_bytes(image_bytes):
-                return await self._extract_text_from_pdf(image_bytes)
+                return await self._extract_text_from_pdf(image_bytes, ocr_language=ocr_language)
 
             await self._apply_rate_limiting()
 
@@ -323,6 +346,7 @@ class OlmOCRService:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
                 {
                     "role": "user",
@@ -339,6 +363,7 @@ class OlmOCRService:
                                 "Extract all readable text from this document image. "
                                 "Return plain text only. Preserve line breaks, labels, and reading order. "
                                 "Do not summarize. Do not convert the result into CSV, JSON, or an Excel table."
+                                + language_instruction
                             )
                         }
                     ]
@@ -360,7 +385,7 @@ class OlmOCRService:
             logger.error(f"OlmOCR text extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract text: {str(e)}")
 
-    async def classify_document_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+    async def classify_document_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
         """Classify a document for extractor routing without inventing an accounting type."""
         try:
             if isinstance(image_data, bytes):
@@ -375,6 +400,7 @@ class OlmOCRService:
 
             await self._apply_rate_limiting()
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
                 {
                     "role": "user",
@@ -394,6 +420,7 @@ class OlmOCRService:
                                 "If the image is unclear, mixed, or could be routed incorrectly, choose needs_manual_selection. "
                                 "confidence must be between 0 and 1. review_reason must briefly explain uncertainty or be empty "
                                 "when the type is clear. Do not extract fields and do not infer accounting treatment."
+                                + language_instruction
                             )
                         }
                     ]
@@ -449,7 +476,7 @@ class OlmOCRService:
             logger.error(f"Document classification error: {str(e)}")
             raise OlmOCRError(f"Failed to classify document: {str(e)}")
 
-    async def extract_notes_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+    async def extract_notes_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
         """Extract handwritten narrative text and any visibly detected tables."""
         try:
             if isinstance(image_data, bytes):
@@ -461,7 +488,7 @@ class OlmOCRService:
             if self._is_pdf_bytes(image_bytes):
                 page_results = []
                 for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
-                    page_result = await self.extract_notes_from_image(page_image)
+                    page_result = await self.extract_notes_from_image(page_image, ocr_language=ocr_language)
                     page_result["page"] = page_number
                     page_results.append(page_result)
                 return self._merge_notes_pages(page_results)
@@ -485,6 +512,7 @@ class OlmOCRService:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [{
                 "role": "user",
                 "content": [
@@ -497,6 +525,7 @@ class OlmOCRService:
                             "If a visible table exists, extract only its visible columns and rows. "
                             "Do not invent a table from prose, summarize, classify accounting, or post data anywhere. "
                             "Use empty arrays when no table is visible and add review notes only for unclear text or cells."
+                            + language_instruction
                         ),
                     },
                 ],
@@ -601,7 +630,7 @@ class OlmOCRService:
             "review_reason": review_reason,
         }
 
-    async def extract_bank_statement_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+    async def extract_bank_statement_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
         """Extract visible bank statement text and transactions into a structured review object."""
         try:
             if isinstance(image_data, bytes):
@@ -614,7 +643,7 @@ class OlmOCRService:
                 page_images = self._render_pdf_pages_to_png(image_bytes)
                 page_results = []
                 for index, page_image in enumerate(page_images, start=1):
-                    result = await self.extract_bank_statement_from_image(page_image)
+                    result = await self.extract_bank_statement_from_image(page_image, ocr_language=ocr_language)
                     result["page"] = index
                     page_results.append(result)
                 return self._merge_bank_statement_pages(page_results)
@@ -639,6 +668,7 @@ class OlmOCRService:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
                 {
                     "role": "user",
@@ -657,6 +687,7 @@ class OlmOCRService:
                                 "Set readable to false only when a row cannot be reliably transcribed, and describe the issue in review_note. "
                                 "Use review_notes only for visible OCR uncertainty such as an unreadable row or a visibly missing statement page. "
                                 "Preserve original wording and number formatting."
+                                + language_instruction
                             )
                         }
                     ]
@@ -756,7 +787,7 @@ class OlmOCRService:
             logger.error(f"OlmOCR bank statement extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract bank statement: {str(e)}")
 
-    async def extract_invoice_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+    async def extract_invoice_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
         """Extract visible invoice fields and line items for review and export."""
         try:
             if isinstance(image_data, bytes):
@@ -768,7 +799,7 @@ class OlmOCRService:
             if self._is_pdf_bytes(image_bytes):
                 page_results = []
                 for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
-                    page_result = await self.extract_invoice_from_image(page_image)
+                    page_result = await self.extract_invoice_from_image(page_image, ocr_language=ocr_language)
                     page_result["page"] = page_number
                     page_results.append(page_result)
                 return self._merge_invoice_pages(page_results)
@@ -793,6 +824,7 @@ class OlmOCRService:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
                 {
                     "role": "user",
@@ -808,6 +840,7 @@ class OlmOCRService:
                                 "Do not infer missing values, calculate missing totals, or classify accounting. "
                                 "Return JSON matching the supplied schema. Use empty strings when fields are not visible. "
                                 "Preserve visible number and date formatting. For line_items, include one item per visible invoice row."
+                                + language_instruction
                             )
                         }
                     ]
@@ -888,7 +921,7 @@ class OlmOCRService:
             logger.error(f"OlmOCR invoice extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract invoice: {str(e)}")
 
-    async def extract_receipt_from_image(self, image_data: Union[bytes, str]) -> Dict[str, Any]:
+    async def extract_receipt_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
         """Extract visible receipt fields and line items for expense review."""
         try:
             if isinstance(image_data, bytes):
@@ -900,7 +933,7 @@ class OlmOCRService:
             if self._is_pdf_bytes(image_bytes):
                 page_results = []
                 for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
-                    page_result = await self.extract_receipt_from_image(page_image)
+                    page_result = await self.extract_receipt_from_image(page_image, ocr_language=ocr_language)
                     page_result["page"] = page_number
                     page_results.append(page_result)
                 return self._merge_receipt_pages(page_results)
@@ -925,6 +958,7 @@ class OlmOCRService:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
                 {
                     "role": "user",
@@ -940,6 +974,7 @@ class OlmOCRService:
                                 "Do not infer missing values, categorize expenses, create bills, or calculate missing totals. "
                                 "Return JSON matching the supplied schema. Use empty strings when fields are not visible. "
                                 "Preserve visible number and date formatting. For line_items, include one item per visible receipt row."
+                                + language_instruction
                             )
                         }
                     ]
