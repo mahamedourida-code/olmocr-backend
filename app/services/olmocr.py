@@ -43,6 +43,7 @@ class OlmOCRService:
             raise OlmOCRError(f"Failed to initialize OlmOCR service: {e}")
         
         self.model = settings.olmocr_model
+        self.models = getattr(settings, "parsed_ocr_models", None) or [self.model]
         self.max_tokens = 2000
         self._last_request_time = 0.0
         self._request_count = 0
@@ -96,13 +97,13 @@ class OlmOCRService:
             "while preserving visible text, dates, numbers, currencies, and field values exactly as written."
         )
 
-    async def _extract_table_from_pdf(self, pdf_data: bytes, ocr_language: Optional[str] = "en") -> str:
+    async def _extract_table_from_pdf(self, pdf_data: bytes, ocr_language: Optional[str] = "en", model: Optional[str] = None) -> str:
         page_images = self._render_pdf_pages_to_png(pdf_data)
         page_outputs: List[str] = []
 
         for index, page_image in enumerate(page_images):
             logger.info(f"Processing PDF page {index + 1}/{len(page_images)}")
-            page_csv = await self.extract_table_from_image(page_image, ocr_language=ocr_language)
+            page_csv = await self.extract_table_from_image(page_image, ocr_language=ocr_language, model=model)
             if page_csv and page_csv.strip():
                 page_outputs.append(page_csv.strip())
 
@@ -111,13 +112,13 @@ class OlmOCRService:
 
         return "\n".join(page_outputs)
 
-    async def _extract_text_from_pdf(self, pdf_data: bytes, ocr_language: Optional[str] = "en") -> str:
+    async def _extract_text_from_pdf(self, pdf_data: bytes, ocr_language: Optional[str] = "en", model: Optional[str] = None) -> str:
         page_images = self._render_pdf_pages_to_png(pdf_data)
         page_outputs: List[str] = []
 
         for index, page_image in enumerate(page_images):
             logger.info(f"Processing PDF page {index + 1}/{len(page_images)} as text")
-            page_text = await self.extract_text_from_image(page_image, ocr_language=ocr_language)
+            page_text = await self.extract_text_from_image(page_image, ocr_language=ocr_language, model=model)
             if page_text and page_text.strip():
                 page_outputs.append(page_text.strip())
 
@@ -169,7 +170,7 @@ class OlmOCRService:
         max_tries=3,
         max_time=30
     )
-    async def extract_table_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> str:
+    async def extract_table_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> str:
         """
         Extract table data from image using OlmOCR API.
 
@@ -195,7 +196,7 @@ class OlmOCRService:
                 image_bytes = base64.b64decode(img_b64_str)
 
             if self._is_pdf_bytes(image_bytes):
-                return await self._extract_table_from_pdf(image_bytes, ocr_language=ocr_language)
+                return await self._extract_table_from_pdf(image_bytes, ocr_language=ocr_language, model=model)
 
             # Apply rate limiting before making the image OCR API call
             await self._apply_rate_limiting()
@@ -260,7 +261,7 @@ class OlmOCRService:
             
             # Make the API call
             logger.info("Making OlmOCR API request")
-            response: ChatCompletion = await self._make_api_call(messages)
+            response: ChatCompletion = await self._make_api_call(messages, model=model)
             
             # Extract the response content
             if not response.choices or not response.choices[0].message.content:
@@ -311,7 +312,7 @@ class OlmOCRService:
         max_tries=3,
         max_time=30
     )
-    async def extract_text_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> str:
+    async def extract_text_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> str:
         """Extract plain text from an image or rendered PDF page."""
         try:
             if isinstance(image_data, bytes):
@@ -321,7 +322,7 @@ class OlmOCRService:
                 image_bytes = base64.b64decode(img_b64_str)
 
             if self._is_pdf_bytes(image_bytes):
-                return await self._extract_text_from_pdf(image_bytes, ocr_language=ocr_language)
+                return await self._extract_text_from_pdf(image_bytes, ocr_language=ocr_language, model=model)
 
             await self._apply_rate_limiting()
 
@@ -371,7 +372,7 @@ class OlmOCRService:
             ]
 
             logger.info("Making OlmOCR text extraction request")
-            response: ChatCompletion = await self._make_api_call(messages, max_tokens=5000)
+            response: ChatCompletion = await self._make_api_call(messages, max_tokens=5000, model=model)
 
             if not response.choices or not response.choices[0].message.content:
                 raise OlmOCRError("Empty response from OlmOCR API")
@@ -385,7 +386,7 @@ class OlmOCRService:
             logger.error(f"OlmOCR text extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract text: {str(e)}")
 
-    async def classify_document_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
+    async def classify_document_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> Dict[str, Any]:
         """Classify a document for extractor routing without inventing an accounting type."""
         try:
             if isinstance(image_data, bytes):
@@ -453,6 +454,7 @@ class OlmOCRService:
                     max_tokens=300,
                     response_format=classification_schema,
                     temperature=0,
+                    model=model,
                 )
             except Exception as schema_error:
                 if "response_format" not in str(schema_error).lower() and "schema" not in str(schema_error).lower():
@@ -462,6 +464,7 @@ class OlmOCRService:
                     max_tokens=300,
                     response_format={"type": "json_object"},
                     temperature=0,
+                    model=model,
                 )
 
             if not response.choices or not response.choices[0].message.content:
@@ -476,7 +479,7 @@ class OlmOCRService:
             logger.error(f"Document classification error: {str(e)}")
             raise OlmOCRError(f"Failed to classify document: {str(e)}")
 
-    async def extract_notes_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
+    async def extract_notes_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> Dict[str, Any]:
         """Extract handwritten narrative text and any visibly detected tables."""
         try:
             if isinstance(image_data, bytes):
@@ -488,7 +491,7 @@ class OlmOCRService:
             if self._is_pdf_bytes(image_bytes):
                 page_results = []
                 for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
-                    page_result = await self.extract_notes_from_image(page_image, ocr_language=ocr_language)
+                    page_result = await self.extract_notes_from_image(page_image, ocr_language=ocr_language, model=model)
                     page_result["page"] = page_number
                     page_results.append(page_result)
                 return self._merge_notes_pages(page_results)
@@ -583,6 +586,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format=notes_schema,
                     temperature=0,
+                    model=model,
                 )
             except Exception as structured_error:
                 error_text = str(structured_error).lower()
@@ -594,6 +598,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format={"type": "json_object"},
                     temperature=0,
+                    model=model,
                 )
 
             if not response.choices or not response.choices[0].message.content:
@@ -630,7 +635,7 @@ class OlmOCRService:
             "review_reason": review_reason,
         }
 
-    async def extract_bank_statement_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
+    async def extract_bank_statement_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> Dict[str, Any]:
         """Extract visible bank statement text and transactions into a structured review object."""
         try:
             if isinstance(image_data, bytes):
@@ -643,7 +648,7 @@ class OlmOCRService:
                 page_images = self._render_pdf_pages_to_png(image_bytes)
                 page_results = []
                 for index, page_image in enumerate(page_images, start=1):
-                    result = await self.extract_bank_statement_from_image(page_image, ocr_language=ocr_language)
+                    result = await self.extract_bank_statement_from_image(page_image, ocr_language=ocr_language, model=model)
                     result["page"] = index
                     page_results.append(result)
                 return self._merge_bank_statement_pages(page_results)
@@ -763,6 +768,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format=bank_statement_schema,
                     temperature=0,
+                    model=model,
                 )
             except Exception as structured_error:
                 error_text = str(structured_error).lower()
@@ -774,6 +780,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format={"type": "json_object"},
                     temperature=0,
+                    model=model,
                 )
 
             if not response.choices or not response.choices[0].message.content:
@@ -787,7 +794,7 @@ class OlmOCRService:
             logger.error(f"OlmOCR bank statement extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract bank statement: {str(e)}")
 
-    async def extract_invoice_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
+    async def extract_invoice_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> Dict[str, Any]:
         """Extract visible invoice fields and line items for review and export."""
         try:
             if isinstance(image_data, bytes):
@@ -799,7 +806,7 @@ class OlmOCRService:
             if self._is_pdf_bytes(image_bytes):
                 page_results = []
                 for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
-                    page_result = await self.extract_invoice_from_image(page_image, ocr_language=ocr_language)
+                    page_result = await self.extract_invoice_from_image(page_image, ocr_language=ocr_language, model=model)
                     page_result["page"] = page_number
                     page_results.append(page_result)
                 return self._merge_invoice_pages(page_results)
@@ -897,6 +904,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format=invoice_schema,
                     temperature=0,
+                    model=model,
                 )
             except Exception as structured_error:
                 error_text = str(structured_error).lower()
@@ -908,6 +916,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format={"type": "json_object"},
                     temperature=0,
+                    model=model,
                 )
 
             if not response.choices or not response.choices[0].message.content:
@@ -921,7 +930,7 @@ class OlmOCRService:
             logger.error(f"OlmOCR invoice extraction error: {str(e)}")
             raise OlmOCRError(f"Failed to extract invoice: {str(e)}")
 
-    async def extract_receipt_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en") -> Dict[str, Any]:
+    async def extract_receipt_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> Dict[str, Any]:
         """Extract visible receipt fields and line items for expense review."""
         try:
             if isinstance(image_data, bytes):
@@ -933,7 +942,7 @@ class OlmOCRService:
             if self._is_pdf_bytes(image_bytes):
                 page_results = []
                 for page_number, page_image in enumerate(self._render_pdf_pages_to_png(image_bytes), start=1):
-                    page_result = await self.extract_receipt_from_image(page_image, ocr_language=ocr_language)
+                    page_result = await self.extract_receipt_from_image(page_image, ocr_language=ocr_language, model=model)
                     page_result["page"] = page_number
                     page_results.append(page_result)
                 return self._merge_receipt_pages(page_results)
@@ -1029,6 +1038,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format=receipt_schema,
                     temperature=0,
+                    model=model,
                 )
             except Exception as structured_error:
                 error_text = str(structured_error).lower()
@@ -1040,6 +1050,7 @@ class OlmOCRService:
                     max_tokens=5000,
                     response_format={"type": "json_object"},
                     temperature=0,
+                    model=model,
                 )
 
             if not response.choices or not response.choices[0].message.content:
@@ -1633,6 +1644,7 @@ class OlmOCRService:
         max_tokens: Optional[int] = None,
         response_format: Optional[Dict[str, Any]] = None,
         temperature: Optional[float] = None,
+        model: Optional[str] = None,
     ) -> ChatCompletion:
         """
         Make the actual API call to OlmOCR.
@@ -1646,7 +1658,7 @@ class OlmOCRService:
         # Run the synchronous OpenAI call in a thread pool
         loop = asyncio.get_event_loop()
         request_options: Dict[str, Any] = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": messages,
             "max_tokens": max_tokens or self.max_tokens,
         }
