@@ -419,7 +419,7 @@ class SupabaseService:
             .select("*")\
             .eq("provider", provider)\
             .eq("user_id", user_id)\
-            .order("updated_at.desc")\
+            .order("updated_at", desc=True)\
             .limit(1)\
             .execute()
         return response.data[0] if response.data else None
@@ -772,7 +772,7 @@ class SupabaseService:
             response = self.client.table("job_files")\
                 .select("*")\
                 .eq("owner_session_id", session_id)\
-                .order("created_at.desc")\
+                .order("created_at", desc=True)\
                 .limit(limit)\
                 .execute()
             return [self._job_file_record_to_metadata(record) for record in (response.data or [])]
@@ -3938,7 +3938,7 @@ class SupabaseService:
             response = self.client.table("processing_jobs")\
                 .select("*")\
                 .eq("user_id", user_id)\
-                .order("created_at.desc")\
+                .order("created_at", desc=True)\
                 .limit(limit)\
                 .execute()
             return response.data
@@ -4017,7 +4017,7 @@ class SupabaseService:
             response = self.client.table("job_history")\
                 .select("*")\
                 .eq("user_id", user_id)\
-                .order("saved_at.desc")\
+                .order("saved_at", desc=True)\
                 .range(offset, offset + limit - 1)\
                 .execute()
             
@@ -4278,7 +4278,7 @@ class SupabaseService:
         try:
             result = self.client.table('share_sessions').select('*').eq(
                 'user_id', user_id
-            ).order('created_at.desc').execute()
+            ).order('created_at', desc=True).execute()
             
             return result.data or []
             
