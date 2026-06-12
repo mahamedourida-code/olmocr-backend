@@ -35,7 +35,7 @@ class OlmOCRService:
             self.client = OpenAI(
                 api_key=settings.olmocr_api_key,
                 base_url=settings.olmocr_base_url,
-                timeout=30.0,
+                timeout=settings.ocr_request_timeout,
                 max_retries=2
             )
         except Exception as e:

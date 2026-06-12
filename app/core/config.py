@@ -11,7 +11,19 @@ class Settings(BaseSettings):
     olmocr_api_key: str = Field(..., env="OLMOCR_API_KEY")
     olmocr_base_url: str = Field("https://api.deepinfra.com/v1/openai", env="OLMOCR_BASE_URL")
     olmocr_model: str = Field("google/gemma-3-4b-it", env="OLMOCR_MODEL")
-    
+    # Additional vision models the OCR pipeline load-balances across (comma-separated).
+    # Each page is routed round-robin to one of these (primary first) with failover to
+    # the others, so the per-model load is spread and batches finish faster.
+    ocr_models: Union[str, list] = Field(
+        "google/gemma-3-4b-it,meta-llama/Llama-3.2-11B-Vision-Instruct,Qwen/Qwen3-VL-30B-A3B-Instruct",
+        env="OCR_MODELS",
+    )
+    # How many *additional* models to try when a page fails on its primary model.
+    ocr_failover_attempts: int = Field(2, env="OCR_FAILOVER_ATTEMPTS")
+    # Per-call timeout (seconds) for a single vision-model request. Must exceed the
+    # slowest model's latency (Qwen3-VL-30B ≈ 35s) or it times out before responding.
+    ocr_request_timeout: float = Field(60.0, env="OCR_REQUEST_TIMEOUT")
+
     # Application Configuration
     environment: str = Field("development", env="ENVIRONMENT")
     debug: bool = Field(False, env="DEBUG")
@@ -378,7 +390,23 @@ class Settings(BaseSettings):
             origins = [origin.strip() for origin in self.allowed_origins.split(",")]
             return [origin for origin in origins if origin]  # Filter out empty strings
         return self.allowed_origins
-    
+
+    @property
+    def parsed_ocr_models(self) -> list:
+        """Vision models to load-balance OCR across — primary (olmocr_model) first, deduped."""
+        raw = self.ocr_models
+        if isinstance(raw, str):
+            models = [m.strip() for m in raw.split(",") if m.strip()]
+        else:
+            models = [str(m).strip() for m in (raw or []) if str(m).strip()]
+        ordered = [self.olmocr_model] + models
+        seen, result = set(), []
+        for model in ordered:
+            if model and model not in seen:
+                seen.add(model)
+                result.append(model)
+        return result or [self.olmocr_model]
+
     @property
     def parsed_cors_allow_methods(self) -> list:
         """Parse CORS allowed methods from environment variable or list."""

@@ -287,20 +287,49 @@ async def process_single_image_simple(
 
         # Extract with OlmOCR - pass base64 string directly.
         # No need to decode→encode, olmocr service handles both formats
-        holder_id = f"{job_id}:{image_id}:{uuid.uuid4().hex}"
-        acquired = await redis.acquire_distributed_semaphore(
-            name="deepinfra_ocr",
-            holder_id=holder_id,
-            limit=settings.max_concurrent_ocr_calls,
-            lease_seconds=300,
-            wait_timeout_seconds=300
-        )
-        if not acquired:
-            raise RuntimeError("OCR capacity is busy. Please retry shortly.")
+        # Multi-model OCR: each page is routed to a primary model (round-robin by
+        # index) and falls back to the other configured models on failure. Each
+        # model has its OWN distributed semaphore, so the model pools provide
+        # independent capacity (~N x the OCR slots) and one slow/overloaded model
+        # can't starve the whole batch into the task soft-time-limit.
+        ocr_models = settings.parsed_ocr_models or [None]
+        primary_model = ocr_models[img_index % len(ocr_models)]
+        model_order = [primary_model] + [m for m in ocr_models if m != primary_model]
+        max_model_attempts = min(len(model_order), 1 + max(0, settings.ocr_failover_attempts))
+
+        async def _ocr_call(make_coro, op_name):
+            """Run one OCR call with per-model semaphores and cross-model failover."""
+            last_exc = None
+            for attempt_model in model_order[:max_model_attempts]:
+                holder_id = f"{job_id}:{image_id}:{uuid.uuid4().hex}"
+                acquired = await redis.acquire_distributed_semaphore(
+                    name=f"deepinfra_ocr:{attempt_model}",
+                    holder_id=holder_id,
+                    limit=settings.max_concurrent_ocr_calls,
+                    lease_seconds=300,
+                    wait_timeout_seconds=120,
+                )
+                if not acquired:
+                    last_exc = RuntimeError(f"OCR capacity busy for model {attempt_model}")
+                    continue
+                try:
+                    return await make_coro(attempt_model)
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        f"[Job {job_id}] {op_name} failed on model {attempt_model} "
+                        f"for image {image_id}: {exc}"
+                    )
+                finally:
+                    await redis.release_distributed_semaphore(f"deepinfra_ocr:{attempt_model}", holder_id)
+            raise last_exc if last_exc else RuntimeError(f"{op_name} produced no result")
 
         try:
             if requested_document_mode == "auto":
-                classification_data = await olmocr.classify_document_from_image(image_data, ocr_language=ocr_language)
+                classification_data = await _ocr_call(
+                    lambda m: olmocr.classify_document_from_image(image_data, ocr_language=ocr_language, model=m),
+                    "classification",
+                )
                 suggested_mode = classification_data.get("document_type")
                 confidence = float(classification_data.get("confidence") or 0)
                 if (
@@ -379,19 +408,38 @@ async def process_single_image_simple(
             wants_notes = document_mode == 'notes'
 
             if wants_bank_statement:
-                bank_statement_data = await olmocr.extract_bank_statement_from_image(image_data, ocr_language=ocr_language)
+                bank_statement_data = await _ocr_call(
+                    lambda m: olmocr.extract_bank_statement_from_image(image_data, ocr_language=ocr_language, model=m),
+                    "bank_statement",
+                )
             elif wants_invoice:
-                invoice_data = await olmocr.extract_invoice_from_image(image_data, ocr_language=ocr_language)
+                invoice_data = await _ocr_call(
+                    lambda m: olmocr.extract_invoice_from_image(image_data, ocr_language=ocr_language, model=m),
+                    "invoice",
+                )
             elif wants_receipt:
-                receipt_data = await olmocr.extract_receipt_from_image(image_data, ocr_language=ocr_language)
+                receipt_data = await _ocr_call(
+                    lambda m: olmocr.extract_receipt_from_image(image_data, ocr_language=ocr_language, model=m),
+                    "receipt",
+                )
             elif wants_notes:
-                notes_data = await olmocr.extract_notes_from_image(image_data, ocr_language=ocr_language)
+                notes_data = await _ocr_call(
+                    lambda m: olmocr.extract_notes_from_image(image_data, ocr_language=ocr_language, model=m),
+                    "notes",
+                )
             elif wants_text_output:
-                text_data = await olmocr.extract_text_from_image(image_data, ocr_language=ocr_language)
+                text_data = await _ocr_call(
+                    lambda m: olmocr.extract_text_from_image(image_data, ocr_language=ocr_language, model=m),
+                    "text",
+                )
             else:
-                csv_data = await olmocr.extract_table_from_image(image_data, ocr_language=ocr_language)
+                csv_data = await _ocr_call(
+                    lambda m: olmocr.extract_table_from_image(image_data, ocr_language=ocr_language, model=m),
+                    "table",
+                )
         finally:
-            await redis.release_distributed_semaphore("deepinfra_ocr", holder_id)
+            # Per-model semaphores are acquired/released inside _ocr_call above.
+            pass
 
         # Generate filename
         original_filename = img.get('original_filename') or img.get('filename', f"image_{image_id}")
