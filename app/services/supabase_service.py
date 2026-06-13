@@ -3667,10 +3667,9 @@ class SupabaseService:
         actor: Dict[str, Any],
         reason: str = "user_requested",
     ) -> Dict[str, Any]:
-        """Permanently erase every durable document in one owned batch."""
+        """Permanently erase one owned batch — its durable documents (modern jobs)
+        or its legacy generated files (older jobs that predate the document model)."""
         documents = await self.get_job_documents(job_id)
-        if not documents:
-            raise ValueError("No stored documents found")
         deleted_file_ids: List[str] = []
         for document in documents:
             result = await self.delete_document_content(
@@ -3682,6 +3681,19 @@ class SupabaseService:
                 scrub_job=False,
             )
             deleted_file_ids.extend(result.get("deleted_file_ids") or [])
+
+        # Legacy batches (pre-document model) have no job_documents — erase any
+        # remaining generated files + their storage objects so nothing is orphaned,
+        # and so the batch can still be deleted instead of erroring "no documents".
+        legacy = self.client.table("job_files").select("file_id,storage_path").eq("job_id", job_id).execute()
+        legacy_rows = legacy.data or []
+        legacy_paths = [row.get("storage_path") for row in legacy_rows if row.get("storage_path")]
+        if legacy_paths:
+            await self._remove_storage_objects(legacy_paths)
+        if legacy_rows:
+            self.client.table("job_files").delete().eq("job_id", job_id).execute()
+            deleted_file_ids.extend(str(row.get("file_id")) for row in legacy_rows if row.get("file_id"))
+
         await self._scrub_job_after_content_deletion(
             job_id,
             deleted_documents=len(documents),
