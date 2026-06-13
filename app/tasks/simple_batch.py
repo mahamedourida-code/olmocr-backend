@@ -298,31 +298,39 @@ async def process_single_image_simple(
         max_model_attempts = min(len(model_order), 1 + max(0, settings.ocr_failover_attempts))
 
         async def _ocr_call(make_coro, op_name):
-            """Run one OCR call with per-model semaphores and cross-model failover."""
-            last_exc = None
-            for attempt_model in model_order[:max_model_attempts]:
-                holder_id = f"{job_id}:{image_id}:{uuid.uuid4().hex}"
-                acquired = await redis.acquire_distributed_semaphore(
-                    name=f"deepinfra_ocr:{attempt_model}",
-                    holder_id=holder_id,
-                    limit=settings.max_concurrent_ocr_calls,
-                    lease_seconds=300,
-                    wait_timeout_seconds=120,
-                )
-                if not acquired:
-                    last_exc = RuntimeError(f"OCR capacity busy for model {attempt_model}")
-                    continue
-                try:
-                    return await make_coro(attempt_model)
-                except Exception as exc:
-                    last_exc = exc
-                    logger.warning(
-                        f"[Job {job_id}] {op_name} failed on model {attempt_model} "
-                        f"for image {image_id}: {exc}"
-                    )
-                finally:
-                    await redis.release_distributed_semaphore(f"deepinfra_ocr:{attempt_model}", holder_id)
-            raise last_exc if last_exc else RuntimeError(f"{op_name} produced no result")
+            """One OCR call under a SINGLE global concurrency cap, then routed across
+            models with cross-model failover inside the held slot.
+
+            The cap is global (not per-model) on purpose: each concurrent OCR call
+            holds a decoded image + model response in memory, and the worker is only
+            512MB. Per-model semaphores multiplied total concurrency by the model
+            count and OOM-killed the Celery worker, so the slot count must stay = the
+            global cap regardless of how many models we round-robin across.
+            """
+            holder_id = f"{job_id}:{image_id}:{uuid.uuid4().hex}"
+            acquired = await redis.acquire_distributed_semaphore(
+                name="deepinfra_ocr",
+                holder_id=holder_id,
+                limit=settings.max_concurrent_ocr_calls,
+                lease_seconds=300,
+                wait_timeout_seconds=300,
+            )
+            if not acquired:
+                raise RuntimeError("OCR capacity is busy. Please retry shortly.")
+            try:
+                last_exc = None
+                for attempt_model in model_order[:max_model_attempts]:
+                    try:
+                        return await make_coro(attempt_model)
+                    except Exception as exc:
+                        last_exc = exc
+                        logger.warning(
+                            f"[Job {job_id}] {op_name} failed on model {attempt_model} "
+                            f"for image {image_id}: {exc}"
+                        )
+                raise last_exc if last_exc else RuntimeError(f"{op_name} produced no result")
+            finally:
+                await redis.release_distributed_semaphore("deepinfra_ocr", holder_id)
 
         try:
             if requested_document_mode == "auto":
