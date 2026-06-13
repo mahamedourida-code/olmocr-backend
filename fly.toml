@@ -82,7 +82,7 @@ primary_region = 'arn'
   REDOC_URL = '/redoc'
   SUPABASE_STORAGE_BUCKET = 'jobs'
   TEMP_STORAGE_PATH = '/app/temp_storage'
-  WORKER_CONCURRENCY = '4'
+  WORKER_CONCURRENCY = '3'
 
 [processes]
   app = 'python start.py'
@@ -116,6 +116,6 @@ primary_region = 'arn'
 
 [[vm]]
   processes = ['worker']
-  memory = '512mb'
+  memory = '1024mb'
   cpu_kind = 'shared'
   cpus = 1
