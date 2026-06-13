@@ -450,6 +450,21 @@ async def get_latest_recoverable_job(
     supabase_service = get_supabase_service()
     owner_id = user["user_id"] if user else f"session:{session.session_id}"
     records = await supabase_service.get_user_jobs(owner_id, limit=max(1, min(limit, 25)))
+    # Time out any stale active jobs first, so the "resume batch" banner never
+    # offers a dead one whose worker died (mirrors the watchdog in get_job_status).
+    for record in records:
+        if str(record.get("status") or "").lower() in ACTIVE_JOB_STATUSES:
+            metadata = _parse_metadata(record.get("processing_metadata"))
+            reaped = await _reap_stale_active_job(
+                record.get("id"),
+                {
+                    "status": record.get("status"),
+                    "updated_at": record.get("updated_at") or record.get("created_at"),
+                    "total_images": metadata.get("total_images"),
+                },
+                supabase_service,
+            )
+            record["status"] = reaped.get("status", record.get("status"))
     summaries = [_job_record_summary(record) for record in records]
     summaries = [job for job in summaries if job.get("job_id")]
 
