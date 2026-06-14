@@ -23,6 +23,8 @@ class JobProgress(BaseModel):
     processed_images: int = Field(..., description="Number of images processed so far")
     current_image: Optional[str] = Field(None, description="Currently processing image filename")
     percentage: float = Field(..., description="Completion percentage")
+    stage: Optional[str] = Field(None, description="Current processing stage")
+    stage_message: Optional[str] = Field(None, description="Human-readable processing stage")
 
 
 class ProcessedFile(BaseModel):

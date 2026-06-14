@@ -36,7 +36,7 @@ class OlmOCRService:
                 api_key=settings.olmocr_api_key,
                 base_url=settings.olmocr_base_url,
                 timeout=settings.ocr_request_timeout,
-                max_retries=2
+                max_retries=settings.ocr_client_max_retries
             )
         except Exception as e:
             logger.error(f"Failed to initialize OpenAI client: {e}")

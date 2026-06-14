@@ -22,7 +22,8 @@ class Settings(BaseSettings):
     ocr_failover_attempts: int = Field(2, env="OCR_FAILOVER_ATTEMPTS")
     # Per-call timeout (seconds) for a single vision-model request. Must exceed the
     # slowest model's latency (Qwen3-VL-30B ≈ 35s) or it times out before responding.
-    ocr_request_timeout: float = Field(60.0, env="OCR_REQUEST_TIMEOUT")
+    ocr_request_timeout: float = Field(45.0, env="OCR_REQUEST_TIMEOUT")
+    ocr_client_max_retries: int = Field(0, env="OCR_CLIENT_MAX_RETRIES")
 
     # Application Configuration
     environment: str = Field("development", env="ENVIRONMENT")

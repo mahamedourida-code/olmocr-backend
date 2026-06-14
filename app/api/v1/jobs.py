@@ -674,7 +674,6 @@ async def create_batch_job(
                 for stored_image in stored_images
             ],
         )
-        await refresh_uploaded_duplicate_warnings(supabase_service, document_records)
         logger.info(f"Created durable Supabase job {job_id} for owner {durable_owner_id}")
         
         # Store job in Redis
@@ -1099,7 +1098,6 @@ async def create_batch_job_multipart(
             document_records,
             [{**stored_image, "job_id": job_id} for stored_image in stored_images],
         )
-        await refresh_uploaded_duplicate_warnings(supabase_service, document_records)
         logger.info(f"Created durable Supabase job {job_id} for owner {durable_owner_id}")
 
         # Store job in Redis
@@ -1411,7 +1409,9 @@ async def get_job_status(
             total_images=total_images,
             processed_images=processed_images,
             current_image=job_data.get('current_image'),
-            percentage=int(job_data.get('progress', 0))
+            percentage=int(job_data.get('progress', 0)),
+            stage=job_data.get('stage'),
+            stage_message=job_data.get('stage_message')
         )
     
     # Build results info

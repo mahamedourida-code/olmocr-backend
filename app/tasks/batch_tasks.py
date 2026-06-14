@@ -357,6 +357,8 @@ async def _prepare_storage_batch_async(
         'progress': int((len(existing_files) / total_images) * 100) if total_images else 0,
         'processed_images': len(existing_files),
         'total_images': total_images,
+        'stage': 'queued',
+        'stage_message': 'Preparing files for extraction',
         'updated_at': datetime.utcnow().isoformat()
     })
 
@@ -376,6 +378,16 @@ async def _prepare_storage_batch_async(
                 'owner_session_id': None if user_id else session_id
             }
         )
+        seen_document_ids = set()
+        for image_info in stored_images:
+            document_id = image_info.get("document_id")
+            if not document_id or document_id in seen_document_ids:
+                continue
+            seen_document_ids.add(document_id)
+            try:
+                await supabase.refresh_document_duplicate_warnings(job_id, document_id)
+            except Exception as duplicate_error:
+                logger.debug(f"[Job {job_id}] Duplicate warning refresh failed for {document_id}: {duplicate_error}")
     except Exception as e:
         logger.warning(f"[Job {job_id}] Failed to mark storage batch as processing in Supabase: {e}")
 

@@ -34,6 +34,8 @@ class JobProgressUpdate(WebSocketMessage):
     total_images: int = Field(..., ge=0, description="Total number of images to process")
     processed_images: int = Field(..., ge=0, description="Number of images processed")
     current_image: Optional[str] = Field(None, description="Currently processing image")
+    stage: Optional[str] = Field(None, description="Current processing stage")
+    stage_message: Optional[str] = Field(None, description="Human-readable processing stage")
     processing_time: Optional[float] = Field(None, description="Processing time in seconds")
     estimated_completion: Optional[datetime] = Field(None, description="Estimated completion time")
 

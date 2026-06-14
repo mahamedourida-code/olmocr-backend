@@ -869,6 +869,8 @@ class RedisService:
                     total_images=total_images,
                     processed_images=processed_images,
                     current_image=job_data.get('current_image'),
+                    stage=job_data.get('stage'),
+                    stage_message=job_data.get('stage_message'),
                     processing_time=processing_time,
                     session_id=session_id
                 )

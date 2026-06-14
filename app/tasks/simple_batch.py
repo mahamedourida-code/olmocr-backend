@@ -284,6 +284,24 @@ async def process_single_image_simple(
         ocr_language = str(img.get('ocr_language') or 'en').strip().lower()[:16] or 'en'
         document_mode = requested_document_mode
         classification_data = None
+        single_file_progress = total_images == 1
+
+        async def _publish_single_file_stage(stage: str, stage_progress: int, stage_message: str) -> None:
+            if not single_file_progress:
+                return
+            try:
+                await redis.update_job(job_id, {
+                    'status': 'processing',
+                    'progress': min(99, max(0, stage_progress)),
+                    'processed_images': 0,
+                    'total_images': total_images,
+                    'current_image': image_id,
+                    'stage': stage,
+                    'stage_message': stage_message,
+                    'updated_at': datetime.utcnow().isoformat(),
+                })
+            except Exception as progress_error:
+                logger.debug(f"[Job {job_id}] Failed to publish {stage} stage: {progress_error}")
 
         # Extract with OlmOCR - pass base64 string directly.
         # No need to decode→encode, olmocr service handles both formats
@@ -333,7 +351,17 @@ async def process_single_image_simple(
                 await redis.release_distributed_semaphore("deepinfra_ocr", holder_id)
 
         try:
+            await _publish_single_file_stage(
+                "reading",
+                8,
+                "Reading the uploaded document",
+            )
             if requested_document_mode == "auto":
+                await _publish_single_file_stage(
+                    "classifying",
+                    18,
+                    "Detecting the document type",
+                )
                 classification_data = await _ocr_call(
                     lambda m: olmocr.classify_document_from_image(image_data, ocr_language=ocr_language, model=m),
                     "classification",
@@ -368,6 +396,11 @@ async def process_single_image_simple(
                     )
 
                 if document_mode == "needs_manual_selection":
+                    await _publish_single_file_stage(
+                        "needs_review",
+                        95,
+                        "Waiting for a document type selection",
+                    )
                     review_flags = [{
                         "code": "classification_needs_review",
                         "area": "document_mode",
@@ -407,6 +440,12 @@ async def process_single_image_simple(
                         "classification": classification_data,
                     }
 
+            extractor_label = document_mode.replace("_", " ")
+            await _publish_single_file_stage(
+                "extracting",
+                45 if requested_document_mode == "auto" else 30,
+                f"Extracting {extractor_label} data",
+            )
             if document_mode == 'table' and output_format in {'txt', 'text', 'plain_text'}:
                 output_format = 'xlsx'
             wants_text_output = output_format in {'txt', 'text', 'plain_text'}
@@ -448,6 +487,12 @@ async def process_single_image_simple(
         finally:
             # Per-model semaphores are acquired/released inside _ocr_call above.
             pass
+
+        await _publish_single_file_stage(
+            "exporting",
+            82,
+            "Preparing the review file",
+        )
 
         # Generate filename
         original_filename = img.get('original_filename') or img.get('filename', f"image_{image_id}")
