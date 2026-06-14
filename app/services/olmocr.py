@@ -416,9 +416,10 @@ class OlmOCRService:
                                 "Classify this uploaded document for extraction routing only. "
                                 "Choose exactly one document_type: invoice, receipt, bank_statement, table, notes, "
                                 "or needs_manual_selection. Use invoice only for supplier bills with invoice fields; "
-                                "receipt only for proof of purchase; bank_statement only for bank account transaction statements; "
+                                "receipt for proof of purchase, point-of-sale receipts, restaurant receipts, and card slips, "
+                                "even when some fields are small or partly cropped; bank_statement only for bank account transaction statements; "
                                 "table for a visible grid/list intended as rows and columns; notes for narrative handwriting or prose. "
-                                "If the image is unclear, mixed, or could be routed incorrectly, choose needs_manual_selection. "
+                                "Only choose needs_manual_selection when the document type is genuinely impossible to determine. "
                                 "confidence must be between 0 and 1. review_reason must briefly explain uncertainty or be empty "
                                 "when the type is clear. Do not extract fields and do not infer accounting treatment."
                                 + language_instruction
@@ -979,10 +980,18 @@ class OlmOCRService:
                         {
                             "type": "text",
                             "text": (
-                                "Extract only visible receipt data for human expense review. "
-                                "Do not infer missing values, categorize expenses, create bills, or calculate missing totals. "
-                                "Return JSON matching the supplied schema. Use empty strings when fields are not visible. "
-                                "Preserve visible number and date formatting. For line_items, include one item per visible receipt row."
+                                "Read the receipt image, then extract every visible receipt field for human expense review. "
+                                "Prefer a partial result over empty fields: if a merchant, date, payment method, subtotal, tax, "
+                                "total, currency, or item row is visible, include it. Do not infer missing values, categorize "
+                                "expenses, create bills, or calculate missing totals. Merchant can be the store, restaurant, "
+                                "retailer, supplier, or seller name. Payment method can be card, cash, tender type, or visible "
+                                "card brand/last digits. Tax can appear as tax, VAT, GST, HST, sales tax, or service tax. "
+                                "Total can appear as total, amount paid, amount due, balance, or grand total. Currency can be "
+                                "a symbol or code. Preserve visible number and date formatting. Put the best plain OCR text "
+                                "you can read in raw_text. Return JSON with keys merchant, date, payment_method, currency, "
+                                "subtotal, tax_vat_amount, total, discount, tip, raw_text, review_notes, and line_items. "
+                                "Each line_items row should use description, quantity, unit_price, tax_rate, and line_total. "
+                                "Use empty strings only for fields that are not visible."
                                 + language_instruction
                             )
                         }
@@ -993,7 +1002,7 @@ class OlmOCRService:
                 "type": "json_schema",
                 "json_schema": {
                     "name": "receipt_extraction",
-                    "strict": True,
+                    "strict": False,
                     "schema": {
                         "type": "object",
                         "properties": {
@@ -1006,6 +1015,8 @@ class OlmOCRService:
                             "total": {"type": "string"},
                             "discount": {"type": "string"},
                             "tip": {"type": "string"},
+                            "raw_text": {"type": "string"},
+                            "review_notes": {"type": "array", "items": {"type": "string"}},
                             "line_items": {
                                 "type": "array",
                                 "items": {
@@ -1024,9 +1035,10 @@ class OlmOCRService:
                         },
                         "required": [
                             "merchant", "date", "payment_method", "currency", "subtotal",
-                            "tax_vat_amount", "total", "discount", "tip", "line_items",
+                            "tax_vat_amount", "total", "discount", "tip", "raw_text",
+                            "review_notes", "line_items",
                         ],
-                        "additionalProperties": False,
+                        "additionalProperties": True,
                     },
                 },
             }
@@ -1546,32 +1558,160 @@ class OlmOCRService:
             else:
                 parse_failed = True
 
+        def normalize_key(value: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", value.lower())
+
+        def scalar(value: Any) -> str:
+            if value in (None, "") or isinstance(value, (dict, list)):
+                return ""
+            return str(value).strip()
+
+        candidates: List[Dict[str, Any]] = []
+
+        def add_candidate(value: Any) -> None:
+            if isinstance(value, dict) and value not in candidates:
+                candidates.append(value)
+
+        add_candidate(parsed)
+        for key in ("receipt", "data", "result", "summary", "expense", "document", "extraction"):
+            add_candidate(parsed.get(key))
+        for key in ("receipts", "documents"):
+            nested_list = parsed.get(key)
+            if isinstance(nested_list, list):
+                for item in nested_list:
+                    add_candidate(item)
+
+        field_entries: List[Dict[str, Any]] = []
+        for source in candidates:
+            fields = source.get("fields")
+            if isinstance(fields, dict):
+                field_entries.extend({"label": key, "value": value} for key, value in fields.items())
+            elif isinstance(fields, list):
+                for entry in fields:
+                    if not isinstance(entry, dict):
+                        continue
+                    label = entry.get("name") or entry.get("label") or entry.get("field") or entry.get("key")
+                    value = entry.get("value") or entry.get("text") or entry.get("content")
+                    if label:
+                        field_entries.append({"label": label, "value": value})
+
+        def first_value(aliases: List[str]) -> str:
+            alias_keys = {normalize_key(alias) for alias in aliases}
+            for source in candidates:
+                for key, value in source.items():
+                    if normalize_key(str(key)) in alias_keys:
+                        text = scalar(value)
+                        if text:
+                            return text
+            for entry in field_entries:
+                label = normalize_key(str(entry.get("label") or ""))
+                if label in alias_keys or any(alias in label or label in alias for alias in alias_keys):
+                    text = scalar(entry.get("value"))
+                    if text:
+                        return text
+            return ""
+
         field_aliases = {
-            "merchant": ["merchant", "merchant_name", "vendor_name", "vendor", "store_name"],
-            "date": ["date", "receipt_date", "transaction_date"],
-            "payment_method": ["payment_method", "payment", "tender"],
-            "currency": ["currency"],
-            "subtotal": ["subtotal", "sub_total"],
-            "tax_vat_amount": ["tax_vat_amount", "tax_amount", "vat_amount", "tax"],
-            "total": ["total", "grand_total", "receipt_total"],
-            "discount": ["discount", "discount_amount"],
-            "tip": ["tip", "tip_amount", "gratuity"],
+            "merchant": [
+                "merchant", "merchant_name", "vendor_name", "vendor", "store_name", "store",
+                "business_name", "supplier", "seller", "retailer", "restaurant", "shop",
+            ],
+            "date": ["date", "receipt_date", "transaction_date", "purchase_date", "transaction_datetime", "datetime"],
+            "payment_method": [
+                "payment_method", "payment", "tender", "tender_type", "payment_type", "paid_by",
+                "card", "card_type", "card_brand", "payment_card",
+            ],
+            "currency": ["currency", "currency_code", "currency_symbol"],
+            "subtotal": ["subtotal", "sub_total", "sub_total_amount", "net", "net_amount", "before_tax"],
+            "tax_vat_amount": [
+                "tax_vat_amount", "tax_amount", "vat_amount", "tax", "vat", "gst", "hst",
+                "sales_tax", "service_tax", "tax_total", "taxes",
+            ],
+            "total": [
+                "total", "grand_total", "receipt_total", "total_amount", "amount", "amount_paid",
+                "amount_due", "balance", "balance_due", "paid", "grand_total_amount",
+            ],
+            "discount": ["discount", "discount_amount", "savings"],
+            "tip": ["tip", "tip_amount", "gratuity", "service_charge"],
         }
-        normalized = {
-            field: next((str(parsed.get(alias) or "").strip() for alias in aliases if parsed.get(alias) not in (None, "")), "")
-            for field, aliases in field_aliases.items()
-        }
+        normalized = {field: first_value(aliases) for field, aliases in field_aliases.items()}
+
+        raw_text = first_value(["raw_text", "ocr_text", "full_text", "receipt_text", "text", "content"])
+        if not raw_text and parse_failed:
+            raw_text = content.strip()
+        normalized["raw_text"] = raw_text
+
+        review_notes: List[str] = []
+        for source in candidates:
+            notes = source.get("review_notes") or source.get("notes") or source.get("warnings")
+            if isinstance(notes, list):
+                review_notes.extend(str(note).strip() for note in notes if str(note).strip())
+            elif scalar(notes):
+                review_notes.append(scalar(notes))
+        normalized["review_notes"] = review_notes
+
         normalized["line_items"] = []
-        for row in parsed.get("line_items") or []:
+        line_item_keys = {normalize_key(key) for key in ("line_items", "items", "products", "purchases", "charges", "rows", "entries")}
+        line_rows: List[Any] = []
+        for source in candidates:
+            for key, value in source.items():
+                if normalize_key(str(key)) in line_item_keys and isinstance(value, list):
+                    line_rows = value
+                    break
+            if line_rows:
+                break
+
+        def row_value(row: Dict[str, Any], aliases: List[str]) -> str:
+            alias_keys = {normalize_key(alias) for alias in aliases}
+            for key, value in row.items():
+                if normalize_key(str(key)) in alias_keys:
+                    text = scalar(value)
+                    if text:
+                        return text
+            return ""
+
+        for row in line_rows:
             if not isinstance(row, dict):
                 continue
             normalized["line_items"].append({
-                "description": str(row.get("description") or "").strip(),
-                "quantity": str(row.get("quantity") or "").strip(),
-                "unit_price": str(row.get("unit_price") or "").strip(),
-                "tax_rate": str(row.get("tax_rate") or row.get("tax") or "").strip(),
-                "line_total": str(row.get("line_total") or row.get("total") or "").strip(),
+                "description": row_value(row, ["description", "item", "name", "label", "product", "details", "line_description"]),
+                "quantity": row_value(row, ["quantity", "qty", "count"]),
+                "unit_price": row_value(row, ["unit_price", "price", "rate", "unit_cost"]),
+                "tax_rate": row_value(row, ["tax_rate", "tax", "vat", "gst", "hst"]),
+                "line_total": row_value(row, ["line_total", "total", "amount", "price", "total_price", "extended_price"]),
             })
+
+        if raw_text:
+            def labeled_amount(labels: List[str]) -> str:
+                for line in raw_text.splitlines():
+                    line_lower = line.lower()
+                    if any(label in line_lower for label in labels):
+                        matches = re.findall(r"[$\u20ac\u00a3]?\s*-?\d[\d,]*(?:[.,]\d{1,2})?", line)
+                        if matches:
+                            return matches[-1].strip()
+                return ""
+
+            normalized["subtotal"] = normalized["subtotal"] or labeled_amount(["subtotal", "sub total", "net"])
+            normalized["tax_vat_amount"] = normalized["tax_vat_amount"] or labeled_amount(["tax", "vat", "gst", "hst"])
+            normalized["total"] = normalized["total"] or labeled_amount(["total", "amount paid", "amount due", "balance"])
+            if not normalized["date"]:
+                date_match = re.search(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b", raw_text)
+                normalized["date"] = date_match.group(0) if date_match else ""
+            if not normalized["currency"]:
+                if "$" in raw_text:
+                    normalized["currency"] = "$"
+                elif "\u20ac" in raw_text:
+                    normalized["currency"] = "EUR"
+                elif "\u00a3" in raw_text:
+                    normalized["currency"] = "GBP"
+            if not normalized["merchant"]:
+                excluded = ("total", "subtotal", "tax", "vat", "visa", "mastercard", "cash", "change", "date", "time", "receipt")
+                for line in raw_text.splitlines()[:8]:
+                    candidate = line.strip()
+                    if 2 < len(candidate) < 80 and re.search(r"[A-Za-z]", candidate) and not any(term in candidate.lower() for term in excluded):
+                        normalized["merchant"] = candidate
+                        break
+
         normalized["review_flags"] = self._validate_receipt_data(normalized)
         if parse_failed:
             normalized["review_flags"].append({

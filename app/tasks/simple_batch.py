@@ -368,10 +368,12 @@ async def process_single_image_simple(
                 )
                 suggested_mode = classification_data.get("document_type")
                 confidence = float(classification_data.get("confidence") or 0)
+                low_confidence = confidence < settings.auto_detection_confidence_threshold
+                allow_low_confidence_receipt = suggested_mode == "receipt"
                 if (
                     (source_page_count or 0) > 1
                     or suggested_mode == "needs_manual_selection"
-                    or confidence < settings.auto_detection_confidence_threshold
+                    or (low_confidence and not allow_low_confidence_receipt)
                 ):
                     if suggested_mode != "needs_manual_selection":
                         classification_data["suggested_type"] = suggested_mode
@@ -623,6 +625,21 @@ async def process_single_image_simple(
             if wants_notes and isinstance(notes_data, dict)
             else []
         )
+        if (
+            requested_document_mode == "auto"
+            and classification_data
+            and classification_data.get("document_type") == "receipt"
+            and float(classification_data.get("confidence") or 0) < settings.auto_detection_confidence_threshold
+        ):
+            review_flags = [
+                *review_flags,
+                {
+                    "code": "classification_low_confidence",
+                    "area": "document_mode",
+                    "note": classification_data.get("review_reason")
+                    or "Auto-detected receipt confidence is low; verify the extracted fields.",
+                },
+            ]
         requires_review = bool(review_flags)
         structured_data = (
             bank_statement_data
