@@ -120,6 +120,18 @@ def _parse_metadata(metadata: Any) -> Dict[str, Any]:
     return {}
 
 
+def _job_is_deleted(job: Dict[str, Any]) -> bool:
+    """A batch whose stored content was deleted must never resurface in history.
+
+    Treats both a hard ``status == "deleted"`` marker and the
+    ``stored_content_deleted`` metadata flag as deleted, so legacy rows or a
+    partially-completed deletion can never reappear in the history/recent lists.
+    """
+    if str(job.get("status") or "").lower() == "deleted":
+        return True
+    return bool(_parse_metadata(job.get("processing_metadata")).get("stored_content_deleted"))
+
+
 ACTIVE_JOB_STATUSES = {"queued", "processing"}
 SUPPORTED_DOCUMENT_MODES = {
     "auto",
@@ -2247,6 +2259,11 @@ async def get_job_history(
 
         # Get user's jobs from Supabase (already sorted by created_at desc)
         all_jobs = await supabase_service.get_user_jobs(user['user_id'], limit=limit + offset)
+
+        # Deleted batches must never reappear here — the list is the source of
+        # truth. Exclude hard-delete remnants and any row still carrying a
+        # deleted marker before paginating so totals stay consistent.
+        all_jobs = [job for job in all_jobs if not _job_is_deleted(job)]
 
         # Apply offset
         jobs = all_jobs[offset:offset + limit]

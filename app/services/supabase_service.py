@@ -3553,6 +3553,13 @@ class SupabaseService:
         if not job:
             return
         if all_documents_deleted:
+            # Mark the batch deleted FIRST so it is excluded from history/recent
+            # lists even if the physical row removal below is interrupted, then
+            # hard-delete the row. This makes "deleted" durable, not best-effort.
+            self.client.table("processing_jobs").update({
+                "status": "deleted",
+                "updated_at": datetime.utcnow().isoformat(),
+            }).eq("id", job_id).execute()
             self.client.table("processing_jobs").delete().eq("id", job_id).execute()
             return
 
