@@ -940,6 +940,31 @@ class SupabaseService:
         return reviewed_data
 
     @staticmethod
+    def _with_review_grid(data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = copy.deepcopy(data)
+        csv_content = normalized.get("csv")
+        if isinstance(csv_content, str) and "review_grid" not in normalized:
+            normalized["review_grid"] = [
+                row
+                for row in csv.reader(io.StringIO(csv_content))
+                if any(str(cell).strip() for cell in row)
+            ]
+        return normalized
+
+    def _reviewable_extraction(self, extraction: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(extraction)
+        normalized["reviewed_data"] = self._initial_review_data(normalized)
+        raw_structured_data = normalized.get("raw_structured_data")
+        if isinstance(raw_structured_data, dict):
+            normalized["raw_structured_data"] = self._with_review_grid(raw_structured_data)
+        elif isinstance(normalized.get("structured_data"), dict):
+            normalized["raw_structured_data"] = self._with_review_grid(normalized.get("structured_data"))
+        return normalized
+
+    @staticmethod
     def _document_metadata(document: Dict[str, Any]) -> Dict[str, Any]:
         metadata = document.get("metadata") or {}
         if isinstance(metadata, dict):
@@ -3014,7 +3039,9 @@ class SupabaseService:
             .execute()
         extractions_by_document: Dict[str, List[Dict[str, Any]]] = {}
         for extraction in extraction_response.data or []:
-            extractions_by_document.setdefault(extraction["document_id"], []).append(extraction)
+            extractions_by_document.setdefault(extraction["document_id"], []).append(
+                self._reviewable_extraction(extraction)
+            )
         return [
             {**peer, "extractions": extractions_by_document.get(peer["id"], [])}
             for peer in peers
@@ -3468,7 +3495,9 @@ class SupabaseService:
 
         extractions_by_document: Dict[str, List[Dict[str, Any]]] = {}
         for extraction in extraction_response.data or []:
-            extractions_by_document.setdefault(extraction["document_id"], []).append(extraction)
+            extractions_by_document.setdefault(extraction["document_id"], []).append(
+                self._reviewable_extraction(extraction)
+            )
 
         files_by_document: Dict[str, List[Dict[str, Any]]] = {}
         for record in file_response.data or []:

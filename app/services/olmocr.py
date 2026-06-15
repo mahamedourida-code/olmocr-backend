@@ -1,5 +1,6 @@
 import base64
 import asyncio
+import csv
 import logging
 import time
 import random
@@ -252,8 +253,14 @@ class OlmOCRService:
                         },
                         {
                             "type": "text",
-                            "text": "Attached is one page of a document that you must process. Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown."
-                                    "Return your output as markdown." + language_instruction
+                            "text": (
+                                "Attached is one page of a document that you must process as a table. "
+                                "Return only the best structured table you can read. Preserve the visible row labels, "
+                                "column labels, amounts, dates, signs, and hierarchy. Do not summarize, explain, or add prose. "
+                                "Use an empty cell when a value is unclear. Prefer one markdown table; if there are multiple "
+                                "tables, return them one after another separated by one blank line. Do not say you are unable "
+                                "to extract the table unless there is no readable table at all. Return markdown table content only."
+                            ) + language_instruction
                         }
                     ]
                 }
@@ -274,16 +281,20 @@ class OlmOCRService:
             # Clean the response (remove code blocks, etc.)
             cleaned_content = self._clean_ocr_response(raw_content)
 
-            # Check if response contains HTML table format
-            if '<table' in cleaned_content.lower() or '<tr' in cleaned_content.lower():
-                logger.info("Detected HTML table format in response, converting to CSV")
-                table_content = self._parse_html_table(cleaned_content)
+            json_csv_content = self._extract_csv_from_json_response(cleaned_content)
+            if self._validate_csv_content(json_csv_content):
+                csv_content = json_csv_content
             else:
-                # Extract table data from markdown response
-                table_content = self._extract_csv_from_response(cleaned_content)
-            
-            # Convert to CSV format (handles both pipe-separated and structured data)
-            csv_content = self._convert_pipe_to_csv(table_content)
+                # Check if response contains HTML table format
+                if '<table' in cleaned_content.lower() or '<tr' in cleaned_content.lower():
+                    logger.info("Detected HTML table format in response, converting to CSV")
+                    table_content = self._parse_html_table(cleaned_content)
+                else:
+                    # Extract table data from markdown response
+                    table_content = self._extract_csv_from_response(cleaned_content)
+
+                # Convert to CSV format (handles both pipe-separated and structured data)
+                csv_content = self._convert_pipe_to_csv(table_content)
             
             # Validate that we got meaningful content
             if not self._validate_csv_content(csv_content):
@@ -1903,6 +1914,111 @@ class OlmOCRService:
             content = '\n'.join(lines)
 
         return content
+
+    @staticmethod
+    def _stringify_table_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value).strip()
+
+    @classmethod
+    def _rows_to_csv(cls, rows: List[List[Any]]) -> str:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        for row in rows:
+            writer.writerow([cls._stringify_table_cell(cell) for cell in row])
+        return output.getvalue().strip()
+
+    def _extract_json_candidate(self, content: str) -> Optional[Any]:
+        if not content:
+            return None
+
+        candidates = [content.strip()]
+        candidates.extend(
+            match.strip()
+            for match in re.findall(r"```(?:json)?\s*(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
+            if match.strip()
+        )
+
+        starts = [index for index in (content.find("{"), content.find("[")) if index >= 0]
+        if starts:
+            start = min(starts)
+            for end_char in ("}", "]"):
+                end = content.rfind(end_char)
+                if end > start:
+                    candidates.append(content[start:end + 1].strip())
+
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except (TypeError, json.JSONDecodeError):
+                continue
+        return None
+
+    def _json_table_rows(self, payload: Any) -> List[List[Any]]:
+        if isinstance(payload, dict):
+            tables = payload.get("tables")
+            if isinstance(tables, list):
+                combined: List[List[Any]] = []
+                for table in tables:
+                    rows = self._json_table_rows(table)
+                    if rows:
+                        combined.extend(rows)
+                return combined
+
+            table = payload.get("table")
+            if isinstance(table, (dict, list)):
+                return self._json_table_rows(table)
+
+            columns = payload.get("columns") or payload.get("headers")
+            rows = payload.get("rows") or payload.get("data")
+            if isinstance(rows, list):
+                normalized: List[List[Any]] = []
+                column_names = [self._stringify_table_cell(column) for column in columns] if isinstance(columns, list) else []
+                if column_names:
+                    normalized.append(column_names)
+                for row in rows:
+                    if isinstance(row, dict):
+                        keys = column_names or list(row.keys())
+                        normalized.append([row.get(key, "") for key in keys])
+                    elif isinstance(row, list):
+                        normalized.append(row)
+                    elif row is not None:
+                        normalized.append([row])
+                return normalized
+
+            dict_values = [value for value in payload.values() if isinstance(value, list)]
+            if len(dict_values) == 1:
+                return self._json_table_rows(dict_values[0])
+
+        if isinstance(payload, list):
+            if not payload:
+                return []
+            if all(isinstance(row, dict) for row in payload):
+                columns: List[str] = []
+                for row in payload:
+                    for key in row.keys():
+                        if key not in columns:
+                            columns.append(key)
+                return [columns] + [[row.get(column, "") for column in columns] for row in payload]
+            if all(isinstance(row, list) for row in payload):
+                return payload
+            return [[item] for item in payload if item is not None]
+
+        return []
+
+    def _extract_csv_from_json_response(self, content: str) -> str:
+        payload = self._extract_json_candidate(content)
+        if payload is None:
+            return ""
+
+        rows = self._json_table_rows(payload)
+        rows = [row for row in rows if any(self._stringify_table_cell(cell) for cell in row)]
+        if not rows:
+            return ""
+        return self._rows_to_csv(rows)
     
     def _extract_csv_from_response(self, content: str) -> str:
         """
@@ -2097,7 +2213,7 @@ class OlmOCRService:
             return ""
         
         lines = content.strip().split('\n')
-        csv_lines = []
+        rows: List[List[Any]] = []
         max_columns = 0
         
         # First pass: detect if we have pipe-separated content
@@ -2123,26 +2239,12 @@ class OlmOCRService:
                     # Split by pipes and clean each cell
                     cells = [cell.strip() for cell in line.split('|')]
                     max_columns = max(max_columns, len(cells))
-                    
-                    # Convert to CSV format
-                    csv_cells = []
-                    for cell in cells:
-                        # Handle empty cells
-                        if not cell:
-                            csv_cells.append('')
-                        elif ',' in cell or '"' in cell or '\n' in cell:
-                            # Escape quotes and wrap in quotes
-                            cell = '"' + cell.replace('"', '""') + '"'
-                            csv_cells.append(cell)
-                        else:
-                            csv_cells.append(cell)
-                    
-                    csv_lines.append(','.join(csv_cells))
+                    rows.append(cells)
                 else:
                     # Line without pipes in a table context - treat as single column continuation
-                    if line and csv_lines:
+                    if line and rows:
                         # Append to the last cell of the previous row
-                        csv_lines[-1] += ' ' + line
+                        rows[-1][-1] = f"{rows[-1][-1]} {line}".strip()
         else:
             # No pipes found - process as structured data
             # This handles cases where handwritten data might not have clear delimiters
@@ -2150,23 +2252,23 @@ class OlmOCRService:
                 line = line.strip()
                 if line:
                     # Try to detect natural column separators (multiple spaces, tabs)
-                    import re
                     if '  ' in line or '\t' in line:
-                        # Replace multiple spaces/tabs with comma
-                        line = re.sub(r'\s{2,}|\t+', ',', line)
-                    csv_lines.append(line)
+                        rows.append([cell.strip() for cell in re.split(r'\s{2,}|\t+', line) if cell.strip()])
+                    elif ',' in line:
+                        rows.append(next(csv.reader([line])))
+                    else:
+                        rows.append([line])
         
         # Ensure all rows have the same number of columns if we detected a table
-        if max_columns > 1 and csv_lines:
-            normalized_lines = []
-            for line in csv_lines:
-                parts = line.split(',')
+        if max_columns > 1 and rows:
+            normalized_rows = []
+            for parts in rows:
                 while len(parts) < max_columns:
                     parts.append('')
-                normalized_lines.append(','.join(parts[:max_columns]))
-            return '\n'.join(normalized_lines)
+                normalized_rows.append(parts[:max_columns])
+            return self._rows_to_csv(normalized_rows)
         
-        return '\n'.join(csv_lines)
+        return self._rows_to_csv(rows)
     
     async def process_batch_images(
         self, 

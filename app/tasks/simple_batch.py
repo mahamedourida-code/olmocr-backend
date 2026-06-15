@@ -6,6 +6,8 @@ No queues, no workers, just clean async processing.
 """
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import uuid
@@ -90,6 +92,18 @@ def _row_fill_ratio(values: List[Any]) -> float:
     return filled / len(values)
 
 
+def _csv_to_review_grid(csv_blob: Any) -> List[List[str]]:
+    if not isinstance(csv_blob, str) or not csv_blob.strip():
+        return []
+
+    rows: List[List[str]] = []
+    for row in csv.reader(io.StringIO(csv_blob)):
+        cleaned = [str(cell).strip() for cell in row]
+        if any(cleaned):
+            rows.append(cleaned)
+    return rows
+
+
 def _compute_row_confidence(structured_data: Any, document_mode: str) -> List[float]:
     """Compute per-row confidence for handwritten tabular output.
 
@@ -122,12 +136,16 @@ def _compute_row_confidence(structured_data: Any, document_mode: str) -> List[fl
             if isinstance(txn, dict):
                 rows.append(list(txn.values()))
     else:
-        csv_blob = structured_data.get('csv')
+        review_grid = structured_data.get('review_grid')
+        if isinstance(review_grid, list):
+            for row in review_grid:
+                if isinstance(row, list):
+                    rows.append(row)
+                elif row is not None:
+                    rows.append([row])
+        csv_blob = structured_data.get('csv') if not rows else None
         if isinstance(csv_blob, str) and csv_blob.strip():
-            for line in csv_blob.splitlines():
-                if not line.strip():
-                    continue
-                rows.append([cell.strip() for cell in line.split(',')])
+            rows.extend(_csv_to_review_grid(csv_blob))
 
     if not rows:
         return []
@@ -640,7 +658,6 @@ async def process_single_image_simple(
                     or "Auto-detected receipt confidence is low; verify the extracted fields.",
                 },
             ]
-        requires_review = bool(review_flags)
         structured_data = (
             bank_statement_data
             if wants_bank_statement
@@ -652,13 +669,23 @@ async def process_single_image_simple(
             if wants_notes
             else {"text": text_data}
             if wants_text_output
-            else {"csv": csv_data}
+            else {"csv": csv_data, "review_grid": _csv_to_review_grid(csv_data)}
         )
         if classification_data:
             structured_data = {
                 **structured_data,
                 "_classification": classification_data,
             }
+        if document_mode == "table" and not structured_data.get("review_grid"):
+            review_flags = [
+                *review_flags,
+                {
+                    "code": "no_extracted_rows",
+                    "area": "review_grid",
+                    "note": "No table rows were extracted; review the source document before export.",
+                },
+            ]
+        requires_review = bool(review_flags)
 
         # P1 — Handwritten specialist signals.
         # is_handwritten: derived from the resolved document_mode. Notes mode is
