@@ -378,6 +378,7 @@ class XeroService:
                     continue
                 records.append({
                     **safe,
+                    "resource_type": resource_type,
                     "connection_id": connection["id"],
                     "workspace_id": connection["workspace_id"],
                     "owner_user_id": user_id,
@@ -386,6 +387,45 @@ class XeroService:
             if records:
                 self.client.table("xero_reference_data").insert(records).execute()
             counts[resource_type] = len(records)
+        # Tracking categories (Xero dimensions): each option becomes one selectable
+        # reference row. Optional — an org with no tracking must not break core sync.
+        try:
+            payload = await self._api_get(connection, "TrackingCategories")
+            self.client.table("xero_reference_data").delete()\
+                .eq("connection_id", connection["id"])\
+                .eq("resource_type", "tracking_option")\
+                .execute()
+            option_records = []
+            for category in payload.get("TrackingCategories", []) or []:
+                if str(category.get("Status") or "ACTIVE").upper() != "ACTIVE":
+                    continue
+                category_id = category.get("TrackingCategoryID")
+                category_name = category.get("Name")
+                for option in category.get("Options", []) or []:
+                    option_id = option.get("TrackingOptionID")
+                    if not option_id or str(option.get("Status") or "ACTIVE").upper() != "ACTIVE":
+                        continue
+                    option_records.append({
+                        "external_id": str(option_id),
+                        "display_name": f"{category_name}: {option.get('Name')}",
+                        "active": True,
+                        "details": {
+                            "category_id": str(category_id or ""),
+                            "category_name": category_name,
+                            "option_id": str(option_id),
+                            "option_name": option.get("Name"),
+                        },
+                        "resource_type": "tracking_option",
+                        "connection_id": connection["id"],
+                        "workspace_id": connection["workspace_id"],
+                        "owner_user_id": user_id,
+                        "synced_at": now,
+                    })
+            if option_records:
+                self.client.table("xero_reference_data").insert(option_records).execute()
+            counts["tracking_option"] = len(option_records)
+        except Exception:
+            counts["tracking_option"] = 0
         updated = self.client.table("xero_connections")\
             .update({"last_synced_at": now, "updated_at": now})\
             .eq("id", connection["id"])\
@@ -449,10 +489,11 @@ class XeroService:
 
     def _bill_payload(self, item: Dict[str, Any], connection: Dict[str, Any]) -> Dict[str, Any]:
         draft = dict(item.get("draft_data") or {})
-        vendor = self._selected_reference(connection, item["owner_user_id"], "vendor", draft.get("vendor_ref_id"), "contact")
-        account = self._selected_reference(connection, item["owner_user_id"], "account", draft.get("account_ref_id"), "account")
+        owner = item["owner_user_id"]
+        vendor = self._selected_reference(connection, owner, "vendor", draft.get("vendor_ref_id"), "contact")
+        account = self._selected_reference(connection, owner, "account", draft.get("account_ref_id"), "account")
         tax_code = self._selected_reference(
-            connection, item["owner_user_id"], "tax_code", draft.get("tax_code_ref_id"), "tax rate", required=False,
+            connection, owner, "tax_code", draft.get("tax_code_ref_id"), "tax rate", required=False,
         )
         assert vendor is not None and account is not None
         account_code = (account.get("details") or {}).get("code")
@@ -460,14 +501,45 @@ class XeroService:
             raise ValueError("The selected Xero account has no code; re-sync the chart of accounts")
         tax_type = (tax_code.get("details") or {}).get("tax_type") if tax_code else None
 
-        def _line(amount: Decimal, description: str) -> Dict[str, Any]:
+        def _tracking_from_refs(ref_ids: Optional[List[str]]) -> List[Dict[str, Any]]:
+            entries: List[Dict[str, Any]] = []
+            for ref_id in ref_ids or []:
+                option = self._selected_reference(connection, owner, "tracking_option", ref_id, "tracking option", required=False)
+                if not option:
+                    continue
+                details = option.get("details") or {}
+                category_id = details.get("category_id")
+                option_id = details.get("option_id") or option.get("external_id")
+                if category_id and option_id:
+                    entries.append({"TrackingCategoryID": str(category_id), "TrackingOptionID": str(option_id)})
+            return entries
+
+        header_tracking = _tracking_from_refs(draft.get("tracking_option_ref_ids"))
+
+        def _line(amount: Decimal, raw: Dict[str, Any]) -> Dict[str, Any]:
+            # Per-line coding falls back to the header account / tax / tracking.
+            code = account_code
+            line_tax_type = tax_type
+            if raw.get("account_ref_id"):
+                resolved = self._selected_reference(connection, owner, "account", raw.get("account_ref_id"), "account", required=False)
+                resolved_code = (resolved.get("details") or {}).get("code") if resolved else None
+                if resolved_code:
+                    code = resolved_code
+            if raw.get("tax_code_ref_id"):
+                resolved_tax = self._selected_reference(connection, owner, "tax_code", raw.get("tax_code_ref_id"), "tax rate", required=False)
+                if resolved_tax:
+                    line_tax_type = (resolved_tax.get("details") or {}).get("tax_type")
+            description = raw.get("description") or raw.get("item") or raw.get("name") or "Line item"
             line: Dict[str, Any] = {
-                "Description": description[:4000],
+                "Description": str(description)[:4000],
                 "LineAmount": float(amount),
-                "AccountCode": str(account_code),
+                "AccountCode": str(code),
             }
-            if tax_type:
-                line["TaxType"] = str(tax_type)
+            if line_tax_type:
+                line["TaxType"] = str(line_tax_type)
+            line_tracking = _tracking_from_refs(raw.get("tracking_option_ref_ids")) or header_tracking
+            if line_tracking:
+                line["Tracking"] = line_tracking
             return line
 
         lines: List[Dict[str, Any]] = []
@@ -485,13 +557,12 @@ class XeroService:
                 amount = quantity * unit_price if quantity is not None and unit_price is not None else None
             if amount is None:
                 continue
-            description = raw.get("description") or raw.get("item") or raw.get("name") or "Line item"
-            lines.append(_line(amount, str(description)))
+            lines.append(_line(amount, raw))
         if not lines:
             total = self._amount(draft.get("total"))
             if total is None:
                 raise ValueError("Add a total or valid line amounts before publishing")
-            lines = [_line(total, str(draft.get("reference") or item.get("source_filename") or "Reviewed invoice"))]
+            lines = [_line(total, {"description": str(draft.get("reference") or item.get("source_filename") or "Reviewed invoice")})]
 
         payload: Dict[str, Any] = {
             "Type": "ACCPAY",

@@ -2274,12 +2274,22 @@ class SupabaseService:
             "tax_code_ref_id",
             "reference",
             "currency",
+            # Dimensional coding (header level).
+            "class_ref_id",
+            "location_ref_id",
         }
         cleaned: Dict[str, Any] = {
             key: str(value).strip()
             for key, value in fields.items()
             if key in allowed_text and value is not None
         }
+        # Xero header tracking options: one option id per tracking category.
+        if isinstance(fields.get("tracking_option_ref_ids"), list):
+            cleaned["tracking_option_ref_ids"] = [
+                str(ref).strip()
+                for ref in fields["tracking_option_ref_ids"]
+                if ref is not None and str(ref).strip()
+            ]
         if isinstance(fields.get("line_items"), list):
             cleaned["line_items"] = [
                 item for item in fields["line_items"] if isinstance(item, dict)
@@ -2355,7 +2365,38 @@ class SupabaseService:
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         enriched["duplicate_warnings"] = list(metadata.get("ap_duplicate_warnings") or [])
         enriched["matched_po"], enriched["po_match_status"] = self._resolve_matched_po(item)
+        # Approval gate (preparer → approver). Stored in metadata.approval so no
+        # schema change is needed; the queue status is derived for the client.
+        approval = metadata.get("approval") if isinstance(metadata.get("approval"), dict) else {}
+        enriched["submitted_by"] = approval.get("submitted_by")
+        enriched["submitted_at"] = approval.get("submitted_at")
+        enriched["approved_by"] = approval.get("approved_by")
+        enriched["approved_at"] = approval.get("approved_at")
+        enriched["submitted_by_email"] = await self._resolve_user_email(approval.get("submitted_by"))
+        enriched["approved_by_email"] = await self._resolve_user_email(approval.get("approved_by"))
+        if approval.get("state") == "awaiting" and str(item.get("status") or "") in {"needs_coding", "needs_review", "failed"}:
+            enriched["status"] = "pending_approval"
         return enriched
+
+    async def _resolve_user_email(self, target_user_id: Optional[str]) -> Optional[str]:
+        """Best-effort user_id -> email for AP approval display."""
+        if not target_user_id:
+            return None
+        try:
+            response = self.client.auth.admin.get_user_by_id(str(target_user_id))
+            user = getattr(response, "user", None) or response
+            email = getattr(user, "email", None)
+            if email:
+                return str(email)
+        except Exception:
+            pass
+        try:
+            membership = self.client.table("workspace_memberships")                .select("member_email")                .eq("user_id", str(target_user_id))                .limit(1)                .execute()
+            if membership.data and membership.data[0].get("member_email"):
+                return str(membership.data[0]["member_email"])
+        except Exception:
+            pass
+        return None
 
     # ── P9 — Purchase order matching ───────────────────────────────────────
 
@@ -2860,6 +2901,151 @@ class SupabaseService:
         if not response.data:
             raise ValueError("Draft bill not found")
         return await self._enrich_accounts_payable_item(response.data[0], user_id)
+
+    # ── Approval gate (preparer submits → approver approves → publish) ──────
+
+    async def _get_ap_item_row(self, item_id: str) -> Dict[str, Any]:
+        """Load one AP item by id without owner scoping (workspace role authorizes)."""
+        response = self.client.table("accounts_payable_items")            .select("*")            .eq("id", item_id)            .limit(1)            .execute()
+        if not response.data:
+            raise ValueError("Draft bill not found")
+        return response.data[0]
+
+    async def _authorize_ap_role(
+        self,
+        item: Dict[str, Any],
+        user_id: str,
+        email: Optional[str],
+        allowed_roles: List[str],
+    ) -> str:
+        """Resolve and check the actor's workspace role for an AP item."""
+        workspace_id = item.get("workspace_id")
+        if not workspace_id:
+            raise ValueError("This draft bill is not attached to a workspace")
+        return await self.require_workspace_role(user_id, email, str(workspace_id), allowed_roles)
+
+    def _append_ap_status_history(
+        self,
+        item: Dict[str, Any],
+        update: Dict[str, Any],
+        from_status: Optional[str],
+        to_status: str,
+        actor_id: str,
+        actor_role: str,
+        reason: str,
+        changed_at: str,
+    ) -> Dict[str, Any]:
+        metadata = dict(update.get("metadata") or item.get("metadata") or {})
+        history = list(metadata.get("status_history") or [])
+        history.append({
+            "from_status": from_status,
+            "to_status": to_status,
+            "reason": reason or "",
+            "actor": {"user_id": actor_id, "role": actor_role},
+            "changed_at": changed_at,
+        })
+        metadata["status_history"] = history
+        return metadata
+
+    async def submit_accounts_payable_item(
+        self,
+        item_id: str,
+        user_id: str,
+        email: Optional[str],
+    ) -> Dict[str, Any]:
+        """Preparer (or owner) submits a coded draft bill for approval."""
+        item = await self._get_ap_item_row(item_id)
+        role = await self._authorize_ap_role(item, user_id, email, ["owner", "reviewer"])
+        current_status = str(item.get("status") or "")
+        existing_approval = (item.get("metadata") or {}).get("approval") or {}
+        if existing_approval.get("state") == "awaiting":
+            return await self._enrich_accounts_payable_item(item, str(item["owner_user_id"]))
+        if current_status in {"published", "discarded"}:
+            raise ValueError("This draft bill can no longer be submitted")
+        changed_at = datetime.utcnow().isoformat()
+        metadata = dict(item.get("metadata") or {})
+        metadata["approval"] = {
+            "state": "awaiting",
+            "submitted_by": user_id,
+            "submitted_at": changed_at,
+        }
+        update: Dict[str, Any] = {
+            "status": "needs_review",
+            "updated_at": changed_at,
+            "metadata": metadata,
+        }
+        update["metadata"] = self._append_ap_status_history(
+            item, update, item.get("status"), "pending_approval", user_id, role,
+            "Submitted for approval", changed_at,
+        )
+        response = self.client.table("accounts_payable_items")            .update(update)            .eq("id", item_id)            .execute()
+        if not response.data:
+            raise ValueError("Draft bill not found")
+        return await self._enrich_accounts_payable_item(response.data[0], str(item["owner_user_id"]))
+
+    async def approve_accounts_payable_item(
+        self,
+        item_id: str,
+        user_id: str,
+        email: Optional[str],
+    ) -> Dict[str, Any]:
+        """Approver (owner only) approves a pending draft bill -> ready_to_publish."""
+        item = await self._get_ap_item_row(item_id)
+        role = await self._authorize_ap_role(item, user_id, email, ["owner"])
+        existing_approval = (item.get("metadata") or {}).get("approval") or {}
+        if existing_approval.get("state") != "awaiting":
+            raise ValueError("Only items pending approval can be approved")
+        changed_at = datetime.utcnow().isoformat()
+        metadata = dict(item.get("metadata") or {})
+        metadata["approval"] = {
+            **existing_approval,
+            "state": "approved",
+            "approved_by": user_id,
+            "approved_at": changed_at,
+        }
+        update: Dict[str, Any] = {
+            "status": "ready_to_publish",
+            "updated_at": changed_at,
+            "metadata": metadata,
+        }
+        update["metadata"] = self._append_ap_status_history(
+            item, update, item.get("status"), "ready_to_publish", user_id, role,
+            "Approved for publishing", changed_at,
+        )
+        response = self.client.table("accounts_payable_items")            .update(update)            .eq("id", item_id)            .execute()
+        if not response.data:
+            raise ValueError("Draft bill not found")
+        return await self._enrich_accounts_payable_item(response.data[0], str(item["owner_user_id"]))
+
+    async def return_accounts_payable_item(
+        self,
+        item_id: str,
+        user_id: str,
+        email: Optional[str],
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Approver (owner only) returns a submitted draft bill to the preparer."""
+        item = await self._get_ap_item_row(item_id)
+        role = await self._authorize_ap_role(item, user_id, email, ["owner"])
+        current_status = str(item.get("status") or "")
+        if current_status in {"published", "discarded"}:
+            raise ValueError("Published or discarded items cannot be returned")
+        changed_at = datetime.utcnow().isoformat()
+        metadata = dict(item.get("metadata") or {})
+        metadata.pop("approval", None)
+        update: Dict[str, Any] = {
+            "status": "needs_coding",
+            "updated_at": changed_at,
+            "metadata": metadata,
+        }
+        update["metadata"] = self._append_ap_status_history(
+            item, update, item.get("status"), "needs_coding", user_id, role,
+            (reason or "Returned to preparer"), changed_at,
+        )
+        response = self.client.table("accounts_payable_items")            .update(update)            .eq("id", item_id)            .execute()
+        if not response.data:
+            raise ValueError("Draft bill not found")
+        return await self._enrich_accounts_payable_item(response.data[0], str(item["owner_user_id"]))
 
     async def bulk_publish_accounts_payable_items(
         self,

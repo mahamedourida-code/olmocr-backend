@@ -11,6 +11,7 @@ from app.models.requests import (
     AccountsPayableDiscardRequest,
     AccountsPayableDuplicateDismissRequest,
     AccountsPayableFromDocumentRequest,
+    AccountsPayableReturnRequest,
     AccountsPayableUpdateRequest,
     PurchaseOrderImportRequest,
     PurchaseOrderMatchRequest,
@@ -180,6 +181,53 @@ async def discard_accounts_payable_item(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 
+# ── Approval gate (preparer submits → owner approves → publish) ──────────────
+
+@router.post("/{item_id}/submit", response_model=Dict[str, Any])
+async def submit_accounts_payable_item(
+    item_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Preparer submits a coded draft bill for approval."""
+    service = get_supabase_service()
+    try:
+        item = await service.submit_accounts_payable_item(item_id, user["user_id"], user.get("email"))
+        return {"item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post("/{item_id}/approve", response_model=Dict[str, Any])
+async def approve_accounts_payable_item(
+    item_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Approver (workspace owner) approves a pending draft bill."""
+    service = get_supabase_service()
+    try:
+        item = await service.approve_accounts_payable_item(item_id, user["user_id"], user.get("email"))
+        return {"item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
+@router.post("/{item_id}/return", response_model=Dict[str, Any])
+async def return_accounts_payable_item(
+    item_id: str,
+    request: AccountsPayableReturnRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Approver returns a submitted draft bill to the preparer for changes."""
+    service = get_supabase_service()
+    try:
+        item = await service.return_accounts_payable_item(
+            item_id, user["user_id"], user.get("email"), request.reason,
+        )
+        return {"item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
 # ── P9 — Purchase order matching ─────────────────────────────────────────────
 
 @router.post("/{item_id}/match-po", response_model=Dict[str, Any])
@@ -202,6 +250,14 @@ async def publish_accounts_payable_item(
     user: dict = Depends(get_current_user),
 ):
     """Publish one item to its workspace's accounting destination (QuickBooks or Xero)."""
+    service = get_supabase_service()
+    try:
+        ap_item = await service.get_accounts_payable_item(item_id, user["user_id"])
+        await service.require_workspace_role(
+            user["user_id"], user.get("email"), str(ap_item["workspace_id"]), ["owner"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     try:
         publisher = await _publisher_for(item_id, user["user_id"])
         item = await publisher.publish_accounts_payable_bill(item_id, user["user_id"])
@@ -219,5 +275,13 @@ async def publish_accounts_payable_batch(
     """Bulk publish to the destination of the batch's workspace (read from the first item)."""
     if not request.item_ids:
         return {"items": [], "failures": [], "total": 0}
+    service = get_supabase_service()
+    try:
+        first_item = await service.get_accounts_payable_item(request.item_ids[0], user["user_id"])
+        await service.require_workspace_role(
+            user["user_id"], user.get("email"), str(first_item["workspace_id"]), ["owner"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     publisher = await _publisher_for(request.item_ids[0], user["user_id"])
     return await publisher.publish_accounts_payable_bills(request.item_ids, user["user_id"])

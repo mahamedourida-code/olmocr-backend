@@ -180,7 +180,15 @@ class VendorRuleUpdateRequest(BaseModel):
     )
 
 
-AccountsPayableStatus = Literal["needs_coding", "needs_review", "ready_to_publish", "published", "failed", "discarded"]
+AccountsPayableStatus = Literal[
+    "needs_coding",
+    "needs_review",
+    "pending_approval",
+    "ready_to_publish",
+    "published",
+    "failed",
+    "discarded",
+]
 
 
 class AccountsPayableFromDocumentRequest(BaseModel):
@@ -191,7 +199,7 @@ class AccountsPayableFromDocumentRequest(BaseModel):
 
 
 class AccountsPayableDraftFields(BaseModel):
-    """Editable reviewed bill values and selected QuickBooks coding references."""
+    """Editable reviewed bill values and selected accounting coding references."""
 
     vendor: Optional[str] = Field(None, max_length=200)
     vendor_ref_id: Optional[str] = Field(None, max_length=120)
@@ -204,6 +212,15 @@ class AccountsPayableDraftFields(BaseModel):
     tax_code_ref_id: Optional[str] = Field(None, max_length=120)
     reference: Optional[str] = Field(None, max_length=160)
     currency: Optional[str] = Field(None, max_length=12)
+    # Dimensional coding (header level).
+    class_ref_id: Optional[str] = Field(None, max_length=120, description="QuickBooks header class")
+    location_ref_id: Optional[str] = Field(None, max_length=120, description="QuickBooks header location/department")
+    tracking_option_ref_ids: Optional[List[str]] = Field(
+        None,
+        description="Xero header tracking options (one option per tracking category)",
+    )
+    # Each line item dict MAY carry per-line coding/dimension references:
+    # account_ref_id, tax_code_ref_id, class_ref_id, tracking_option_ref_ids.
     line_items: Optional[List[Dict[str, Any]]] = None
 
 
@@ -244,6 +261,12 @@ class AccountsPayableDiscardRequest(BaseModel):
     """Discard a draft AP item after confirming it is a duplicate."""
 
     reason: Optional[str] = Field(None, max_length=240, description="Short note explaining why the item was discarded")
+
+
+class AccountsPayableReturnRequest(BaseModel):
+    """Approver returns a submitted draft bill to the preparer for changes."""
+
+    reason: Optional[str] = Field(None, max_length=240, description="Optional note explaining what to fix")
 
 
 ConnectedSourceProvider = Literal["google_drive", "dropbox"]

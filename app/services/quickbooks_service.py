@@ -311,6 +311,9 @@ class QuickBooksService:
                 "classification": record.get("Classification"),
             }
             display_name = record.get("Name")
+        elif resource_type in {"class", "location"}:
+            details = {"fully_qualified_name": record.get("FullyQualifiedName")}
+            display_name = record.get("FullyQualifiedName") or record.get("Name")
         else:
             details = {
                 "description": record.get("Description"),
@@ -331,34 +334,49 @@ class QuickBooksService:
         assert connection is not None
         company = await self._read_company_info(connection)
         now = self._now().isoformat()
-        mappings = {"vendor": "Vendor", "account": "Account", "tax_code": "TaxCode"}
+        mappings = {
+            "vendor": "Vendor",
+            "account": "Account",
+            "tax_code": "TaxCode",
+            "class": "Class",
+            "location": "Department",
+        }
         counts: Dict[str, int] = {}
         for resource_type, entity in mappings.items():
-            payload = await self._accounting_get(
-                connection,
-                f"{self._company_base_url}/v3/company/{connection['realm_id']}/query",
-                {"query": f"select * from {entity} maxresults 1000", "minorversion": settings.quickbooks_minor_version},
-            )
-            rows = payload.get("QueryResponse", {}).get(entity, []) or []
-            self.client.table("quickbooks_reference_data").delete()\
-                .eq("connection_id", connection["id"])\
-                .eq("resource_type", resource_type)\
-                .execute()
-            records = []
-            for raw in rows:
-                safe = self._reference_row(resource_type, raw)
-                if not safe["external_id"]:
+            try:
+                payload = await self._accounting_get(
+                    connection,
+                    f"{self._company_base_url}/v3/company/{connection['realm_id']}/query",
+                    {"query": f"select * from {entity} maxresults 1000", "minorversion": settings.quickbooks_minor_version},
+                )
+                rows = payload.get("QueryResponse", {}).get(entity, []) or []
+                self.client.table("quickbooks_reference_data").delete()\
+                    .eq("connection_id", connection["id"])\
+                    .eq("resource_type", resource_type)\
+                    .execute()
+                records = []
+                for raw in rows:
+                    safe = self._reference_row(resource_type, raw)
+                    if not safe["external_id"]:
+                        continue
+                    records.append({
+                        **safe,
+                        "resource_type": resource_type,
+                        "connection_id": connection["id"],
+                        "workspace_id": connection["workspace_id"],
+                        "owner_user_id": user_id,
+                        "synced_at": now,
+                    })
+                if records:
+                    self.client.table("quickbooks_reference_data").insert(records).execute()
+                counts[resource_type] = len(records)
+            except Exception:
+                # Dimensions (class/location) are optional — a company without them
+                # turned on must not break the core vendor/account/tax sync.
+                if resource_type in {"class", "location"}:
+                    counts[resource_type] = 0
                     continue
-                records.append({
-                    **safe,
-                    "connection_id": connection["id"],
-                    "workspace_id": connection["workspace_id"],
-                    "owner_user_id": user_id,
-                    "synced_at": now,
-                })
-            if records:
-                self.client.table("quickbooks_reference_data").insert(records).execute()
-            counts[resource_type] = len(records)
+                raise
         company_name = company.get("CompanyName") or company.get("LegalName")
         update = {"last_synced_at": now, "updated_at": now}
         if company_name:
@@ -424,27 +442,42 @@ class QuickBooksService:
 
     def _bill_payload(self, item: Dict[str, Any], connection: Dict[str, Any]) -> Dict[str, Any]:
         draft = dict(item.get("draft_data") or {})
-        vendor = self._selected_reference(
-            connection, item["owner_user_id"], "vendor", draft.get("vendor_ref_id"), "vendor"
-        )
-        account = self._selected_reference(
-            connection, item["owner_user_id"], "account", draft.get("account_ref_id"), "account"
-        )
+        owner = item["owner_user_id"]
+        vendor = self._selected_reference(connection, owner, "vendor", draft.get("vendor_ref_id"), "vendor")
+        account = self._selected_reference(connection, owner, "account", draft.get("account_ref_id"), "account")
         tax_code = self._selected_reference(
-            connection,
-            item["owner_user_id"],
-            "tax_code",
-            draft.get("tax_code_ref_id"),
-            "tax code",
-            required=False,
+            connection, owner, "tax_code", draft.get("tax_code_ref_id"), "tax code", required=False,
+        )
+        header_class = self._selected_reference(
+            connection, owner, "class", draft.get("class_ref_id"), "class", required=False,
+        )
+        location = self._selected_reference(
+            connection, owner, "location", draft.get("location_ref_id"), "location", required=False,
         )
         assert vendor is not None and account is not None
-        detail_base: Dict[str, Any] = {
-            "AccountRef": {"value": account["external_id"], "name": account["display_name"]},
-            "BillableStatus": "NotBillable",
-        }
-        if tax_code:
-            detail_base["TaxCodeRef"] = {"value": tax_code["external_id"], "name": tax_code["display_name"]}
+
+        def _line_ref(resource_type: str, ref_id: Optional[str], fallback: Optional[Dict[str, Any]], label: str):
+            if ref_id:
+                resolved = self._selected_reference(connection, owner, resource_type, ref_id, label, required=False)
+                if resolved:
+                    return resolved
+            return fallback
+
+        def _detail_for(raw: Dict[str, Any]) -> Dict[str, Any]:
+            # Per-line coding falls back to the header account / tax / class.
+            line_account = _line_ref("account", raw.get("account_ref_id"), account, "account")
+            line_tax = _line_ref("tax_code", raw.get("tax_code_ref_id"), tax_code, "tax code")
+            line_class = _line_ref("class", raw.get("class_ref_id"), header_class, "class")
+            detail: Dict[str, Any] = {
+                "AccountRef": {"value": line_account["external_id"], "name": line_account["display_name"]},
+                "BillableStatus": "NotBillable",
+            }
+            if line_tax:
+                detail["TaxCodeRef"] = {"value": line_tax["external_id"], "name": line_tax["display_name"]}
+            if line_class:
+                detail["ClassRef"] = {"value": line_class["external_id"], "name": line_class["display_name"]}
+            return detail
+
         lines: List[Dict[str, Any]] = []
         for raw in draft.get("line_items") or []:
             if not isinstance(raw, dict):
@@ -463,7 +496,7 @@ class QuickBooksService:
             line: Dict[str, Any] = {
                 "Amount": float(amount),
                 "DetailType": "AccountBasedExpenseLineDetail",
-                "AccountBasedExpenseLineDetail": dict(detail_base),
+                "AccountBasedExpenseLineDetail": _detail_for(raw),
             }
             description = raw.get("description") or raw.get("item") or raw.get("name")
             if description:
@@ -477,12 +510,14 @@ class QuickBooksService:
                 "Amount": float(total),
                 "Description": str(draft.get("reference") or item.get("source_filename") or "Reviewed invoice")[:4000],
                 "DetailType": "AccountBasedExpenseLineDetail",
-                "AccountBasedExpenseLineDetail": dict(detail_base),
+                "AccountBasedExpenseLineDetail": _detail_for({}),
             }]
         payload: Dict[str, Any] = {
             "VendorRef": {"value": vendor["external_id"], "name": vendor["display_name"]},
             "Line": lines,
         }
+        if location:
+            payload["DepartmentRef"] = {"value": location["external_id"]}
         if draft.get("invoice_number"):
             payload["DocNumber"] = str(draft["invoice_number"])[:21]
         if draft.get("invoice_date"):
