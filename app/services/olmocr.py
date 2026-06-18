@@ -10,9 +10,25 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Optional, List, Dict, Any, Union
 from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 from openai.types.chat import ChatCompletion
-import backoff
 from PIL import Image
+
+# Transient provider failures worth retrying on the SAME model: request timeouts,
+# connection resets, 429 rate limits, and 5xx server errors. Everything else
+# (bad request / auth / unprocessable) is non-retryable and must fail fast so the
+# model-failover layer or the page-level failure path can take over.
+_RETRYABLE_OCR_ERRORS = (
+    APITimeoutError,
+    APIConnectionError,
+    RateLimitError,
+    InternalServerError,
+)
 
 from app.core.config import settings
 from app.utils.exceptions import OlmOCRError
@@ -165,12 +181,6 @@ class OlmOCRService:
         
         self._last_request_time = time.time()
     
-    @backoff.on_exception(
-        backoff.expo,
-        (Exception,),
-        max_tries=3,
-        max_time=30
-    )
     async def extract_table_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> str:
         """
         Extract table data from image using OlmOCR API.
@@ -317,12 +327,6 @@ class OlmOCRService:
             logger.error(f"OlmOCR API error: {str(e)}")
             raise OlmOCRError(f"Failed to process image: {str(e)}")
 
-    @backoff.on_exception(
-        backoff.expo,
-        (Exception,),
-        max_tries=3,
-        max_time=30
-    )
     async def extract_text_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> str:
         """Extract plain text from an image or rendered PDF page."""
         try:
@@ -1789,6 +1793,23 @@ class OlmOCRService:
                 })
         return flags
 
+    def _retry_after_seconds(self, exc: RateLimitError) -> Optional[float]:
+        """Read a Retry-After header off a 429 and clamp it to a sane ceiling."""
+        try:
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", None)
+            if not headers:
+                return None
+            raw = headers.get("retry-after") or headers.get("Retry-After")
+            if raw is None:
+                return None
+            delay = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        if delay < 0:
+            return None
+        return min(delay, settings.ocr_retry_after_cap_seconds)
+
     async def _make_api_call(
         self,
         messages: List[Dict[str, Any]],
@@ -1798,15 +1819,15 @@ class OlmOCRService:
         model: Optional[str] = None,
     ) -> ChatCompletion:
         """
-        Make the actual API call to OlmOCR.
-        
-        Args:
-            messages: Chat completion messages
-            
-        Returns:
-            API response
+        Make the actual API call to OlmOCR with the single authoritative retry layer.
+
+        Retries ONLY transient provider failures (timeouts / connection resets /
+        429 / 5xx) on the same model, with jittered exponential backoff and a
+        capped Retry-After honor on 429s. Non-retryable errors raise immediately so
+        the caller's model-failover loop (or the page failure path) takes over.
+        The OpenAI client's own transport retry is left at ocr_client_max_retries
+        (0 by default) so retries do not multiply.
         """
-        # Run the synchronous OpenAI call in a thread pool
         loop = asyncio.get_event_loop()
         request_options: Dict[str, Any] = {
             "model": model or self.model,
@@ -1817,11 +1838,37 @@ class OlmOCRService:
             request_options["response_format"] = response_format
         if temperature is not None:
             request_options["temperature"] = temperature
-        response = await loop.run_in_executor(
-            None,
-            lambda: self.client.chat.completions.create(**request_options)
-        )
-        return response
+
+        max_attempts = max(1, settings.ocr_max_attempts_per_model)
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await loop.run_in_executor(
+                    None,
+                    lambda: self.client.chat.completions.create(**request_options),
+                )
+            except _RETRYABLE_OCR_ERRORS as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    break
+                # Jittered exponential backoff; honor a capped Retry-After on 429.
+                backoff_delay = min(
+                    settings.ocr_retry_max_delay_seconds,
+                    settings.ocr_retry_base_delay_seconds * (2 ** (attempt - 1)),
+                )
+                delay = backoff_delay + random.uniform(0, backoff_delay)
+                if isinstance(exc, RateLimitError):
+                    retry_after = self._retry_after_seconds(exc)
+                    if retry_after is not None:
+                        delay = max(delay, retry_after)
+                logger.warning(
+                    "Transient OCR error on model %s (attempt %d/%d): %s — retrying in %.2fs",
+                    request_options["model"], attempt, max_attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
+        # Exhausted retries on a transient error — surface it for model failover.
+        assert last_exc is not None
+        raise last_exc
     
     def _parse_html_table(self, content: str) -> str:
         """

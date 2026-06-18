@@ -19,10 +19,33 @@ class Settings(BaseSettings):
         env="OCR_MODELS",
     )
     # How many *additional* models to try when a page fails on its primary model.
-    ocr_failover_attempts: int = Field(2, env="OCR_FAILOVER_ATTEMPTS")
+    # Kept at 1 so the worst case stays bounded: per OCR call =
+    #   (1 + ocr_failover_attempts) models x ocr_max_attempts_per_model attempts x ocr_request_timeout.
+    # With the defaults below that is 2 x 2 x 45s = 180s, comfortably under the
+    # Celery soft time limit (see app/tasks/celery_app.py) even for auto mode
+    # (classify + extract = ~360s worst case).
+    ocr_failover_attempts: int = Field(1, env="OCR_FAILOVER_ATTEMPTS")
     # Per-call timeout (seconds) for a single vision-model request. Must exceed the
     # slowest model's latency (Qwen3-VL-30B ≈ 35s) or it times out before responding.
     ocr_request_timeout: float = Field(45.0, env="OCR_REQUEST_TIMEOUT")
+    # Total attempts for a SINGLE model on a SINGLE OCR call (1 = no retry).
+    # This is the authoritative retry layer for transient provider errors
+    # (timeouts / 429 / 5xx / connection resets). Retries only fire for those
+    # transient classes; non-retryable errors (4xx other than 408/409/429) give
+    # up immediately. Model failover (ocr_failover_attempts) is a SEPARATE layer
+    # that escapes a persistently-bad model — the two are bounded together above.
+    ocr_max_attempts_per_model: int = Field(2, env="OCR_MAX_ATTEMPTS_PER_MODEL")
+    # Base/cap (seconds) for the jittered exponential backoff between retries of
+    # the same model inside a single OCR call.
+    ocr_retry_base_delay_seconds: float = Field(1.5, env="OCR_RETRY_BASE_DELAY_SECONDS")
+    ocr_retry_max_delay_seconds: float = Field(8.0, env="OCR_RETRY_MAX_DELAY_SECONDS")
+    # Hard ceiling on Retry-After (seconds) we will honor on a 429 before falling
+    # back to normal backoff — stops a hostile/huge Retry-After from blowing the
+    # task time budget.
+    ocr_retry_after_cap_seconds: float = Field(15.0, env="OCR_RETRY_AFTER_CAP_SECONDS")
+    # Retained for the OpenAI client's *own* transport-level retry. Kept at 0 so
+    # the SDK's retry does not multiply with ocr_max_attempts_per_model; our
+    # explicit, typed retry in _make_api_call is the single authoritative layer.
     ocr_client_max_retries: int = Field(0, env="OCR_CLIENT_MAX_RETRIES")
 
     # Application Configuration
