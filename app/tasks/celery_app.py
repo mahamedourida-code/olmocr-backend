@@ -139,9 +139,15 @@ celery_app.conf.update(
               queue_arguments={'x-max-priority': 1}),
     ),
     
-    # Task time limits
-    task_soft_time_limit=300,  # 5 minutes soft limit
-    task_time_limit=600,  # 10 minutes hard limit
+    # Task time limits.
+    # A single image task may run classify + extract, and each OCR call can retry
+    # transient errors on a model and fail over to one other model. Worst case per
+    # OCR call = (1 + OCR_FAILOVER_ATTEMPTS) x OCR_MAX_ATTEMPTS_PER_MODEL x
+    # OCR_REQUEST_TIMEOUT = 2 x 2 x 45s = 180s; auto mode (classify + extract) ≈
+    # 360s. The soft limit sits above that with headroom for the OCR semaphore
+    # wait and parsing; the hard limit gives a further margin before SIGKILL.
+    task_soft_time_limit=600,  # 10 minutes soft limit
+    task_time_limit=900,  # 15 minutes hard limit
     
     # Task retry settings
     task_acks_late=True,  # Acknowledge tasks after completion

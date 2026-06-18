@@ -344,12 +344,18 @@ async def process_single_image_simple(
             global cap regardless of how many models we round-robin across.
             """
             holder_id = f"{job_id}:{image_id}:{uuid.uuid4().hex}"
+            # Lease must exceed a single _ocr_call's worst case so a legitimately
+            # slow call (transient-retry on a model, then failover to one other
+            # model) does not have its slot stolen mid-flight:
+            #   (1 + OCR_FAILOVER_ATTEMPTS) x OCR_MAX_ATTEMPTS_PER_MODEL x
+            #   OCR_REQUEST_TIMEOUT + backoff sleeps ≈ 2 x 2 x 45s + ~30s ≈ 210s.
+            # 360s leaves margin; wait_timeout stays under the task hard limit (900s).
             acquired = await redis.acquire_distributed_semaphore(
                 name="deepinfra_ocr",
                 holder_id=holder_id,
                 limit=settings.max_concurrent_ocr_calls,
-                lease_seconds=300,
-                wait_timeout_seconds=300,
+                lease_seconds=360,
+                wait_timeout_seconds=360,
             )
             if not acquired:
                 raise RuntimeError("OCR capacity is busy. Please retry shortly.")
