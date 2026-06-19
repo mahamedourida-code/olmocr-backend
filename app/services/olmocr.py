@@ -630,12 +630,10 @@ class OlmOCRService:
         allowed_types = {"invoice", "receipt", "bank_statement", "table", "notes", "needs_manual_selection"}
         try:
             parsed = json.loads(content)
-        except json.JSONDecodeError:
-            return {
-                "document_type": "needs_manual_selection",
-                "confidence": 0.0,
-                "review_reason": "The document type could not be parsed reliably."
-            }
+        except json.JSONDecodeError as exc:
+            # Raise instead of silently returning needs_manual_selection: a bad reply
+            # from one model must trigger cross-model failover, not skip extraction.
+            raise OlmOCRError("Document classification response was not valid JSON") from exc
 
         document_type = str(parsed.get("document_type") or "needs_manual_selection").strip().lower()
         if document_type not in allowed_types:

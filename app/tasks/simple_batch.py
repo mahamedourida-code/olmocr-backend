@@ -386,31 +386,43 @@ async def process_single_image_simple(
                     18,
                     "Detecting the document type",
                 )
-                classification_data = await _ocr_call(
-                    lambda m: olmocr.classify_document_from_image(image_data, ocr_language=ocr_language, model=m),
-                    "classification",
-                )
+                try:
+                    classification_data = await _ocr_call(
+                        lambda m: olmocr.classify_document_from_image(image_data, ocr_language=ocr_language, model=m),
+                        "classification",
+                    )
+                except Exception as classify_error:
+                    logger.warning(
+                        f"[Job {job_id}] Classification failed for image {image_id}; "
+                        f"defaulting to receipt extraction: {classify_error}"
+                    )
+                    classification_data = {
+                        "document_type": "receipt",
+                        "confidence": 0.0,
+                        "review_reason": "Auto-detect could not read the document type; defaulted to receipt — please verify.",
+                        "auto_fallback": True,
+                    }
                 suggested_mode = classification_data.get("document_type")
                 confidence = float(classification_data.get("confidence") or 0)
                 low_confidence = confidence < settings.auto_detection_confidence_threshold
-                allow_low_confidence_receipt = suggested_mode == "receipt"
-                if (
-                    (source_page_count or 0) > 1
-                    or suggested_mode == "needs_manual_selection"
-                    or (low_confidence and not allow_low_confidence_receipt)
-                ):
-                    if suggested_mode != "needs_manual_selection":
-                        classification_data["suggested_type"] = suggested_mode
-                    classification_data["document_type"] = "needs_manual_selection"
-                    classification_data["review_reason"] = (
-                        "Select one extraction mode for this multi-page document before processing."
-                        if (source_page_count or 0) > 1
-                        else classification_data.get("review_reason")
-                        or "Document type confidence is too low for automatic extraction."
-                    )
-                    document_mode = "needs_manual_selection"
-                else:
+                # Never leave a document unread. Trust a valid detected type (even at low
+                # confidence — it still extracts and is flagged). Only when the type is
+                # genuinely unknown (needs_manual_selection / unparseable / classify failure)
+                # do we default to the receipt extractor and flag it for confirmation,
+                # instead of skipping extraction and rendering empty cells. Multi-page PDFs
+                # are read per page with their own detected type.
+                if suggested_mode in {"invoice", "receipt", "bank_statement", "table", "notes"}:
                     document_mode = suggested_mode
+                else:
+                    if suggested_mode and suggested_mode != "needs_manual_selection":
+                        classification_data["suggested_type"] = suggested_mode
+                    classification_data["review_reason"] = (
+                        classification_data.get("review_reason")
+                        or "Auto-detect was unsure of the document type; defaulted to receipt — please verify."
+                    )
+                    classification_data["document_type"] = "receipt"
+                    classification_data["resolved_via_fallback"] = True
+                    document_mode = "receipt"
 
                 if document_id:
                     supabase = get_supabase_service()
