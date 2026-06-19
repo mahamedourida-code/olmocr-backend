@@ -685,6 +685,223 @@ class OlmOCRService:
             "review_reason": review_reason,
         }
 
+    async def detect_and_extract_from_image(
+        self,
+        image_data: Union[bytes, str],
+        ocr_language: Optional[str] = "en",
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Classify AND extract a document in a SINGLE vision call.
+
+        One prompt decides document_type by the document's purpose/content (NOT by
+        whether it is handwritten) and, in the same response, extracts the fields
+        using the SAME key names the dedicated extractor for that type emits — so
+        the existing ``_parse_<type>_json`` adapters parse the raw reply unchanged.
+
+        Returns a dict with the classification info plus the typed structured data:
+            {
+              "document_type", "confidence", "is_handwritten", "review_reason",
+              "classification": {document_type, confidence, is_handwritten, review_reason},
+              "structured_data": <output of the matching _parse_<type>_json, or a
+                                  CSV string for table>,
+            }
+        PDFs are handled per page by the caller's per-page split upstream; here a
+        multi-page PDF falls back to its first rendered page for the single call,
+        mirroring ``classify_document_from_image``.
+        """
+        try:
+            if isinstance(image_data, bytes):
+                image_bytes = image_data
+            else:
+                img_b64_str = image_data.split(',', 1)[1] if image_data.startswith('data:') else image_data
+                image_bytes = base64.b64decode(img_b64_str)
+
+            if self._is_pdf_bytes(image_bytes):
+                page_images = self._render_pdf_pages_to_png(image_bytes)
+                image_bytes = page_images[0]
+
+            await self._apply_rate_limiting()
+
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                if hasattr(img, 'format') and img.format and img.format.lower() in ['heif', 'heic']:
+                    logger.info(f"Detected HEIC/HEIF image (format: {img.format}), converting to JPEG...")
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    elif img.mode == 'RGBA':
+                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                        rgb_img.paste(img, mask=img.split()[3] if len(img.split()) > 3 else None)
+                        img = rgb_img
+                    output_buffer = io.BytesIO()
+                    img.save(output_buffer, format='JPEG', quality=95)
+                    output_buffer.seek(0)
+                    image_bytes = output_buffer.read()
+                img.close()
+            except Exception as e:
+                logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
+
+            image_bytes = self._downscale_for_ocr(image_bytes)
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            language_instruction = self._ocr_language_instruction(ocr_language)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                        {
+                            "type": "text",
+                            "text": (
+                                "You read one uploaded document image and, in a SINGLE JSON reply, BOTH classify it AND "
+                                "extract its visible content for human review. Do not infer missing values, reconcile, "
+                                "categorize accounting, calculate missing totals, or give advice.\n\n"
+                                "STEP 1 — classify by the document's PURPOSE/CONTENT, not by its appearance:\n"
+                                "- document_type must be exactly one of: invoice, receipt, bank_statement, table, notes.\n"
+                                "- Whether the document is handwritten, printed, or photographed does NOT change the type. "
+                                "A handwritten supplier bill is still \"invoice\". A handwritten shop/restaurant/card receipt "
+                                "is still \"receipt\". A handwritten account transaction statement is still \"bank_statement\". "
+                                "A handwritten grid of rows and columns is still \"table\".\n"
+                                "- Use \"invoice\" for supplier bills with invoice fields (vendor, invoice number, totals). "
+                                "Use \"receipt\" for proof of purchase, point-of-sale/restaurant receipts, and card slips. "
+                                "Use \"bank_statement\" only for bank account transaction statements. "
+                                "Use \"table\" for a visible grid/list meant as rows and columns. "
+                                "Use \"notes\" ONLY for genuine narrative/prose handwriting (or typed prose) that has NO "
+                                "financial-document structure — never pick \"notes\" just because the writing is by hand.\n"
+                                "- Set is_handwritten to true when the document's content is primarily handwritten, false otherwise. "
+                                "This is a SEPARATE attribute and must never override the type.\n"
+                                "- confidence is a number between 0 and 1. review_reason briefly explains any uncertainty, "
+                                "or is an empty string when the type is clear.\n\n"
+                                "STEP 2 — in the SAME JSON object, also include the extracted fields for the detected type, "
+                                "using these EXACT key names:\n"
+                                "- invoice: vendor_name, supplier_tax_vat_id, invoice_number, invoice_date, due_date, "
+                                "po_reference, subtotal, tax_vat_amount, total, currency, and line_items (array of objects "
+                                "with description, quantity, unit_price, tax_rate, line_total).\n"
+                                "- receipt: merchant, date, payment_method, currency, subtotal, tax_vat_amount, total, "
+                                "discount, tip, raw_text, and line_items (array of objects with description, quantity, "
+                                "unit_price, tax_rate, line_total).\n"
+                                "- bank_statement: account_holder, bank_name, account_number, period, currency, "
+                                "opening_balance, closing_balance, printed_page_number, printed_page_count, raw_text, and "
+                                "transactions (array of objects with date, description, reference, debit, credit, balance, "
+                                "readable (boolean), review_note).\n"
+                                "- table: a single \"csv\" string holding the grid as CSV (one row per line, comma-separated "
+                                "cells, header row first). Preserve visible row/column labels, amounts, dates, and signs.\n"
+                                "- notes: readable_text (the narrative in reading order, preserving line breaks) and tables "
+                                "(array of objects with title, columns (array of strings), rows (array of objects each with a "
+                                "cells array of strings)); use an empty tables array when no table is visible.\n\n"
+                                "Use empty strings for fields that are not visible and empty arrays when there are no rows. "
+                                "Preserve visible number, currency, and date formatting exactly. Return ONLY the single JSON "
+                                "object, with document_type, confidence, is_handwritten, review_reason, and the detected "
+                                "type's fields all at the top level."
+                                + language_instruction
+                            ),
+                        },
+                    ],
+                }
+            ]
+
+            logger.info("Making OlmOCR unified detect+extract request")
+            response: ChatCompletion = await self._make_api_call(
+                messages,
+                max_tokens=5000,
+                response_format={"type": "json_object"},
+                temperature=0,
+                model=model,
+            )
+
+            if not response.choices or not response.choices[0].message.content:
+                raise OlmOCRError("Empty response from OlmOCR API")
+
+            raw_content = self._clean_ocr_response(response.choices[0].message.content.strip())
+            return self._parse_detect_and_extract(raw_content)
+        except OlmOCRError:
+            raise
+        except Exception as e:
+            logger.error(f"OlmOCR detect+extract error: {str(e)}")
+            raise OlmOCRError(f"Failed to detect and extract document: {str(e)}")
+
+    def _parse_detect_and_extract(self, content: str) -> Dict[str, Any]:
+        """Split the unified reply into classification info + typed structured data.
+
+        The raw JSON is routed UNCHANGED to the existing per-type parser so field
+        names match exactly. For table, a "csv" string is returned (the same shape
+        the table branch in simple_batch consumes). Unknown/empty type falls back
+        to receipt extraction so a document is never left empty.
+        """
+        allowed_types = {"invoice", "receipt", "bank_statement", "table", "notes"}
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+            parsed = None
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    parsed = None
+            if not isinstance(parsed, dict):
+                # Unparseable unified reply: trigger cross-model failover, exactly
+                # like the dedicated classifier does on bad JSON.
+                raise OlmOCRError("Unified detect+extract response was not valid JSON")
+
+        if not isinstance(parsed, dict):
+            raise OlmOCRError("Unified detect+extract response was not a JSON object")
+
+        document_type = str(parsed.get("document_type") or "").strip().lower()
+        type_fallback = document_type not in allowed_types
+        if type_fallback:
+            document_type = "receipt"
+
+        try:
+            confidence = min(1.0, max(0.0, float(parsed.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        is_handwritten_value = parsed.get("is_handwritten", False)
+        if isinstance(is_handwritten_value, bool):
+            is_handwritten = is_handwritten_value
+        else:
+            is_handwritten = str(is_handwritten_value).strip().lower() in {"true", "yes", "1"}
+
+        review_reason = str(parsed.get("review_reason") or "").strip()
+        if type_fallback:
+            review_reason = (
+                review_reason
+                or "Auto-detect was unsure of the document type; defaulted to receipt — please verify."
+            )
+
+        # The whole raw JSON carries the type's fields at the top level, so feed it
+        # straight to the same parser the dedicated extractor uses.
+        raw_json = json.dumps(parsed)
+        if document_type == "invoice":
+            structured_data = self._parse_invoice_json(raw_json)
+        elif document_type == "bank_statement":
+            structured_data = self._parse_bank_statement_json(raw_json)
+        elif document_type == "notes":
+            structured_data = self._parse_notes_json(raw_json)
+        elif document_type == "table":
+            # Reuse the same JSON->CSV / csv-string handling the table branch uses.
+            csv_blob = parsed.get("csv")
+            if isinstance(csv_blob, str) and csv_blob.strip():
+                structured_data = csv_blob.strip()
+            else:
+                structured_data = self._extract_csv_from_json_response(raw_json)
+        else:
+            structured_data = self._parse_receipt_json(raw_json)
+
+        return {
+            "document_type": document_type,
+            "confidence": confidence,
+            "is_handwritten": is_handwritten,
+            "review_reason": review_reason,
+            "type_fallback": type_fallback,
+            "classification": {
+                "document_type": document_type,
+                "confidence": confidence,
+                "is_handwritten": is_handwritten,
+                "review_reason": review_reason,
+            },
+            "structured_data": structured_data,
+        }
+
     async def extract_bank_statement_from_image(self, image_data: Union[bytes, str], ocr_language: Optional[str] = "en", model: Optional[str] = None) -> Dict[str, Any]:
         """Extract visible bank statement text and transactions into a structured review object."""
         try:

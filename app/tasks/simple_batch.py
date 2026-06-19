@@ -302,6 +302,10 @@ async def process_single_image_simple(
         ocr_language = str(img.get('ocr_language') or 'en').strip().lower()[:16] or 'en'
         document_mode = requested_document_mode
         classification_data = None
+        # Pre-extracted typed data from the unified detect+extract call (auto mode
+        # only). When set, the extraction block below skips the second OCR call and
+        # reuses this so the whole flow runs on ONE external-API call.
+        auto_extracted_data = None
         single_file_progress = total_images == 1
 
         async def _publish_single_file_stage(stage: str, stage_progress: int, stage_message: str) -> None:
@@ -386,31 +390,43 @@ async def process_single_image_simple(
                     18,
                     "Detecting the document type",
                 )
+                # ONE external-API call that BOTH classifies the document type and
+                # extracts its fields (replaces the old classify-then-extract pair).
+                # detect_and_extract resolves to a concrete type (handwriting never
+                # forces "notes") and carries the typed structured_data so the
+                # extraction block below reuses it instead of a second OCR call.
                 try:
-                    classification_data = await _ocr_call(
-                        lambda m: olmocr.classify_document_from_image(image_data, ocr_language=ocr_language, model=m),
-                        "classification",
+                    detect_result = await _ocr_call(
+                        lambda m: olmocr.detect_and_extract_from_image(image_data, ocr_language=ocr_language, model=m),
+                        "detect_extract",
                     )
-                except Exception as classify_error:
+                    classification_data = dict(detect_result.get("classification") or {})
+                    auto_extracted_data = detect_result.get("structured_data")
+                    if detect_result.get("type_fallback"):
+                        classification_data["resolved_via_fallback"] = True
+                except Exception as detect_error:
                     logger.warning(
-                        f"[Job {job_id}] Classification failed for image {image_id}; "
-                        f"defaulting to receipt extraction: {classify_error}"
+                        f"[Job {job_id}] Detect+extract failed for image {image_id}; "
+                        f"defaulting to receipt extraction: {detect_error}"
                     )
                     classification_data = {
                         "document_type": "receipt",
                         "confidence": 0.0,
+                        "is_handwritten": False,
                         "review_reason": "Auto-detect could not read the document type; defaulted to receipt — please verify.",
                         "auto_fallback": True,
                     }
+                    auto_extracted_data = None
                 suggested_mode = classification_data.get("document_type")
                 confidence = float(classification_data.get("confidence") or 0)
                 low_confidence = confidence < settings.auto_detection_confidence_threshold
-                # Never leave a document unread. Trust a valid detected type (even at low
-                # confidence — it still extracts and is flagged). Only when the type is
-                # genuinely unknown (needs_manual_selection / unparseable / classify failure)
-                # do we default to the receipt extractor and flag it for confirmation,
-                # instead of skipping extraction and rendering empty cells. Multi-page PDFs
-                # are read per page with their own detected type.
+                # Never leave a document unread. The unified call already resolves to a
+                # concrete extractable type (invoice/receipt/bank_statement/table/notes),
+                # so a valid type extracts even at low confidence. If the type comes back
+                # outside the allowed set (e.g. a model that ignored the instruction), fall
+                # back to the receipt extractor and flag it for confirmation rather than
+                # rendering empty cells. Multi-page PDFs are read per page with their own
+                # detected type.
                 if suggested_mode in {"invoice", "receipt", "bank_statement", "table", "notes"}:
                     document_mode = suggested_mode
                 else:
@@ -423,6 +439,9 @@ async def process_single_image_simple(
                     classification_data["document_type"] = "receipt"
                     classification_data["resolved_via_fallback"] = True
                     document_mode = "receipt"
+                    # The unified reply extracted under the original (unsupported) type;
+                    # re-run the receipt extraction so we never export empty cells.
+                    auto_extracted_data = None
 
                 if document_id:
                     supabase = get_supabase_service()
@@ -492,36 +511,60 @@ async def process_single_image_simple(
             wants_receipt = document_mode == 'receipt'
             wants_notes = document_mode == 'notes'
 
+            # Auto mode already extracted the typed data in the SAME unified call, so
+            # reuse it here instead of making a second OCR call. The parser guarantees
+            # auto_extracted_data matches the resolved document_mode (dict for
+            # invoice/receipt/bank_statement/notes, CSV string for table). When it is
+            # None (detect failure or an unsupported type that fell back to receipt),
+            # we run the dedicated extractor so the document is never left empty.
+            reuse_auto = requested_document_mode == "auto" and auto_extracted_data is not None
             if wants_bank_statement:
-                bank_statement_data = await _ocr_call(
-                    lambda m: olmocr.extract_bank_statement_from_image(image_data, ocr_language=ocr_language, model=m),
-                    "bank_statement",
-                )
+                if reuse_auto:
+                    bank_statement_data = auto_extracted_data
+                else:
+                    bank_statement_data = await _ocr_call(
+                        lambda m: olmocr.extract_bank_statement_from_image(image_data, ocr_language=ocr_language, model=m),
+                        "bank_statement",
+                    )
             elif wants_invoice:
-                invoice_data = await _ocr_call(
-                    lambda m: olmocr.extract_invoice_from_image(image_data, ocr_language=ocr_language, model=m),
-                    "invoice",
-                )
+                if reuse_auto:
+                    invoice_data = auto_extracted_data
+                else:
+                    invoice_data = await _ocr_call(
+                        lambda m: olmocr.extract_invoice_from_image(image_data, ocr_language=ocr_language, model=m),
+                        "invoice",
+                    )
             elif wants_receipt:
-                receipt_data = await _ocr_call(
-                    lambda m: olmocr.extract_receipt_from_image(image_data, ocr_language=ocr_language, model=m),
-                    "receipt",
-                )
+                if reuse_auto:
+                    receipt_data = auto_extracted_data
+                else:
+                    receipt_data = await _ocr_call(
+                        lambda m: olmocr.extract_receipt_from_image(image_data, ocr_language=ocr_language, model=m),
+                        "receipt",
+                    )
             elif wants_notes:
-                notes_data = await _ocr_call(
-                    lambda m: olmocr.extract_notes_from_image(image_data, ocr_language=ocr_language, model=m),
-                    "notes",
-                )
+                if reuse_auto:
+                    notes_data = auto_extracted_data
+                else:
+                    notes_data = await _ocr_call(
+                        lambda m: olmocr.extract_notes_from_image(image_data, ocr_language=ocr_language, model=m),
+                        "notes",
+                    )
             elif wants_text_output:
                 text_data = await _ocr_call(
                     lambda m: olmocr.extract_text_from_image(image_data, ocr_language=ocr_language, model=m),
                     "text",
                 )
             else:
-                csv_data = await _ocr_call(
-                    lambda m: olmocr.extract_table_from_image(image_data, ocr_language=ocr_language, model=m),
-                    "table",
-                )
+                if reuse_auto:
+                    # Unified call returned the grid as a CSV string (same shape
+                    # extract_table_from_image produces).
+                    csv_data = auto_extracted_data if isinstance(auto_extracted_data, str) else ""
+                else:
+                    csv_data = await _ocr_call(
+                        lambda m: olmocr.extract_table_from_image(image_data, ocr_language=ocr_language, model=m),
+                        "table",
+                    )
         finally:
             # Per-model semaphores are acquired/released inside _ocr_call above.
             pass
@@ -706,9 +749,10 @@ async def process_single_image_simple(
         requires_review = bool(review_flags)
 
         # P1 — Handwritten specialist signals.
-        # is_handwritten: derived from the resolved document_mode. Notes mode is
-        # always handwritten in the current product flow; future backends can
-        # override this by emitting an explicit signal on classification_data.
+        # is_handwritten now comes from the model: the unified detect+extract call
+        # reports it as a SEPARATE boolean attribute (a handwritten invoice is still
+        # classified as invoice, etc.). Notes mode still implies handwriting as a
+        # floor so legacy/non-auto notes extractions keep the signal.
         classification_handwritten = bool(classification_data.get("is_handwritten")) if classification_data else False
         is_handwritten = bool(wants_notes or classification_handwritten)
 
