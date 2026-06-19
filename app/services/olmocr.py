@@ -92,6 +92,38 @@ class OlmOCRService:
         except Exception as exc:
             raise OlmOCRError(f"Failed to render PDF for OCR: {exc}") from exc
 
+    def _downscale_for_ocr(self, image_bytes: bytes, max_dim: int = 2048, quality: int = 85) -> bytes:
+        """Downscale oversized photos before the vision call to cut latency + memory.
+
+        Big phone photos (3-5 MB, 3000-4000 px) cost upload time, vision-token
+        prefill, and worker RAM with no OCR accuracy gain. We cap the longest side
+        and re-encode as JPEG. Images already within the cap (including 180-DPI PDF
+        page renders, which are ~1980px) pass through untouched, so PDF quality is
+        never degraded. Any failure falls back to the original bytes.
+        """
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                if max(img.size) <= max_dim:
+                    return image_bytes
+                scale = max_dim / float(max(img.size))
+                new_size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample = Image.LANCZOS
+                resized = img.convert("RGB").resize(new_size, resample)
+                buffer = io.BytesIO()
+                resized.save(buffer, format="JPEG", quality=quality, optimize=True)
+                downscaled = buffer.getvalue()
+                logger.info(
+                    f"Downscaled OCR image {img.size}->{new_size} "
+                    f"({len(image_bytes)//1024}KB->{len(downscaled)//1024}KB)"
+                )
+                return downscaled
+        except Exception as exc:
+            logger.debug(f"Image downscale skipped: {exc}")
+            return image_bytes
+
     @staticmethod
     def _ocr_language_instruction(ocr_language: Optional[str]) -> str:
         code = str(ocr_language or "en").strip().lower()
@@ -247,6 +279,7 @@ class OlmOCRService:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
             
             # Convert to base64 for API
+            image_bytes = self._downscale_for_ocr(image_bytes)
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             language_instruction = self._ocr_language_instruction(ocr_language)
             
@@ -361,6 +394,7 @@ class OlmOCRService:
             except Exception as e:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
+            image_bytes = self._downscale_for_ocr(image_bytes)
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
@@ -415,6 +449,7 @@ class OlmOCRService:
                 image_bytes = page_images[0]
 
             await self._apply_rate_limiting()
+            image_bytes = self._downscale_for_ocr(image_bytes)
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
@@ -530,6 +565,7 @@ class OlmOCRService:
             except Exception as e:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
+            image_bytes = self._downscale_for_ocr(image_bytes)
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [{
@@ -686,6 +722,7 @@ class OlmOCRService:
             except Exception as e:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
+            image_bytes = self._downscale_for_ocr(image_bytes)
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
@@ -844,6 +881,7 @@ class OlmOCRService:
             except Exception as e:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
+            image_bytes = self._downscale_for_ocr(image_bytes)
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [
@@ -980,6 +1018,7 @@ class OlmOCRService:
             except Exception as e:
                 logger.debug(f"PIL processing note: {str(e)} - proceeding with original image")
 
+            image_bytes = self._downscale_for_ocr(image_bytes)
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             language_instruction = self._ocr_language_instruction(ocr_language)
             messages = [

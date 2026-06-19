@@ -21,9 +21,10 @@ class Settings(BaseSettings):
     # How many *additional* models to try when a page fails on its primary model.
     # Kept at 1 so the worst case stays bounded: per OCR call =
     #   (1 + ocr_failover_attempts) models x ocr_max_attempts_per_model attempts x ocr_request_timeout.
-    # With the defaults below that is 2 x 2 x 45s = 180s, comfortably under the
+    # With the defaults below that is 2 x 1 x 45s = 90s, comfortably under the
     # Celery soft time limit (see app/tasks/celery_app.py) even for auto mode
-    # (classify + extract = ~360s worst case).
+    # (classify + extract = ~180s worst case). Images are downscaled before the
+    # call (_downscale_for_ocr) so typical calls land in ~10-15s, not the cap.
     ocr_failover_attempts: int = Field(1, env="OCR_FAILOVER_ATTEMPTS")
     # Per-call timeout (seconds) for a single vision-model request. Must exceed the
     # slowest model's latency (Qwen3-VL-30B ≈ 35s) or it times out before responding.
@@ -34,7 +35,7 @@ class Settings(BaseSettings):
     # transient classes; non-retryable errors (4xx other than 408/409/429) give
     # up immediately. Model failover (ocr_failover_attempts) is a SEPARATE layer
     # that escapes a persistently-bad model — the two are bounded together above.
-    ocr_max_attempts_per_model: int = Field(2, env="OCR_MAX_ATTEMPTS_PER_MODEL")
+    ocr_max_attempts_per_model: int = Field(1, env="OCR_MAX_ATTEMPTS_PER_MODEL")
     # Base/cap (seconds) for the jittered exponential backoff between retries of
     # the same model inside a single OCR call.
     ocr_retry_base_delay_seconds: float = Field(1.5, env="OCR_RETRY_BASE_DELAY_SECONDS")
