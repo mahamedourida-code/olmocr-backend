@@ -1473,6 +1473,8 @@ async def get_job_status(
                         confidence_score=file_info.get('confidence_score'),
                         is_handwritten=file_info.get('is_handwritten'),
                         row_confidence=file_info.get('row_confidence'),
+                        uncertain_cells=file_info.get('uncertain_cells') or [],
+                        certainty=file_info.get('certainty'),
                         review_flags=file_info.get('review_flags') or [],
                         created_at=file_created_at
                     ))

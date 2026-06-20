@@ -44,6 +44,8 @@ class ProcessedFile(BaseModel):
     confidence_score: Optional[float] = Field(None, description="Approximate confidence score for UI review")
     is_handwritten: Optional[bool] = Field(None, description="True when the source was handwritten (specialist mode)")
     row_confidence: Optional[List[float]] = Field(None, description="Per-row confidence scores (0-1) for tabular handwritten output")
+    uncertain_cells: Optional[List[List[int]]] = Field(default_factory=list, description="Self-reported low-confidence cells as [rowIndex, colIndex] pairs into review_grid (header is row 0, never flagged); empty when confident")
+    certainty: Optional[int] = Field(None, description="Per-file certainty 0-100; 100 when no uncertain cells, floored at 5")
     review_flags: List[Dict[str, Any]] = Field(default_factory=list, description="Areas that should be checked")
     created_at: datetime = Field(..., description="File creation timestamp")
     

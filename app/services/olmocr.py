@@ -226,6 +226,25 @@ class OlmOCRService:
         Raises:
             OlmOCRError: If API call fails or returns invalid response
         """
+        result = await self.extract_table_with_uncertainty_from_image(
+            image_data, ocr_language=ocr_language, model=model
+        )
+        return result.get("csv", "")
+
+    async def extract_table_with_uncertainty_from_image(
+        self,
+        image_data: Union[bytes, str],
+        ocr_language: Optional[str] = "en",
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract a table AND the model's self-reported uncertain cells.
+
+        Returns ``{"csv": <csv string>, "uncertain_cells": [[row, col], ...]}`` where
+        the coordinates are 0-based into the markdown/CSV grid (header is row 0),
+        clamped to the cells that actually exist in the returned CSV. The plain
+        ``extract_table_from_image`` wrapper drops the coordinates for callers that
+        only want the CSV string.
+        """
         try:
             # Handle both bytes and base64 string input
             if isinstance(image_data, bytes):
@@ -239,7 +258,8 @@ class OlmOCRService:
                 image_bytes = base64.b64decode(img_b64_str)
 
             if self._is_pdf_bytes(image_bytes):
-                return await self._extract_table_from_pdf(image_bytes, ocr_language=ocr_language, model=model)
+                csv_blob = await self._extract_table_from_pdf(image_bytes, ocr_language=ocr_language, model=model)
+                return {"csv": csv_blob, "uncertain_cells": []}
 
             # Apply rate limiting before making the image OCR API call
             await self._apply_rate_limiting()
@@ -302,7 +322,11 @@ class OlmOCRService:
                                 "column labels, amounts, dates, signs, and hierarchy. Do not summarize, explain, or add prose. "
                                 "Use an empty cell when a value is unclear. Prefer one markdown table; if there are multiple "
                                 "tables, return them one after another separated by one blank line. Do not say you are unable "
-                                "to extract the table unless there is no readable table at all. Return markdown table content only."
+                                "to extract the table unless there is no readable table at all. Return markdown table content only. "
+                                "After the table, leave one blank line and then output a single final line listing the cells you "
+                                "are NOT confident you read correctly from the image. Use exactly this format: "
+                                "UNCERTAIN: r,c; r,c where r and c are 0-based cell coordinates (the header counts as row 0). "
+                                "If you are confident about every cell, output exactly: UNCERTAIN:"
                             ) + language_instruction
                         }
                     ]
@@ -320,9 +344,13 @@ class OlmOCRService:
             raw_content = response.choices[0].message.content.strip()
             logger.info(f"Received OCR response, length: {len(raw_content)}")
             logger.debug(f"Raw OCR response (first 500 chars): {raw_content[:500]}...")
-            
+
             # Clean the response (remove code blocks, etc.)
             cleaned_content = self._clean_ocr_response(raw_content)
+
+            # Strip the self-reported "UNCERTAIN: r,c; r,c" line before parsing the
+            # table so it never leaks into a cell, capturing the reported coordinates.
+            cleaned_content, uncertain_cells = self._split_uncertain_table_line(cleaned_content)
 
             json_csv_content = self._extract_csv_from_json_response(cleaned_content)
             if self._validate_csv_content(json_csv_content):
@@ -352,8 +380,9 @@ class OlmOCRService:
                     csv_content = '\n'.join([line.strip() for line in lines if line.strip()])
             
             logger.info(f"Successfully processed OCR data: {len(csv_content.split(chr(10)))} rows")
-            return csv_content
-            
+            clamped_uncertain = self._clamp_uncertain_cells_to_csv(uncertain_cells, csv_content)
+            return {"csv": csv_content, "uncertain_cells": clamped_uncertain}
+
         except OlmOCRError:
             raise
         except Exception as e:
@@ -579,7 +608,10 @@ class OlmOCRService:
                             "Return the readable narrative in reading order, preserving headings and line breaks. "
                             "If a visible table exists, extract only its visible columns and rows. "
                             "Do not invent a table from prose, summarize, classify accounting, or post data anywhere. "
-                            "Use empty arrays when no table is visible and add review notes only for unclear text or cells."
+                            "Use empty arrays when no table is visible and add review notes only for unclear text or cells. "
+                            "In uncertain_fields, list the JSON field names (for table cells use a path like "
+                            "tables[0].rows[2].cells[1]) of any value you are NOT confident you read correctly from the "
+                            "image; empty array if confident."
                             + language_instruction
                         ),
                     },
@@ -589,7 +621,9 @@ class OlmOCRService:
                 "type": "json_schema",
                 "json_schema": {
                     "name": "notes_extraction",
-                    "strict": True,
+                    # strict relaxed so the optional self-reported uncertain_fields
+                    # array can be present without being a required property.
+                    "strict": False,
                     "schema": {
                         "type": "object",
                         "properties": {
@@ -624,9 +658,10 @@ class OlmOCRService:
                                     "additionalProperties": False,
                                 },
                             },
+                            "uncertain_fields": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["readable_text", "tables", "review_notes"],
-                        "additionalProperties": False,
+                        "additionalProperties": True,
                     },
                 },
             }
@@ -788,9 +823,12 @@ class OlmOCRService:
                                 "(array of objects with title, columns (array of strings), rows (array of objects each with a "
                                 "cells array of strings)); use an empty tables array when no table is visible.\n\n"
                                 "Use empty strings for fields that are not visible and empty arrays when there are no rows. "
-                                "Preserve visible number, currency, and date formatting exactly. Return ONLY the single JSON "
-                                "object, with document_type, confidence, is_handwritten, review_reason, and the detected "
-                                "type's fields all at the top level."
+                                "Preserve visible number, currency, and date formatting exactly. "
+                                "Also include a top-level array uncertain_fields: list the JSON field names (for line items use "
+                                "a path like line_items[2].amount, for bank rows transactions[0].balance) of any value you are "
+                                "NOT confident you read correctly from the image; empty array if confident. "
+                                "Return ONLY the single JSON object, with document_type, confidence, is_handwritten, "
+                                "review_reason, uncertain_fields, and the detected type's fields all at the top level."
                                 + language_instruction
                             ),
                         },
@@ -887,12 +925,19 @@ class OlmOCRService:
         else:
             structured_data = self._parse_receipt_json(raw_json)
 
+        # The dict structured_data (invoice/receipt/bank/notes) already carries the
+        # self-reported uncertain_fields via its _parse_<type>_json. For the table
+        # branch structured_data is a bare CSV string, so surface the top-level
+        # uncertain_fields here too so the caller can still map them if present.
+        uncertain_fields = self._extract_uncertain_fields(parsed)
+
         return {
             "document_type": document_type,
             "confidence": confidence,
             "is_handwritten": is_handwritten,
             "review_reason": review_reason,
             "type_fallback": type_fallback,
+            "uncertain_fields": uncertain_fields,
             "classification": {
                 "document_type": document_type,
                 "confidence": confidence,
@@ -959,7 +1004,10 @@ class OlmOCRService:
                                 "Keep every visible transaction row in document order. "
                                 "Set readable to false only when a row cannot be reliably transcribed, and describe the issue in review_note. "
                                 "Use review_notes only for visible OCR uncertainty such as an unreadable row or a visibly missing statement page. "
-                                "Preserve original wording and number formatting."
+                                "Preserve original wording and number formatting. "
+                                "In uncertain_fields, list the JSON field names (for transaction rows use a path like "
+                                "transactions[2].balance) of any value you are NOT confident you read correctly from the image; "
+                                "empty array if confident."
                                 + language_instruction
                             )
                         }
@@ -970,7 +1018,9 @@ class OlmOCRService:
                 "type": "json_schema",
                 "json_schema": {
                     "name": "bank_statement_extraction",
-                    "strict": True,
+                    # strict relaxed so the optional self-reported uncertain_fields
+                    # array can be present without being a required property.
+                    "strict": False,
                     "schema": {
                         "type": "object",
                         "properties": {
@@ -1017,6 +1067,7 @@ class OlmOCRService:
                                     "additionalProperties": False,
                                 },
                             },
+                            "uncertain_fields": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": [
                             "account_holder", "bank_name", "account_number", "period",
@@ -1024,7 +1075,7 @@ class OlmOCRService:
                             "printed_page_number", "printed_page_count", "transactions",
                             "raw_text", "review_notes",
                         ],
-                        "additionalProperties": False,
+                        "additionalProperties": True,
                     },
                 },
             }
@@ -1115,7 +1166,9 @@ class OlmOCRService:
                                 "Extract only visible invoice data for human review. "
                                 "Do not infer missing values, calculate missing totals, or classify accounting. "
                                 "Return JSON matching the supplied schema. Use empty strings when fields are not visible. "
-                                "Preserve visible number and date formatting. For line_items, include one item per visible invoice row."
+                                "Preserve visible number and date formatting. For line_items, include one item per visible invoice row. "
+                                "In uncertain_fields, list the JSON field names (for line items use a path like line_items[2].amount) "
+                                "of any value you are NOT confident you read correctly from the image; empty array if confident."
                                 + language_instruction
                             )
                         }
@@ -1126,7 +1179,9 @@ class OlmOCRService:
                 "type": "json_schema",
                 "json_schema": {
                     "name": "invoice_extraction",
-                    "strict": True,
+                    # strict relaxed so the optional self-reported uncertain_fields
+                    # array can be present without being a required property.
+                    "strict": False,
                     "schema": {
                         "type": "object",
                         "properties": {
@@ -1155,13 +1210,14 @@ class OlmOCRService:
                                     "additionalProperties": False,
                                 },
                             },
+                            "uncertain_fields": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": [
                             "vendor_name", "supplier_tax_vat_id", "invoice_number",
                             "invoice_date", "due_date", "po_reference", "subtotal",
                             "tax_vat_amount", "total", "currency", "line_items",
                         ],
-                        "additionalProperties": False,
+                        "additionalProperties": True,
                     },
                 },
             }
@@ -1260,7 +1316,9 @@ class OlmOCRService:
                                 "you can read in raw_text. Return JSON with keys merchant, date, payment_method, currency, "
                                 "subtotal, tax_vat_amount, total, discount, tip, raw_text, review_notes, and line_items. "
                                 "Each line_items row should use description, quantity, unit_price, tax_rate, and line_total. "
-                                "Use empty strings only for fields that are not visible."
+                                "Use empty strings only for fields that are not visible. "
+                                "In uncertain_fields, list the JSON field names (for line items use a path like line_items[2].amount) "
+                                "of any value you are NOT confident you read correctly from the image; empty array if confident."
                                 + language_instruction
                             )
                         }
@@ -1301,6 +1359,7 @@ class OlmOCRService:
                                     "additionalProperties": False,
                                 },
                             },
+                            "uncertain_fields": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": [
                             "merchant", "date", "payment_method", "currency", "subtotal",
@@ -1430,6 +1489,7 @@ class OlmOCRService:
             "opening_balance": normalized["opening_balance"],
             "closing_balance": normalized["closing_balance"],
         }
+        normalized["uncertain_fields"] = self._extract_uncertain_fields(parsed)
         normalized["review_flags"] = self._validate_bank_statement_data(normalized)
         if parse_failed:
             normalized["review_flags"].append({
@@ -1494,6 +1554,7 @@ class OlmOCRService:
             "opening_balance": merged["opening_balance"],
             "closing_balance": merged["closing_balance"],
         }
+        merged["uncertain_fields"] = self._merge_scalar_uncertain_fields(page_results)
         merged["review_flags"] = self._validate_bank_statement_data(
             merged,
             available_printed_pages=printed_page_numbers,
@@ -1601,6 +1662,46 @@ class OlmOCRService:
         parsed = int(match.group(0))
         return parsed if parsed > 0 else None
 
+    @staticmethod
+    def _extract_uncertain_fields(parsed: Any) -> List[str]:
+        """Pull the model's self-reported ``uncertain_fields`` array off a parsed reply.
+
+        Returns a de-duplicated list of field-path strings (e.g. ``"total"`` or
+        ``"line_items[2].amount"``). Anything that is not a non-empty string is
+        ignored. The grid mapping in simple_batch translates these paths into
+        ``uncertain_cells`` against the rendered review grid.
+        """
+        if not isinstance(parsed, dict):
+            return []
+        raw = parsed.get("uncertain_fields")
+        if not isinstance(raw, list):
+            return []
+        seen: List[str] = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in seen:
+                seen.append(text)
+        return seen
+
+    @staticmethod
+    def _merge_scalar_uncertain_fields(page_results: List[Dict[str, Any]]) -> List[str]:
+        """Union the non-indexed uncertain field paths across merged pages.
+
+        Indexed paths (``line_items[2].amount``, ``transactions[0].balance``) are
+        dropped because row indices shift when pages are concatenated and can no
+        longer be reliably mapped to a grid cell. Scalar paths (``total``,
+        ``invoice_number``) stay valid and are kept.
+        """
+        merged: List[str] = []
+        for result in page_results:
+            if not isinstance(result, dict):
+                continue
+            for path in result.get("uncertain_fields") or []:
+                text = str(path or "").strip()
+                if text and "[" not in text and text not in merged:
+                    merged.append(text)
+        return merged
+
     def _parse_notes_json(self, content: str) -> Dict[str, Any]:
         parsed: Dict[str, Any] = {}
         parse_failed = False
@@ -1646,6 +1747,7 @@ class OlmOCRService:
                 if isinstance(note, dict) and str(note.get("note") or "").strip()
             ],
         }
+        normalized["uncertain_fields"] = self._extract_uncertain_fields(parsed)
         normalized["review_flags"] = self._validate_notes_data(normalized)
         if parse_failed:
             normalized["review_flags"].append({
@@ -1677,6 +1779,7 @@ class OlmOCRService:
             "readable_text": "\n\n".join(text_parts),
             "tables": tables,
             "review_notes": review_notes,
+            "uncertain_fields": self._merge_scalar_uncertain_fields(page_results),
         }
         merged["review_flags"] = self._validate_notes_data(merged)
         for flag in page_flags:
@@ -1741,6 +1844,7 @@ class OlmOCRService:
                 "tax_rate": str(row.get("tax_rate") or row.get("tax") or "").strip(),
                 "line_total": str(row.get("line_total") or row.get("total") or "").strip(),
             })
+        normalized["uncertain_fields"] = self._extract_uncertain_fields(parsed)
         normalized["review_flags"] = self._validate_invoice_data(normalized)
         if parse_failed:
             normalized["review_flags"].append({
@@ -1765,6 +1869,9 @@ class OlmOCRService:
             for row in result.get("line_items") or []:
                 if isinstance(row, dict):
                     merged["line_items"].append({"page": page, **row})
+        # Only scalar (non line-item-indexed) uncertain paths survive a page merge;
+        # row indices shift when pages are concatenated so indexed paths are dropped.
+        merged["uncertain_fields"] = self._merge_scalar_uncertain_fields(page_results)
         merged["review_flags"] = self._validate_invoice_data(merged)
         return merged
 
@@ -1981,6 +2088,7 @@ class OlmOCRService:
                         normalized["merchant"] = candidate
                         break
 
+        normalized["uncertain_fields"] = self._extract_uncertain_fields(parsed)
         normalized["review_flags"] = self._validate_receipt_data(normalized)
         if parse_failed:
             normalized["review_flags"].append({
@@ -2005,6 +2113,7 @@ class OlmOCRService:
             for row in result.get("line_items") or []:
                 if isinstance(row, dict):
                     merged["line_items"].append({"page": page, **row})
+        merged["uncertain_fields"] = self._merge_scalar_uncertain_fields(page_results)
         merged["review_flags"] = self._validate_receipt_data(merged)
         return merged
 
@@ -2186,6 +2295,65 @@ class OlmOCRService:
         result = '\n'.join(csv_rows)
         logger.info(f"Parsed HTML table: {len(csv_rows)} rows extracted")
         return result
+
+    def _split_uncertain_table_line(self, content: str) -> tuple[str, List[List[int]]]:
+        """Pull the trailing ``UNCERTAIN: r,c; r,c`` line off a markdown table reply.
+
+        Returns ``(content_without_that_line, [[row, col], ...])`` with 0-based
+        coordinates (header counts as row 0). ``UNCERTAIN:`` with nothing after it
+        means the model was confident, so the coordinate list is empty. The line is
+        removed wherever it appears so it never becomes a table cell.
+        """
+        if not content:
+            return content, []
+
+        lines = content.split("\n")
+        kept_lines: List[str] = []
+        coords: List[List[int]] = []
+        for line in lines:
+            stripped = line.strip()
+            if re.match(r"^uncertain\s*:", stripped, flags=re.IGNORECASE):
+                payload = stripped.split(":", 1)[1] if ":" in stripped else ""
+                for pair in payload.split(";"):
+                    numbers = re.findall(r"-?\d+", pair)
+                    if len(numbers) >= 2:
+                        row, col = int(numbers[0]), int(numbers[1])
+                        if row >= 0 and col >= 0 and [row, col] not in coords:
+                            coords.append([row, col])
+                continue
+            kept_lines.append(line)
+
+        return "\n".join(kept_lines).strip(), coords
+
+    def _clamp_uncertain_cells_to_csv(
+        self, uncertain_cells: List[List[int]], csv_content: str
+    ) -> List[List[int]]:
+        """Drop any reported coordinate that falls outside the final CSV grid.
+
+        The header is row 0; row 0 is dropped so the header is never flagged. Only
+        coordinates that land on a real data cell of the parsed CSV survive.
+        """
+        if not uncertain_cells or not isinstance(csv_content, str) or not csv_content.strip():
+            return []
+
+        grid: List[List[str]] = []
+        for row in csv.reader(io.StringIO(csv_content)):
+            grid.append([str(cell) for cell in row])
+        if not grid:
+            return []
+
+        clamped: List[List[int]] = []
+        for pair in uncertain_cells:
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            row, col = int(pair[0]), int(pair[1])
+            if row <= 0 or row >= len(grid):
+                continue
+            if col < 0 or col >= len(grid[row]):
+                continue
+            if [row, col] not in clamped:
+                clamped.append([row, col])
+        return clamped
 
     def _clean_ocr_response(self, content: str) -> str:
         """

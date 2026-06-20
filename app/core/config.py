@@ -10,12 +10,12 @@ class Settings(BaseSettings):
     # OlmOCR API Configuration
     olmocr_api_key: str = Field(..., env="OLMOCR_API_KEY")
     olmocr_base_url: str = Field("https://api.deepinfra.com/v1/openai", env="OLMOCR_BASE_URL")
-    olmocr_model: str = Field("google/gemma-3-4b-it", env="OLMOCR_MODEL")
-    # Additional vision models the OCR pipeline load-balances across (comma-separated).
+    olmocr_model: str = Field("Qwen/Qwen3-VL-30B-A3B-Instruct", env="OLMOCR_MODEL")
+    # Two vision models the OCR pipeline load-balances across (comma-separated).
     # Each page is routed round-robin to one of these (primary first) with failover to
-    # the others, so the per-model load is spread and batches finish faster.
+    # the other, so the per-model load is spread and batches finish faster.
     ocr_models: Union[str, list] = Field(
-        "google/gemma-3-4b-it,meta-llama/Llama-3.2-11B-Vision-Instruct,Qwen/Qwen3-VL-30B-A3B-Instruct",
+        "Qwen/Qwen3-VL-30B-A3B-Instruct,meta-llama/Llama-3.2-11B-Vision-Instruct",
         env="OCR_MODELS",
     )
     # How many *additional* models to try when a page fails on its primary model.

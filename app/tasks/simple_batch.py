@@ -10,6 +10,7 @@ import csv
 import io
 import json
 import logging
+import re
 import uuid
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
@@ -151,6 +152,177 @@ def _compute_row_confidence(structured_data: Any, document_mode: str) -> List[fl
         return []
 
     return [round(_bucket_confidence(_row_fill_ratio(row)), 3) for row in rows]
+
+
+# Column layout of the line-item / transaction grid the frontend renders per mode.
+# Header row (row 0) is these labels; data rows follow. Field paths reported by the
+# model map to (row, col) against this exact grid. Keep in lockstep with the
+# frontend's lineItems config (src/app/dashboard/document/page.tsx).
+_LINE_ITEM_COLUMNS: Dict[str, List[tuple]] = {
+    # (header label, structured-data key, set of field-path aliases the model may use)
+    "invoice": [
+        ("Description", "description", {"description", "desc"}),
+        ("Qty", "quantity", {"quantity", "qty"}),
+        ("Unit price", "unit_price", {"unit_price", "unitprice", "price"}),
+        ("Tax rate", "tax_rate", {"tax_rate", "taxrate", "tax"}),
+        ("Amount", "line_total", {"line_total", "linetotal", "amount", "total"}),
+    ],
+    "receipt": [
+        ("Description", "description", {"description", "desc"}),
+        ("Qty", "quantity", {"quantity", "qty"}),
+        ("Unit price", "unit_price", {"unit_price", "unitprice", "price"}),
+        ("Tax rate", "tax_rate", {"tax_rate", "taxrate", "tax"}),
+        ("Amount", "line_total", {"line_total", "linetotal", "amount", "total"}),
+    ],
+    "bank_statement": [
+        ("Date", "date", {"date"}),
+        ("Description", "description", {"description", "desc"}),
+        ("Reference", "reference", {"reference", "ref"}),
+        ("Debit", "debit", {"debit"}),
+        ("Credit", "credit", {"credit"}),
+        ("Balance", "balance", {"balance"}),
+    ],
+}
+_LINE_ITEM_ROOT = {"invoice": "line_items", "receipt": "line_items", "bank_statement": "transactions"}
+
+
+def _build_review_grid(structured_data: Any, document_mode: str) -> List[List[str]]:
+    """Build the canonical 2D review grid the frontend renders for this mode.
+
+    - table:        the existing CSV-derived grid (already on structured_data).
+    - invoice/receipt: line_items as rows under a fixed header row.
+    - bank_statement:  transactions as rows under a fixed header row.
+    - notes:        the first detected table, header + cells.
+    Returns ``[]`` when there is no row-structured grid to render.
+    """
+    if not isinstance(structured_data, dict):
+        return []
+
+    if document_mode in _LINE_ITEM_COLUMNS:
+        columns = _LINE_ITEM_COLUMNS[document_mode]
+        root = _LINE_ITEM_ROOT[document_mode]
+        rows = structured_data.get(root) or []
+        if not isinstance(rows, list) or not rows:
+            return []
+        grid: List[List[str]] = [[label for label, _key, _aliases in columns]]
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            grid.append([str(row.get(key) or "").strip() for _label, key, _aliases in columns])
+        return grid if len(grid) > 1 else []
+
+    if document_mode == "notes":
+        tables = structured_data.get("tables") or []
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            columns = [str(cell or "").strip() for cell in table.get("columns") or []]
+            data_rows = [
+                [str(cell or "").strip() for cell in (row or [])]
+                for row in table.get("rows") or []
+                if isinstance(row, list)
+            ]
+            if columns or data_rows:
+                grid = ([columns] if columns else []) + data_rows
+                return grid if grid else []
+        return []
+
+    # table mode (and anything else): use the grid already attached / CSV fallback.
+    grid = structured_data.get("review_grid")
+    if isinstance(grid, list):
+        clean = [[str(cell) for cell in row] for row in grid if isinstance(row, list)]
+        return clean
+    csv_blob = structured_data.get("csv")
+    if isinstance(csv_blob, str) and csv_blob.strip():
+        return _csv_to_review_grid(csv_blob)
+    return []
+
+
+def _normalize_field_token(value: str) -> str:
+    return "".join(char for char in str(value).lower() if char.isalnum())
+
+
+def _map_uncertain_fields_to_cells(
+    uncertain_fields: List[str],
+    review_grid: List[List[str]],
+    document_mode: str,
+) -> List[List[int]]:
+    """Translate model-reported field paths into [row, col] cells of review_grid.
+
+    A line/transaction path (``line_items[2].amount`` / ``transactions[0].balance``)
+    maps to that data row (header is row 0, so data row i -> grid row i+1) and the
+    column whose aliases match the trailing key. Scalar paths that do not name a
+    grid column are dropped (they live in header fields, not the grid). Coordinates
+    are clamped to the grid; the header row is never flagged.
+    """
+    if not uncertain_fields or not review_grid or len(review_grid) < 2:
+        return []
+    columns = _LINE_ITEM_COLUMNS.get(document_mode)
+    if not columns:
+        return []
+    root = _LINE_ITEM_ROOT.get(document_mode, "")
+    root_token = _normalize_field_token(root)
+    data_row_count = len(review_grid) - 1
+
+    cells: List[List[int]] = []
+    for path in uncertain_fields:
+        text = str(path or "").strip()
+        if not text:
+            continue
+        # Pull the row index out of e.g. line_items[2].amount -> 2
+        index_match = re.search(r"\[(\d+)\]", text)
+        if not index_match:
+            continue
+        # Only map paths that target this grid's root collection.
+        prefix = text[: index_match.start()]
+        if root_token and root_token not in _normalize_field_token(prefix):
+            continue
+        row_index = int(index_match.group(1))
+        if row_index < 0 or row_index >= data_row_count:
+            continue
+        trailing = text[index_match.end():]
+        key_token = _normalize_field_token(trailing)
+        if not key_token:
+            continue
+        col_index = None
+        for idx, (_label, _key, aliases) in enumerate(columns):
+            if any(_normalize_field_token(alias) in key_token or key_token in _normalize_field_token(alias) for alias in aliases):
+                col_index = idx
+                break
+        if col_index is None:
+            continue
+        grid_row = row_index + 1
+        if grid_row < len(review_grid) and col_index < len(review_grid[grid_row]):
+            pair = [grid_row, col_index]
+            if pair not in cells:
+                cells.append(pair)
+    return cells
+
+
+def _count_non_empty_data_cells(review_grid: List[List[str]]) -> int:
+    """Count non-empty cells in review_grid EXCLUDING the header row (row 0)."""
+    if not isinstance(review_grid, list) or len(review_grid) < 2:
+        return 0
+    total = 0
+    for row in review_grid[1:]:
+        if not isinstance(row, list):
+            continue
+        for cell in row:
+            if str(cell or "").strip():
+                total += 1
+    return total
+
+
+def _compute_certainty(uncertain_cells: List[List[int]], review_grid: List[List[str]]) -> int:
+    """Per-file certainty %: 100 when nothing uncertain, else scaled by share of
+    flagged data cells. Floored at 5 (never 0). Defaults to 100 when no grid."""
+    if not uncertain_cells:
+        return 100
+    total_data_cells = _count_non_empty_data_cells(review_grid)
+    if total_data_cells <= 0:
+        return 100
+    certainty = round(100 * (1 - len(uncertain_cells) / total_data_cells))
+    return max(5, min(100, certainty))
 
 
 def _parse_job_metadata(job_record: Dict[str, Any]) -> Dict[str, Any]:
@@ -306,6 +478,9 @@ async def process_single_image_simple(
         # only). When set, the extraction block below skips the second OCR call and
         # reuses this so the whole flow runs on ONE external-API call.
         auto_extracted_data = None
+        # Self-reported uncertain table cells (0-based [row, col], header = row 0)
+        # captured from the dedicated markdown-table path. Empty for other modes.
+        table_uncertain_cells: List[List[int]] = []
         single_file_progress = total_images == 1
 
         async def _publish_single_file_stage(stage: str, stage_progress: int, stage_message: str) -> None:
@@ -558,12 +733,18 @@ async def process_single_image_simple(
             else:
                 if reuse_auto:
                     # Unified call returned the grid as a CSV string (same shape
-                    # extract_table_from_image produces).
+                    # extract_table_from_image produces). The unified path reports
+                    # uncertainty as field paths, not r,c coords, so no table cells
+                    # are flagged here.
                     csv_data = auto_extracted_data if isinstance(auto_extracted_data, str) else ""
                 else:
-                    csv_data = await _ocr_call(
-                        lambda m: olmocr.extract_table_from_image(image_data, ocr_language=ocr_language, model=m),
+                    table_result = await _ocr_call(
+                        lambda m: olmocr.extract_table_with_uncertainty_from_image(image_data, ocr_language=ocr_language, model=m),
                         "table",
+                    )
+                    csv_data = table_result.get("csv", "") if isinstance(table_result, dict) else ""
+                    table_uncertain_cells = (
+                        table_result.get("uncertain_cells", []) if isinstance(table_result, dict) else []
                     )
         finally:
             # Per-model semaphores are acquired/released inside _ocr_call above.
@@ -746,6 +927,37 @@ async def process_single_image_simple(
                     "note": "No table rows were extracted; review the source document before export.",
                 },
             ]
+
+        # Self-reported uncertainty -> per-cell flags + per-file certainty.
+        # Build the canonical review grid the frontend renders for this mode, map the
+        # model's reported uncertain field paths (or the table path's r,c coords) into
+        # [row, col] cells of THAT grid, then derive certainty. Stored alongside
+        # review_grid so the documents endpoint exposes reviewed_data.uncertain_cells
+        # and reviewed_data.certainty exactly like reviewed_data.review_grid.
+        canonical_review_grid = _build_review_grid(structured_data, document_mode)
+        if document_mode == "table":
+            uncertain_cells = [
+                pair for pair in table_uncertain_cells
+                if isinstance(pair, list) and len(pair) == 2
+            ]
+        else:
+            uncertain_fields = (
+                structured_data.get("uncertain_fields") or []
+                if isinstance(structured_data, dict)
+                else []
+            )
+            uncertain_cells = _map_uncertain_fields_to_cells(
+                uncertain_fields, canonical_review_grid, document_mode
+            )
+        certainty = _compute_certainty(uncertain_cells, canonical_review_grid)
+        if isinstance(structured_data, dict):
+            # Persist the grid (so every mode exposes review_grid), plus the new
+            # fields, mirroring exactly how review_grid is stored for table mode.
+            if not isinstance(structured_data.get("review_grid"), list) and canonical_review_grid:
+                structured_data["review_grid"] = canonical_review_grid
+            structured_data["uncertain_cells"] = uncertain_cells
+            structured_data["certainty"] = certainty
+
         requires_review = bool(review_flags)
 
         # P1 — Handwritten specialist signals.
@@ -790,6 +1002,8 @@ async def process_single_image_simple(
             'confidence_score': 72 if requires_review else 92,
             'is_handwritten': is_handwritten,
             'row_confidence': row_confidence,
+            'uncertain_cells': uncertain_cells,
+            'certainty': certainty,
             'source_page': source_page,
             'source_page_count': source_page_count,
             'expires_at': (datetime.utcnow() + timedelta(hours=settings.file_retention_hours)).isoformat(),
@@ -916,6 +1130,8 @@ async def process_single_image_simple(
             document_mode=document_mode,
             requires_review=requires_review,
             confidence_score=file_record.get("confidence_score"),
+            uncertain_cells=file_record.get("uncertain_cells") or [],
+            certainty=file_record.get("certainty"),
             review_flags=review_flags
         )
 
@@ -1195,6 +1411,8 @@ async def process_batch_simple(
                 document_mode=file_data.get('document_mode'),
                 requires_review=file_data.get('requires_review'),
                 confidence_score=file_data.get('confidence_score'),
+                uncertain_cells=file_data.get('uncertain_cells') or [],
+                certainty=file_data.get('certainty'),
                 review_flags=file_data.get('review_flags') or []
             ))
 
