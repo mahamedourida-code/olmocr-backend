@@ -1426,11 +1426,27 @@ async def get_job_status(
             stage_message=job_data.get('stage_message')
         )
     
-    # Build results info
+    # Build results info.
+    #
+    # Results are surfaced PROGRESSIVELY: as soon as any image in the batch has
+    # produced a durable file we return it, so the client shows each document the
+    # moment it is ready instead of waiting for the whole batch. While the job is
+    # still 'processing' the per-image results live in Redis (image_results), so we
+    # read those; once terminal the job carries its own generated_files snapshot.
     results = None
-    if job_data.get('status') in ['completed', 'partially_completed']:
+    job_status = job_data.get('status')
+    generated_files = job_data.get('generated_files') or []
+    if job_status == 'processing' and not generated_files:
+        image_results = await redis_service.get_job_image_results(job_id)
+        generated_files = [
+            result.get('file_info')
+            for result in (image_results or {}).values()
+            if isinstance(result, dict) and result.get('status') == 'success' and result.get('file_info')
+        ]
+
+    if job_status in ['completed', 'partially_completed'] or (job_status == 'processing' and generated_files):
         from app.models.responses import BatchJobResults, ProcessedFile
-        
+
         try:
             # Calculate expiration time safely
             expires_at = None
@@ -1445,8 +1461,8 @@ async def get_job_status(
             
             # Handle multiple files (new format)
             files = []
-            if job_data.get('generated_files'):
-                for file_info in job_data['generated_files']:
+            if generated_files:
+                for file_info in generated_files:
                     created_at_value = (
                         file_info.get('completed_at')
                         or file_info.get('created_at')
@@ -1482,9 +1498,14 @@ async def get_job_status(
             # Get processing statistics
             total_images = int(job_data.get('total_images', 0))
             
-            # Calculate success/failure based on generated files vs total images
+            # Calculate success/failure based on generated files vs total images.
+            # Mid-batch the not-yet-finished images are still in flight, NOT failed,
+            # so we read the real failure count from the job instead of inferring it.
             successful_count = len(files)  # Number of files generated = successful images
-            failed_count = total_images - successful_count  # Remaining images failed
+            if job_status == 'processing':
+                failed_count = int(job_data.get('failed_images', 0))
+            else:
+                failed_count = total_images - successful_count  # Remaining images failed
             
             # Get processing time
             processing_time = float(job_data.get('processing_time', 0))
