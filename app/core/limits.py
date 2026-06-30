@@ -10,7 +10,7 @@ def normalize_plan_type(plan_type: Optional[str]) -> str:
     if plan in {"max", "business"}:
         return "max"
     if plan in {"mega", "enterprise"}:
-        return "mega"
+        return "enterprise"
     if plan == "anonymous":
         return "anonymous"
     return "free"
@@ -25,6 +25,7 @@ def get_plan_limits(plan_type: Optional[str], settings: Settings = get_settings(
         "pro": settings.pro_max_files_per_batch,
         "max": settings.max_max_files_per_batch,
         "mega": settings.mega_max_files_per_batch,
+        "enterprise": settings.enterprise_max_files_per_batch,
     }
     daily_limits = {
         "anonymous": settings.rate_limit_anonymous_images_per_day,
@@ -32,6 +33,7 @@ def get_plan_limits(plan_type: Optional[str], settings: Settings = get_settings(
         "pro": settings.rate_limit_pro_images_per_day,
         "max": settings.rate_limit_max_images_per_day,
         "mega": settings.rate_limit_mega_images_per_day,
+        "enterprise": settings.rate_limit_enterprise_images_per_day,
     }
     daily_run_limits = {
         "anonymous": settings.rate_limit_anonymous_runs_per_day,
@@ -39,6 +41,7 @@ def get_plan_limits(plan_type: Optional[str], settings: Settings = get_settings(
         "pro": 0,
         "max": 0,
         "mega": 0,
+        "enterprise": 0,
     }
 
     return {

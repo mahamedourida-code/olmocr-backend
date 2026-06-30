@@ -53,13 +53,13 @@ class Settings(BaseSettings):
     environment: str = Field("development", env="ENVIRONMENT")
     debug: bool = Field(False, env="DEBUG")
     max_file_size_mb: int = Field(10, env="MAX_FILE_SIZE_MB")
-    max_batch_size: int = Field(100, env="MAX_BATCH_SIZE")
+    max_batch_size: int = Field(250, env="MAX_BATCH_SIZE")
     anonymous_max_files_per_batch: int = Field(3, env="ANONYMOUS_MAX_FILES_PER_BATCH")
     free_max_files_per_batch: int = Field(5, env="FREE_MAX_FILES_PER_BATCH")
-    pro_max_files_per_batch: int = Field(30, env="PRO_MAX_FILES_PER_BATCH")
-    max_max_files_per_batch: int = Field(50, env="MAX_MAX_FILES_PER_BATCH")
-    mega_max_files_per_batch: int = Field(100, env="MEGA_MAX_FILES_PER_BATCH")
-    enterprise_max_files_per_batch: int = Field(50, env="ENTERPRISE_MAX_FILES_PER_BATCH")
+    pro_max_files_per_batch: int = Field(75, env="PRO_MAX_FILES_PER_BATCH")
+    max_max_files_per_batch: int = Field(200, env="MAX_MAX_FILES_PER_BATCH")
+    mega_max_files_per_batch: int = Field(250, env="MEGA_MAX_FILES_PER_BATCH")
+    enterprise_max_files_per_batch: int = Field(250, env="ENTERPRISE_MAX_FILES_PER_BATCH")
     file_retention_hours: int = Field(720, env="FILE_RETENTION_HOURS")
     
     # Server Configuration
@@ -109,10 +109,10 @@ class Settings(BaseSettings):
     rate_limit_authenticated_runs_per_day: int = Field(3, env="RATE_LIMIT_AUTHENTICATED_RUNS_PER_DAY")
     rate_limit_anonymous_images_per_day: int = Field(9, env="RATE_LIMIT_ANONYMOUS_IMAGES_PER_DAY")
     rate_limit_authenticated_images_per_day: int = Field(30, env="RATE_LIMIT_AUTHENTICATED_IMAGES_PER_DAY")
-    rate_limit_pro_images_per_day: int = Field(1000, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
-    rate_limit_max_images_per_day: int = Field(2500, env="RATE_LIMIT_MAX_IMAGES_PER_DAY")
-    rate_limit_mega_images_per_day: int = Field(7000, env="RATE_LIMIT_MEGA_IMAGES_PER_DAY")
-    rate_limit_enterprise_images_per_day: int = Field(5000, env="RATE_LIMIT_ENTERPRISE_IMAGES_PER_DAY")
+    rate_limit_pro_images_per_day: int = Field(3000, env="RATE_LIMIT_PRO_IMAGES_PER_DAY")
+    rate_limit_max_images_per_day: int = Field(12000, env="RATE_LIMIT_MAX_IMAGES_PER_DAY")
+    rate_limit_mega_images_per_day: int = Field(50000, env="RATE_LIMIT_MEGA_IMAGES_PER_DAY")
+    rate_limit_enterprise_images_per_day: int = Field(50000, env="RATE_LIMIT_ENTERPRISE_IMAGES_PER_DAY")
     queue_admission_max_queued_jobs: int = Field(50, env="QUEUE_ADMISSION_MAX_QUEUED_JOBS")
     queue_admission_max_active_jobs: int = Field(100, env="QUEUE_ADMISSION_MAX_ACTIVE_JOBS")
 
@@ -132,12 +132,12 @@ class Settings(BaseSettings):
     polar_max_yearly_price_cents: int = Field(149000, env="POLAR_MAX_YEARLY_PRICE_CENTS")
     polar_mega_monthly_price_cents: int = Field(7900, env="POLAR_MEGA_MONTHLY_PRICE_CENTS")
     polar_mega_yearly_price_cents: int = Field(79000, env="POLAR_MEGA_YEARLY_PRICE_CENTS")
-    polar_pro_monthly_credits: int = Field(1000, env="POLAR_PRO_MONTHLY_CREDITS")
-    polar_pro_yearly_credits: int = Field(12000, env="POLAR_PRO_YEARLY_CREDITS")
-    polar_max_monthly_credits: int = Field(2500, env="POLAR_MAX_MONTHLY_CREDITS")
-    polar_max_yearly_credits: int = Field(30000, env="POLAR_MAX_YEARLY_CREDITS")
-    polar_mega_monthly_credits: int = Field(7000, env="POLAR_MEGA_MONTHLY_CREDITS")
-    polar_mega_yearly_credits: int = Field(84000, env="POLAR_MEGA_YEARLY_CREDITS")
+    polar_pro_monthly_credits: int = Field(3000, env="POLAR_PRO_MONTHLY_CREDITS")
+    polar_pro_yearly_credits: int = Field(36000, env="POLAR_PRO_YEARLY_CREDITS")
+    polar_max_monthly_credits: int = Field(12000, env="POLAR_MAX_MONTHLY_CREDITS")
+    polar_max_yearly_credits: int = Field(144000, env="POLAR_MAX_YEARLY_CREDITS")
+    polar_mega_monthly_credits: int = Field(50000, env="POLAR_MEGA_MONTHLY_CREDITS")
+    polar_mega_yearly_credits: int = Field(600000, env="POLAR_MEGA_YEARLY_CREDITS")
 
     # Legacy Lemon Squeezy Billing Configuration
     lemonsqueezy_api_key: str = Field("", env="LEMONSQUEEZY_API_KEY")
@@ -159,14 +159,14 @@ class Settings(BaseSettings):
     lemonsqueezy_mega_yearly_price_cents: int = Field(53000, env="LEMONSQUEEZY_MEGA_YEARLY_PRICE_CENTS")
     lemonsqueezy_business_monthly_price_cents: int = Field(14900, env="LEMONSQUEEZY_BUSINESS_MONTHLY_PRICE_CENTS")
     lemonsqueezy_business_yearly_price_cents: int = Field(149000, env="LEMONSQUEEZY_BUSINESS_YEARLY_PRICE_CENTS")
-    lemonsqueezy_pro_monthly_credits: int = Field(1000, env="LEMONSQUEEZY_PRO_MONTHLY_CREDITS")
-    lemonsqueezy_pro_yearly_credits: int = Field(12000, env="LEMONSQUEEZY_PRO_YEARLY_CREDITS")
-    lemonsqueezy_max_monthly_credits: int = Field(2500, env="LEMONSQUEEZY_MAX_MONTHLY_CREDITS")
-    lemonsqueezy_max_yearly_credits: int = Field(30000, env="LEMONSQUEEZY_MAX_YEARLY_CREDITS")
-    lemonsqueezy_mega_monthly_credits: int = Field(7000, env="LEMONSQUEEZY_MEGA_MONTHLY_CREDITS")
-    lemonsqueezy_mega_yearly_credits: int = Field(84000, env="LEMONSQUEEZY_MEGA_YEARLY_CREDITS")
-    lemonsqueezy_business_monthly_credits: int = Field(2000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_CREDITS")
-    lemonsqueezy_business_yearly_credits: int = Field(24000, env="LEMONSQUEEZY_BUSINESS_YEARLY_CREDITS")
+    lemonsqueezy_pro_monthly_credits: int = Field(3000, env="LEMONSQUEEZY_PRO_MONTHLY_CREDITS")
+    lemonsqueezy_pro_yearly_credits: int = Field(36000, env="LEMONSQUEEZY_PRO_YEARLY_CREDITS")
+    lemonsqueezy_max_monthly_credits: int = Field(12000, env="LEMONSQUEEZY_MAX_MONTHLY_CREDITS")
+    lemonsqueezy_max_yearly_credits: int = Field(144000, env="LEMONSQUEEZY_MAX_YEARLY_CREDITS")
+    lemonsqueezy_mega_monthly_credits: int = Field(50000, env="LEMONSQUEEZY_MEGA_MONTHLY_CREDITS")
+    lemonsqueezy_mega_yearly_credits: int = Field(600000, env="LEMONSQUEEZY_MEGA_YEARLY_CREDITS")
+    lemonsqueezy_business_monthly_credits: int = Field(12000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_CREDITS")
+    lemonsqueezy_business_yearly_credits: int = Field(144000, env="LEMONSQUEEZY_BUSINESS_YEARLY_CREDITS")
 
     # QuickBooks Online Integration Configuration
     quickbooks_client_id: str = Field("", env="QUICKBOOKS_CLIENT_ID")
@@ -282,7 +282,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.polar_pro_monthly_price_cents,
                 "credits": self.polar_pro_monthly_credits,
-                "volume_label": "1,000 credits/month",
+                "volume_label": "3,000 documents/month",
                 "self_service": True,
             },
             "pro_yearly": {
@@ -292,7 +292,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.polar_pro_yearly_price_cents,
                 "credits": self.polar_pro_yearly_credits,
-                "volume_label": "12,000 credits/year",
+                "volume_label": "36,000 documents/year",
                 "self_service": True,
             },
             "max_monthly": {
@@ -302,7 +302,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.polar_max_monthly_price_cents,
                 "credits": self.polar_max_monthly_credits,
-                "volume_label": "2,500 credits/month",
+                "volume_label": "12,000 documents/month",
                 "self_service": True,
             },
             "max_yearly": {
@@ -312,7 +312,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.polar_max_yearly_price_cents,
                 "credits": self.polar_max_yearly_credits,
-                "volume_label": "30,000 credits/year",
+                "volume_label": "144,000 documents/year",
                 "self_service": True,
             },
             "mega_monthly": {
@@ -322,7 +322,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.polar_mega_monthly_price_cents,
                 "credits": self.polar_mega_monthly_credits,
-                "volume_label": "Custom processing volume",
+                "volume_label": "50,000+ documents/month",
                 "self_service": False,
             },
             "mega_yearly": {
@@ -332,7 +332,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.polar_mega_yearly_price_cents,
                 "credits": self.polar_mega_yearly_credits,
-                "volume_label": "Custom annual volume",
+                "volume_label": "600,000+ documents/year",
                 "self_service": False,
             },
         }
@@ -356,7 +356,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_pro_monthly_price_cents,
                 "credits": self.lemonsqueezy_pro_monthly_credits,
-                "volume_label": "1,000 images",
+                "volume_label": "3,000 documents/month",
                 "self_service": True,
             },
             "pro_yearly": {
@@ -366,7 +366,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_pro_yearly_price_cents,
                 "credits": self.lemonsqueezy_pro_yearly_credits,
-                "volume_label": "12,000 images/year",
+                "volume_label": "36,000 documents/year",
                 "self_service": True,
             },
             "max_monthly": {
@@ -376,7 +376,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_max_monthly_price_cents,
                 "credits": self.lemonsqueezy_max_monthly_credits,
-                "volume_label": "2,500 images",
+                "volume_label": "12,000 documents/month",
                 "self_service": True,
             },
             "max_yearly": {
@@ -386,7 +386,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_max_yearly_price_cents,
                 "credits": self.lemonsqueezy_max_yearly_credits,
-                "volume_label": "30,000 images/year",
+                "volume_label": "144,000 documents/year",
                 "self_service": True,
             },
             "mega_monthly": {
@@ -396,7 +396,7 @@ class Settings(BaseSettings):
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_mega_monthly_price_cents,
                 "credits": self.lemonsqueezy_mega_monthly_credits,
-                "volume_label": "Custom processing volume",
+                "volume_label": "50,000+ documents/month",
                 "self_service": False,
             },
             "mega_yearly": {
@@ -406,7 +406,7 @@ class Settings(BaseSettings):
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_mega_yearly_price_cents,
                 "credits": self.lemonsqueezy_mega_yearly_credits,
-                "volume_label": "Custom annual volume",
+                "volume_label": "600,000+ documents/year",
                 "self_service": False,
             },
         }
