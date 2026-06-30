@@ -68,7 +68,33 @@ def _public_plan(
             if interval == "year" and monthly_reference_cents
             else 0
         ),
-        "checkout_available": bool(settings.polar_access_token and plan_data.get("product_id")),
+        "checkout_available": bool(
+            settings.polar_access_token
+            and plan_data.get("product_id")
+            and plan_data.get("self_service", True)
+        ),
+    }
+
+
+def _contact_sales_plan() -> Dict[str, Any]:
+    limits = get_plan_limits("enterprise")
+    return {
+        "key": "enterprise",
+        "checkout_key": None,
+        "name": "Enterprise",
+        "plan": "enterprise",
+        "interval": "custom",
+        "price_cents": 0,
+        "price_formatted": "Contact sales",
+        "currency": "USD",
+        "credits": 0,
+        "included_volume": "Custom processing volume",
+        "max_files_per_batch": limits["max_files_per_batch"],
+        "daily_image_limit": limits["daily_image_limit"],
+        "daily_run_limit": limits.get("daily_run_limit"),
+        "max_file_size_mb": limits["max_file_size_mb"],
+        "annual_discount_percent": 0,
+        "checkout_available": False,
     }
 
 
@@ -77,15 +103,13 @@ def _billing_plan_catalog() -> Dict[str, Any]:
     free_limits = get_plan_limits("free")
     pro_monthly = variants["pro_monthly"]["price_cents"]
     max_monthly = variants["max_monthly"]["price_cents"]
-    mega_monthly = variants["mega_monthly"]["price_cents"]
 
     paid_plans = [
         _public_plan("pro_monthly", variants["pro_monthly"]),
         _public_plan("pro_yearly", variants["pro_yearly"], pro_monthly),
         _public_plan("max_monthly", variants["max_monthly"]),
         _public_plan("max_yearly", variants["max_yearly"], max_monthly),
-        _public_plan("mega_monthly", variants["mega_monthly"]),
-        _public_plan("mega_yearly", variants["mega_yearly"], mega_monthly),
+        _contact_sales_plan(),
     ]
 
     return {

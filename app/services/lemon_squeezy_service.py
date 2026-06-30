@@ -35,6 +35,8 @@ class LemonSqueezyService:
         plan = settings.lemonsqueezy_plan_variants.get(plan_key)
         if not plan or not plan.get("variant_id"):
             raise ValueError(f"Unsupported or unconfigured Lemon Squeezy plan: {plan_key}")
+        if plan.get("self_service") is False:
+            raise ValueError("This plan is handled through sales. Please contact AxLiner.")
         return plan
 
     async def create_checkout(

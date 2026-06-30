@@ -33,6 +33,8 @@ class PolarService:
         plan = settings.polar_plan_products.get(plan_key)
         if not plan or not plan.get("product_id"):
             raise ValueError(f"Unsupported or unconfigured Polar plan: {plan_key}")
+        if plan.get("self_service") is False:
+            raise ValueError("This plan is handled through sales. Please contact AxLiner.")
         return plan
 
     async def create_checkout(

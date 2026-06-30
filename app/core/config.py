@@ -126,10 +126,10 @@ class Settings(BaseSettings):
     polar_max_yearly_product_id: str = Field("", env="POLAR_MAX_YEARLY_PRODUCT_ID")
     polar_mega_monthly_product_id: str = Field("", env="POLAR_MEGA_MONTHLY_PRODUCT_ID")
     polar_mega_yearly_product_id: str = Field("", env="POLAR_MEGA_YEARLY_PRODUCT_ID")
-    polar_pro_monthly_price_cents: int = Field(1900, env="POLAR_PRO_MONTHLY_PRICE_CENTS")
-    polar_pro_yearly_price_cents: int = Field(19000, env="POLAR_PRO_YEARLY_PRICE_CENTS")
-    polar_max_monthly_price_cents: int = Field(3900, env="POLAR_MAX_MONTHLY_PRICE_CENTS")
-    polar_max_yearly_price_cents: int = Field(39000, env="POLAR_MAX_YEARLY_PRICE_CENTS")
+    polar_pro_monthly_price_cents: int = Field(5900, env="POLAR_PRO_MONTHLY_PRICE_CENTS")
+    polar_pro_yearly_price_cents: int = Field(59000, env="POLAR_PRO_YEARLY_PRICE_CENTS")
+    polar_max_monthly_price_cents: int = Field(14900, env="POLAR_MAX_MONTHLY_PRICE_CENTS")
+    polar_max_yearly_price_cents: int = Field(149000, env="POLAR_MAX_YEARLY_PRICE_CENTS")
     polar_mega_monthly_price_cents: int = Field(7900, env="POLAR_MEGA_MONTHLY_PRICE_CENTS")
     polar_mega_yearly_price_cents: int = Field(79000, env="POLAR_MEGA_YEARLY_PRICE_CENTS")
     polar_pro_monthly_credits: int = Field(1000, env="POLAR_PRO_MONTHLY_CREDITS")
@@ -151,14 +151,14 @@ class Settings(BaseSettings):
     lemonsqueezy_mega_yearly_variant_id: str = Field("", env="LEMONSQUEEZY_MEGA_YEARLY_VARIANT_ID")
     lemonsqueezy_business_monthly_variant_id: str = Field("", env="LEMONSQUEEZY_BUSINESS_MONTHLY_VARIANT_ID")
     lemonsqueezy_business_yearly_variant_id: str = Field("", env="LEMONSQUEEZY_BUSINESS_YEARLY_VARIANT_ID")
-    lemonsqueezy_pro_monthly_price_cents: int = Field(1000, env="LEMONSQUEEZY_PRO_MONTHLY_PRICE_CENTS")
-    lemonsqueezy_pro_yearly_price_cents: int = Field(10000, env="LEMONSQUEEZY_PRO_YEARLY_PRICE_CENTS")
-    lemonsqueezy_max_monthly_price_cents: int = Field(2000, env="LEMONSQUEEZY_MAX_MONTHLY_PRICE_CENTS")
-    lemonsqueezy_max_yearly_price_cents: int = Field(19000, env="LEMONSQUEEZY_MAX_YEARLY_PRICE_CENTS")
+    lemonsqueezy_pro_monthly_price_cents: int = Field(5900, env="LEMONSQUEEZY_PRO_MONTHLY_PRICE_CENTS")
+    lemonsqueezy_pro_yearly_price_cents: int = Field(59000, env="LEMONSQUEEZY_PRO_YEARLY_PRICE_CENTS")
+    lemonsqueezy_max_monthly_price_cents: int = Field(14900, env="LEMONSQUEEZY_MAX_MONTHLY_PRICE_CENTS")
+    lemonsqueezy_max_yearly_price_cents: int = Field(149000, env="LEMONSQUEEZY_MAX_YEARLY_PRICE_CENTS")
     lemonsqueezy_mega_monthly_price_cents: int = Field(5000, env="LEMONSQUEEZY_MEGA_MONTHLY_PRICE_CENTS")
     lemonsqueezy_mega_yearly_price_cents: int = Field(53000, env="LEMONSQUEEZY_MEGA_YEARLY_PRICE_CENTS")
-    lemonsqueezy_business_monthly_price_cents: int = Field(2000, env="LEMONSQUEEZY_BUSINESS_MONTHLY_PRICE_CENTS")
-    lemonsqueezy_business_yearly_price_cents: int = Field(19000, env="LEMONSQUEEZY_BUSINESS_YEARLY_PRICE_CENTS")
+    lemonsqueezy_business_monthly_price_cents: int = Field(14900, env="LEMONSQUEEZY_BUSINESS_MONTHLY_PRICE_CENTS")
+    lemonsqueezy_business_yearly_price_cents: int = Field(149000, env="LEMONSQUEEZY_BUSINESS_YEARLY_PRICE_CENTS")
     lemonsqueezy_pro_monthly_credits: int = Field(1000, env="LEMONSQUEEZY_PRO_MONTHLY_CREDITS")
     lemonsqueezy_pro_yearly_credits: int = Field(12000, env="LEMONSQUEEZY_PRO_YEARLY_CREDITS")
     lemonsqueezy_max_monthly_credits: int = Field(2500, env="LEMONSQUEEZY_MAX_MONTHLY_CREDITS")
@@ -283,6 +283,7 @@ class Settings(BaseSettings):
                 "price_cents": self.polar_pro_monthly_price_cents,
                 "credits": self.polar_pro_monthly_credits,
                 "volume_label": "1,000 credits/month",
+                "self_service": True,
             },
             "pro_yearly": {
                 "product_id": self.polar_pro_yearly_product_id,
@@ -292,6 +293,7 @@ class Settings(BaseSettings):
                 "price_cents": self.polar_pro_yearly_price_cents,
                 "credits": self.polar_pro_yearly_credits,
                 "volume_label": "12,000 credits/year",
+                "self_service": True,
             },
             "max_monthly": {
                 "product_id": self.polar_max_monthly_product_id,
@@ -301,6 +303,7 @@ class Settings(BaseSettings):
                 "price_cents": self.polar_max_monthly_price_cents,
                 "credits": self.polar_max_monthly_credits,
                 "volume_label": "2,500 credits/month",
+                "self_service": True,
             },
             "max_yearly": {
                 "product_id": self.polar_max_yearly_product_id,
@@ -310,24 +313,27 @@ class Settings(BaseSettings):
                 "price_cents": self.polar_max_yearly_price_cents,
                 "credits": self.polar_max_yearly_credits,
                 "volume_label": "30,000 credits/year",
+                "self_service": True,
             },
             "mega_monthly": {
                 "product_id": self.polar_mega_monthly_product_id,
-                "plan": "mega",
-                "display_name": "Max Plan",
+                "plan": "enterprise",
+                "display_name": "Enterprise",
                 "interval": "month",
                 "price_cents": self.polar_mega_monthly_price_cents,
                 "credits": self.polar_mega_monthly_credits,
-                "volume_label": "7,000 credits/month",
+                "volume_label": "Custom processing volume",
+                "self_service": False,
             },
             "mega_yearly": {
                 "product_id": self.polar_mega_yearly_product_id,
-                "plan": "mega",
-                "display_name": "Max Plan",
+                "plan": "enterprise",
+                "display_name": "Enterprise",
                 "interval": "year",
                 "price_cents": self.polar_mega_yearly_price_cents,
                 "credits": self.polar_mega_yearly_credits,
-                "volume_label": "84,000 credits/year",
+                "volume_label": "Custom annual volume",
+                "self_service": False,
             },
         }
 
@@ -351,6 +357,7 @@ class Settings(BaseSettings):
                 "price_cents": self.lemonsqueezy_pro_monthly_price_cents,
                 "credits": self.lemonsqueezy_pro_monthly_credits,
                 "volume_label": "1,000 images",
+                "self_service": True,
             },
             "pro_yearly": {
                 "variant_id": self.lemonsqueezy_pro_yearly_variant_id,
@@ -360,6 +367,7 @@ class Settings(BaseSettings):
                 "price_cents": self.lemonsqueezy_pro_yearly_price_cents,
                 "credits": self.lemonsqueezy_pro_yearly_credits,
                 "volume_label": "12,000 images/year",
+                "self_service": True,
             },
             "max_monthly": {
                 "variant_id": self.lemonsqueezy_max_monthly_variant_id or self.lemonsqueezy_business_monthly_variant_id,
@@ -369,6 +377,7 @@ class Settings(BaseSettings):
                 "price_cents": self.lemonsqueezy_max_monthly_price_cents,
                 "credits": self.lemonsqueezy_max_monthly_credits,
                 "volume_label": "2,500 images",
+                "self_service": True,
             },
             "max_yearly": {
                 "variant_id": self.lemonsqueezy_max_yearly_variant_id or self.lemonsqueezy_business_yearly_variant_id,
@@ -378,24 +387,27 @@ class Settings(BaseSettings):
                 "price_cents": self.lemonsqueezy_max_yearly_price_cents,
                 "credits": self.lemonsqueezy_max_yearly_credits,
                 "volume_label": "30,000 images/year",
+                "self_service": True,
             },
             "mega_monthly": {
                 "variant_id": self.lemonsqueezy_mega_monthly_variant_id,
-                "plan": "mega",
-                "display_name": "Max Plan",
+                "plan": "enterprise",
+                "display_name": "Enterprise",
                 "interval": "month",
                 "price_cents": self.lemonsqueezy_mega_monthly_price_cents,
                 "credits": self.lemonsqueezy_mega_monthly_credits,
-                "volume_label": "7,000 images",
+                "volume_label": "Custom processing volume",
+                "self_service": False,
             },
             "mega_yearly": {
                 "variant_id": self.lemonsqueezy_mega_yearly_variant_id,
-                "plan": "mega",
-                "display_name": "Max Plan",
+                "plan": "enterprise",
+                "display_name": "Enterprise",
                 "interval": "year",
                 "price_cents": self.lemonsqueezy_mega_yearly_price_cents,
                 "credits": self.lemonsqueezy_mega_yearly_credits,
-                "volume_label": "84,000 images/year",
+                "volume_label": "Custom annual volume",
+                "self_service": False,
             },
         }
 
